@@ -3,6 +3,12 @@
 > Solo maintainer, ~8-15h/week. Each phase has circuit-breaker (防烂尾 key design). All tasks `status: todo`.
 > Synced from `/memories/repo/roadmap-phases.md`.
 
+## Phase 0 progress log (2026-07-24)
+- **Wk1 infrastructure ✅ (committed `78ab251`):** E0-INF1 (8-repo skeleton) + E0-INF2 (CI) + E0-INF3 (Docker+Makefile+smoke) + E0-INF4 (trademark) + S04-P0#1 (mailbox migrated to ethereal-shell, CERN-OHL-S, lint cleanup pending `S04-P0#2`). Docker-gated validations pending.
+- **E0-FAB1 ✅ (elut4+FF):** `ethereal-fabric/rtl/clb/elut4.sv` G1-clean (in lint glob); golden model `elut4_model.py` validated by **1211 local pytest**; cocotb DUT-vs-model Docker-gated. Bitfield frozen in `ethereal-spec/fabric/elut4-config-v0.md`. Report: `docs/reports/report-E0-FAB1-elut4-20260724.md`.
+- **Convention established:** `make test-model` = local pure-Python golden-model pytest (no simulator); cocotb tests `test_<unit>.py` (Docker-gated), model tests `test_<unit>_model.py` (local).
+- **Next:** E0-FAB2 (CLB-T cluster, N=8 eLUT4 + Clos IIB I=26).
+
 ## Phase summary
 | Phase | Window | Core goal | Key exit criteria | Budget |
 |---|---|---|---|---|

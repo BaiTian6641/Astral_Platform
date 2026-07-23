@@ -8,6 +8,7 @@
 #     make help          list targets
 #     make lint          verilator --lint-only -Wall over all RTL
 #     make test          cocotb regression (smoke test minimum)
+#     make test-model    pure-Python golden-model pytest (LOCAL, no simulator)
 #     make sim           quick smoke simulation (counter)
 #     make docker-build  docker build -f docker/Dockerfile -t ethereal-sim docker/
 #     make docker-shell  run ethereal-sim interactively, repo mounted at /work
@@ -44,7 +45,7 @@ SMOKE_DIR := ethereal-fabric/tests/smoke
 IMAGE    := ethereal-sim
 WORKDIR  := /work
 
-.PHONY: help lint lint-mailbox test sim docker-build docker-shell clean
+.PHONY: help lint lint-mailbox test test-model sim docker-build docker-shell clean
 
 help: ## Show this help
 	@echo "Ethereal Logic Platform — root Makefile (GNU make)"
@@ -91,6 +92,18 @@ ifeq ($(VERILATOR),)
 else
 	@$(MAKE) -C $(SMOKE_DIR) sim SIM=verilator
 endif
+
+test-model: ## Run pure-Python golden-model pytest (no simulator needed; runs locally)
+	@MODELS=$$(find ethereal-fabric/tests -name 'test_*_model.py' 2>/dev/null); \
+	if [ -z "$$MODELS" ]; then \
+		echo "[test-model] No test_*_model.py found under ethereal-fabric/tests."; \
+		exit 0; \
+	fi; \
+	if command -v pytest >/dev/null 2>&1; then PYTEST=pytest; \
+	elif [ -x .venv/bin/pytest ]; then PYTEST=.venv/bin/pytest; \
+	else echo "[test-model] pytest not found. Create a venv: python3 -m venv .venv && .venv/bin/pip install pytest"; exit 1; fi; \
+	echo "[test-model] running: $$PYTEST $$MODELS"; \
+	$$PYTEST -q $$MODELS
 
 test: ## Run cocotb regression (smoke test minimum, Phase 0)
 ifeq ($(VERILATOR),)
