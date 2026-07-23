@@ -50,7 +50,9 @@ v2.1 deprecates → GW5's DDR3 1GB + PCIe 3.0 hard-core NOT directly used in Pha
 ## Open questions for user (from subsystem §7, by priority)
 | Priority | Question | Blocks |
 |---|---|---|
-| 🔴 high | Mailbox RTL re-license CERN-OHL-S-2.0 + migrate out of TinyGPU-FPGA? | E0-INF1, S04-P0#1 |
+| 🔴 high | **"Astral" naming conflict** — `github.com/AstralPlatform` (no hyphen) is an active FPGA/RISC-V org; `astral-os` already taken; astral.sh (Ruff/uv) dominates software mindshare. Use `Astral-OS`+tagline or rename? | `astral-os/` repo, branding (E0-INF4 report) |
+| 🟡 mid | Mailbox RTL G1-cleanup backlog (~22 procedural loops, plain-logic FSMs, no nettype restore) — add task `S04-P0#2`? Cleaned RTL only then enters main `make lint` gate. | `S04-P0#2` |
+| ✅ resolved | ~~Mailbox re-license + migrate out of TinyGPU-FPGA~~ → **DONE 2026-07-24** (S04-P0#1) | — |
 | 🔴 high | Exact Zynq US+ board model (constraints + DFX slot planning)? | E2-PLT1 |
 | 🔴 high | Tang Mega 138K = Dock (confirmed) or Pro? (Board Manifest pin table) | E1-IO3, E1-PLT2 |
 | 🟡 mid | Final virtual LUT granularity = LUT4? (affects all downstream; sim can parametrize LUT6 compare) | E0-FAB1 |

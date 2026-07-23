@@ -60,14 +60,14 @@ github.com/ethereal-fpga/   (org name TBD via E0-INF4)
 ## Critical upstream deps (MUST read before impl, README §4)
 | Dep | Location | Use | Status |
 |---|---|---|---|
-| **AXI-MailboxFabric** (user's own NoC) | `github.com/BaiTian6641/TinyGPU-FPGA/ip/mailbox` | EBI-Lite backbone (S04) | **User action: migrate out + CERN-OHL-S-2.0 license note** |
+| **AXI-MailboxFabric** (user's own NoC) | `github.com/BaiTian6641/TinyGPU-FPGA/ip/mailbox` | EBI-Lite backbone (S04) | ✅ **Migrated 2026-07-24** (S04-P0#1) → `ethereal-shell/rtl/{mailbox,interface}/` + `docs/mailbox_interconnect_spec.md` under CERN-OHL-S-2.0 + provenance headers; G1-cleanup pending → advisory `make lint-mailbox` |
 | SPI/UART fabric satellite adapters | same repo `ip/interface/{spi,uart}/` | L2 proxy reuse starting point (C06 §2.3) | pending migration |
 | SystemVerilog RTL Policy | same repo `docs/SystemVerilog_RTL_Policy.md` | G1 rules source | pending link |
 | NEORV32 | github.com/stnolting/neorv32 | BMC core | BSD-3, ready to use |
 | **Main verify board** | Tang Mega 138K **Dock** (GW5AST-LV138PG484A) | Profile-G main battlefield | confirmed |
 
-## 🔴 BLOCKER
-Mailbox RTL migration needs user to first complete licensing note in TinyGPU-FPGA. Phase 0 week-1 task `S04-P0#1` depends on this.
+## ✅ BLOCKER RESOLVED (2026-07-24)
+Mailbox RTL licensing + migration **DONE** (S04-P0#1): 14 RTL + 1 spec migrated to `ethereal-shell/` under CERN-OHL-S-2.0 with provenance headers; see `ethereal-shell/docs/MIGRATION-mailbox.md`. Remaining: G1-cleanup backlog (procedural loops, FSM typedef, nettype restore) — linted separately via advisory `make lint-mailbox`, target new task `S04-P0#2`. Real `verilator --lint-only -Wall` + cocotb are Docker-gated (no verilator/docker in authoring env).
 
 ## Verified platform facts (2026-07 web cross-check, baseline for design)
 - GW5 CFU supports LUT4/ALU/**memory mode**; each CLS has 2 regs w/ CE/SR/GSR (Gowin DS1103E) → eLUT4 truth-table as distributed RAM; v1 still uses FF (C01 §2)

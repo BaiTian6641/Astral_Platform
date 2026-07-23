@@ -1,0 +1,46 @@
+# docker/ build-context ignore list (task E0-INF3)
+# The ethereal-sim image only installs tooling — it never COPY's repo sources
+# (the repo is bind-mounted at runtime). Keep the context tiny and free of junk
+# so `docker build` is fast and deterministic.
+
+# Version control
+.git
+.gitignore
+.github
+
+# Build / regenerable artifacts (mirror of repo-root .gitignore convention)
+build/
+out/
+obj_dir/
+sim_build/
+_build/
+cmake-build-*/
+generated/
+**/obj_dir/
+**/sim_build/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store
+**/:Zone.Identifier
+**/:Zone.Identifier:$DATA
+**/*.swp
+
+# Waveforms / logs (never bake into the image)
+*.vcd
+*.fst
+*.fst.hier
+*.log
+
+# Don't recursively pull the whole repo through the context
+docker-compose.yml
+README.md

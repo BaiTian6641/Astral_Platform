@@ -1,0 +1,9 @@
+# ethereal-runtime — software (daemon + bmc-fw C firmware), licensed MIT. See LICENSE.
+* text=auto eol=lf
+
+# Help GitHub Linguist classify sources correctly.
+*.sv    linguist-language=SystemVerilog
+*.v     linguist-language=Verilog
+*.c     linguist-language=C
+*.h     linguist-language=C
+*.py    linguist-language=Python

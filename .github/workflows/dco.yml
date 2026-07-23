@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: MIT
+# Workflow:    dco.yml
+# Plan-Ref:    docs/ethereal-tasks.yaml  task E0-INF2 (CI skeleton)
+# Description: Developer Certificate of Origin check — every commit in a PR must carry
+#              a `Signed-off-by: Name <email>` trailer (i.e. `git commit -s`).
+#
+# DCO APPROACH (G6 — dependency-free, robust):
+#   An INLINE SHELL step inspects each commit in the PR range and verifies a valid
+#   `Signed-off-by:` trailer is present, failing the job if any commit lacks one.
+#   This is chosen over third-party DCO actions (christophebedard/dco-action,
+#   fredrikaverpil/dco, scicat-project/dco, probot/dco-app) because:
+#     1. Their maintenance/version status was not web-verified, and pinning an
+#        external action of uncertain upkeep violates the project's G6 spirit.
+#     2. The inline check is fully auditable, self-contained, and has no supply chain.
+#   Behavior matches the standard Linux-kernel / Git DCO convention.
+#
+# ASSUMPTION (2026-07-24): Only truly validates on GitHub Actions runners (the
+# `github.event.pull_request.*` context is populated there). YAML parse is the only
+# local check available in this environment.
+
+name: DCO
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: Signed-off-by trailer on every PR commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # Full history is required so base.sha..head.sha is resolvable locally.
+          fetch-depth: 0
+
+      - name: Verify every PR commit has a Signed-off-by trailer
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_SHA}" ] || [ -z "${HEAD_SHA}" ]; then
+            echo "::error::Could not determine PR commit range (base/head SHA empty). Not a pull_request event?"
+            exit 1
+          fi
+          RANGE="${BASE_SHA}..${HEAD_SHA}"
+          commit_count=$(git rev-list --count "${RANGE}" 2>/dev/null || echo 0)
+          echo "Inspecting ${commit_count} commit(s) in range ${RANGE}"
+          if [ "${commit_count}" -eq 0 ]; then
+            echo "::notice::No commits to check (empty range)."
+            exit 0
+          fi
+          # DCO trailer regex: 'Signed-off-by: <name> <<email>>' — email must contain
+          # '@' and a '.', matching the canonical `git commit -s` format.
+          sob_re='^Signed-off-by: .+ <[^[:space:]]+@[^[:space:]]+\.[^[:space:]]+>'
+          missing=0
+          for sha in $(git rev-list "${RANGE}"); do
+            body=$(git log -1 --format='%B' "${sha}")
+            if ! printf '%s\n' "${body}" | grep -Eq "${sob_re}"; then
+              subject=$(git log -1 --format='%s' "${sha}")
+              echo "::error::Commit ${sha} (“${subject}”) is missing a valid 'Signed-off-by:' trailer."
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo ""
+            echo "::error::DCO check failed. Add the trailer with 'git commit -s'."
+            echo "::error::To fix existing commits: 'git rebase --exec \"git commit --amend --no-edit -s\" <base>' and force-push."
+            exit 1
+          fi
+          echo "✅ All ${commit_count} commit(s) carry a valid Signed-off-by trailer."

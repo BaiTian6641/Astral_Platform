@@ -1,0 +1,7 @@
+# ethereal-tools — software (Python toolchain), licensed MIT. See LICENSE.
+* text=auto eol=lf
+
+# Help GitHub Linguist classify sources correctly.
+*.sv    linguist-language=SystemVerilog
+*.v     linguist-language=Verilog
+*.py    linguist-language=Python

@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: MIT
+# Workflow:    lint-and-test.yml
+# Plan-Ref:    docs/ethereal-tasks.yaml  task E0-INF2 (CI skeleton)
+# Description: Verilator lint + cocotb regression, executed inside the reproducible
+#              sim Docker image produced by the parallel task E0-INF3.
+#
+# DECISION (hard-fail vs continue-on-error):
+#   * The `sim` job HARD-FAILS on any real lint/test breakage (no continue-on-error on
+#     the lint/test steps) — this is what catches regressions in production.
+#   * BUT, to stay GREEN during early bootstrap while E0-INF3 has not landed yet, the
+#     first step detects a missing `docker/Dockerfile` and SKIPS the job with a clear
+#     `::notice::` message + success exit. Once E0-INF3 lands the skip guard becomes a
+#     no-op and the job protects real RTL.
+#   * The `tools-lint` job is `continue-on-error: true` because there is no Python code
+#     in `ethereal-tools` yet (TODO: promote to hard-fail at E0-MAP1+).
+#
+# ASSUMPTION (2026-07-24): This workflow only truly validates when it runs on GitHub
+# Actions runners. The Makefile targets (`make lint`, `make test`) and the sim Docker
+# image are defined by E0-INF3 per the shared contract; locally this environment has
+# neither docker nor the toolchain, so YAML parse-validation is the only check here.
+
+name: Lint and Test
+
+on:
+  push:
+    branches: [main, develop]
+    paths-ignore:
+      - 'docs/**'
+      - 'memory/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main, develop]
+    paths-ignore:
+      - 'docs/**'
+      - 'memory/**'
+      - '**/*.md'
+
+# Cancel superseded runs on the same ref to conserve CI minutes.
+concurrency:
+  group: lint-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    name: Verilator lint + cocotb regression (in sim Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check sim Docker prerequisites
+        id: prereq
+        run: |
+          set -euo pipefail
+          if [ ! -f docker/Dockerfile ]; then
+            echo "::notice::docker/Dockerfile not present yet (parallel task E0-INF3 pending). Skipping lint/test for now — this keeps CI green during early bootstrap."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          if [ ! -f Makefile ]; then
+            echo "::warning::docker/Dockerfile exists but root Makefile is missing — 'make lint'/'make test' will likely fail."
+          fi
+          if [ ! -d ethereal-fabric/tests/smoke ]; then
+            echo "::warning::ethereal-fabric/tests/smoke/ not found — 'make test' may have nothing to run."
+          fi
+
+      # NOTE: From here on every step HARD-FAILS (no continue-on-error). The `if:`
+      # guard just skips them when the Dockerfile is absent during early bootstrap.
+      - name: Build sim Docker image
+        if: steps.prereq.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          docker build -f docker/Dockerfile -t ethereal-sim docker/
+
+      - name: Verilator lint (make lint)
+        if: steps.prereq.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/work -w /work ethereal-sim make lint
+
+      - name: cocotb regression (make test)
+        if: steps.prereq.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/work -w /work ethereal-sim make test
+
+  tools-lint:
+    name: Python tools lint (ruff + mypy) — non-blocking bootstrap
+    runs-on: ubuntu-latest
+    # No Python sources in ethereal-tools yet; keep CI green today.
+    # TODO (E0-MAP1+): drop continue-on-error and fail hard once real code lands.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff + mypy
+        run: pip install --no-input ruff mypy
+
+      # Best-effort: silent + `|| true` so a missing/empty dir never breaks the lane.
+      - name: ruff check ethereal-tools
+        run: ruff check ethereal-tools 2>/dev/null || true
+
+      - name: mypy ethereal-tools (best-effort)
+        run: |
+          if find ethereal-tools -name '*.py' 2>/dev/null | grep -q .; then
+            mypy ethereal-tools || true
+          else
+            echo "No Python sources in ethereal-tools yet — skipping mypy."
+          fi

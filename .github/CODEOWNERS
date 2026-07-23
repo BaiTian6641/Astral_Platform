@@ -1,0 +1,16 @@
+# CODEOWNERS for the Ethereal Logic Platform monorepo.
+# Default owner for everything in the repository.
+*                       @BaiTian6641
+
+# Per-component owners (single maintainer today; expand as the team grows).
+/ethereal-fabric/       @BaiTian6641
+/ethereal-shell/        @BaiTian6641
+/ethereal-tools/        @BaiTian6641
+/ethereal-runtime/      @BaiTian6641
+/ethereal-spec/         @BaiTian6641
+/ethereal-images/       @BaiTian6641
+/astral-os/             @BaiTian6641
+/docs/                  @BaiTian6641
+/ethereal-plan/         @BaiTian6641
+/memory/                @BaiTian6641
+/.github/               @BaiTian6641

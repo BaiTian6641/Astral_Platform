@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT
+# Workflow:    docs.yml
+# Plan-Ref:    docs/ethereal-tasks.yaml  task E0-INF2 (CI skeleton)
+# Description: Docs CI lane — lightweight Markdown link checking. Exists so docs-only
+#              changes have a CI signal from day one.
+#
+# DECISION (non-blocking today): There is no `mkdocs.yml` yet, so we run the fast
+#   `lychee` link checker with `continue-on-error: true`. This lane is intentionally
+#   advisory until the docs link inventory is curated and an `mkdocs build --strict`
+#   site exists; at that point remove `continue-on-error` and swap in the strict build.
+#
+# ASSUMPTION (2026-07-24): This workflow only truly validates on GitHub Actions
+# runners (the `lycheeverse/lychee-action` runs there). YAML parse is the only local
+# check available in this environment.
+
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'ethereal-plan/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'ethereal-plan/**'
+      - '**/*.md'
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docs-check:
+    name: Markdown link check (lychee) — non-blocking
+    runs-on: ubuntu-latest
+    # TODO: tighten (remove continue-on-error) once the link inventory is curated
+    # and/or an mkdocs site lands. Advisory-only for now so green status is preserved.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lychee link checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          # fail: false ensures broken links never fail the step; combined with the
+          # job-level continue-on-error this lane is purely advisory today.
+          fail: false
+          args: >-
+            --no-progress
+            --max-concurrency 16
+            --exclude '.*:Zone\.Identifier'
+            'docs/**/*.md' 'ethereal-plan/**/*.md' '*.md'

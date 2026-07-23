@@ -1,0 +1,8 @@
+# ethereal-images — packaging/tooling under MIT; reference RTL sources are
+# CERN-OHL-S-2.0 and live in ethereal-fabric/ethereal-shell. See LICENSE.
+* text=auto eol=lf
+
+# Help GitHub Linguist classify sources correctly.
+*.sv    linguist-language=SystemVerilog
+*.v     linguist-language=Verilog
+*.py    linguist-language=Python

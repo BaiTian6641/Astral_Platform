@@ -1,0 +1,27 @@
+# ethereal-sim dev / sim container (task E0-INF3) — optional convenience wrapper.
+#
+# Prefer the Makefile targets (they handle the image name + mount consistently):
+#     make docker-build      # build ethereal-sim (one-time, ~45-90 min cold)
+#     make docker-shell      # interactive shell, repo at /work
+#     make test              # native cocotb if verilator present, else see docker
+#
+# With compose (image build context = this docker/ dir, matching the Makefile):
+#     docker compose -f docker/docker-compose.yml build
+#     docker compose -f docker/docker-compose.yml run --rm sim make test
+#     docker compose -f docker/docker-compose.yml run --rm sim bash
+#
+# NOTE on the volume: this file lives in docker/, so `..` resolves to the repo
+# root and is bind-mounted at /work inside the container.
+
+services:
+  sim:
+    image: ethereal-sim
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ..:/work
+    stdin_open: true
+    tty: true
+    command: bash

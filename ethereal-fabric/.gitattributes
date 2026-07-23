@@ -1,0 +1,9 @@
+# ethereal-fabric — hardware RTL, licensed CERN-OHL-S-2.0 (strongly reciprocal).
+# All design sources in this repo must remain under that licence; see LICENSE.
+* text=auto eol=lf
+
+# Help GitHub Linguist classify HDL correctly.
+*.sv    linguist-language=SystemVerilog
+*.svh   linguist-language=SystemVerilog
+*.v     linguist-language=Verilog
+*.vh    linguist-language=Verilog
