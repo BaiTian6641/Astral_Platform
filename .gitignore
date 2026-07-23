@@ -1,0 +1,300 @@
+# =============================================================================
+# Ethereal Logic Platform / Astral OS — .gitignore
+# =============================================================================
+# This monorepo will host: SystemVerilog RTL, Python tools (fabric-gen, mapper,
+# bitgen, ethimg, ethctl, CI), embedded C firmware (bmc-fw), HDL simulation
+# (Verilator + cocotb), open-source EDA (Yosys / VPR / nextpnr / Apicula),
+# vendor FPGA flows (Gowin EDA / Vivado / Quartus), Docker, and Markdown specs.
+#
+# CONVENTION: all generated / regenerable outputs go under one of:
+#   build/  out/  obj_dir/  sim_build/  _build/  cmake-build-*/  generated/
+# These directories are ignored wholesale below. Hand-authored sources
+# (.sv, .py, .c/.h, .md, .yaml, .json, fabric.yaml, manifests, .tcl, .xdc)
+# and deliverables (.eth logic images) are always kept tracked.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# 1. Windows / download metadata (NTFS Zone.Identifier ADS) — NEVER commit
+#    These appear when files are copied from Windows / downloaded from internet.
+# -----------------------------------------------------------------------------
+*:Zone.Identifier
+*:Zone.Identifier:$DATA
+
+
+# -----------------------------------------------------------------------------
+# 2. Operating system junk
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+Directory.icloud
+*.lnk
+
+
+# -----------------------------------------------------------------------------
+# 3. Editors / IDEs
+#    Keep shareable VS Code configs, ignore machine-local editor state.
+# -----------------------------------------------------------------------------
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.idea/
+*.iml
+*.ipr
+*.iws
+# Vim / Emacs
+*.swp
+*.swo
+*.swn
+*~
+\#*\#
+.\#*
+# Other editors
+*.sublime-workspace
+*.sublime-project
+.vs/
+.history/
+
+
+# -----------------------------------------------------------------------------
+# 4. Python (ethereal-tools: fabric-gen / mapper / bitgen / ethimg / ethctl, CI)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+env.bak/
+venv.bak/
+
+# Testing / type-checking / linting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Jupyter
+.ipynb_checkpoints/
+
+
+# -----------------------------------------------------------------------------
+# 5. C / C++ firmware build artifacts (ethereal-runtime/bmc-fw)
+#    NOTE: we do NOT ignore *.bin / *.hex / *.mif globally — these may be
+#    intentional data (ROM init, benchmark frames). Firmware build outputs
+#    belong under build/ or _build/ (ignored above in §4).
+# -----------------------------------------------------------------------------
+*.o
+*.obj
+*.elf
+*.map
+*.a
+*.la
+*.lo
+*.dylib
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+cmake-build-*/
+_build/
+
+
+# -----------------------------------------------------------------------------
+# 6. HDL simulation (Verilator + cocotb)
+#    Waveforms are large & regenerable — keep NONE of them in git.
+# -----------------------------------------------------------------------------
+# Verilator
+obj_dir/
+obj_dir-*/
+# cocotb / generic
+sim_build/
+results.xml
+coverage.dat
+coverage.ecsmdb
+coverage.elog
+# Waveform dumps (all formats)
+*.vcd
+*.vcd.gz
+*.evcd
+*.fst
+*.fst.gz
+*.lxt
+*.lxt2
+*.ghw
+*.wlf
+*.shm/
+*.wcfg
+# GTKWave layout saves are small and useful — keep them tracked:
+# !*.gtkw
+
+
+# -----------------------------------------------------------------------------
+# 7. FPGA vendor tool flows
+# -----------------------------------------------------------------------------
+
+# --- Gowin EDA (GW5AST-138 base image builds) ---
+impl/
+*_0.sdc
+*.sdf
+*.fs
+*.fs.bit
+
+# --- AMD / Xilinx Vivado (Zynq US+ DFX + base image) ---
+*.jou
+*.str
+*.bak
+*.debug
+*.wdb
+*.wpc
+*.summary
+.Xil/
+*.cache/
+*.hw/
+*.hw_ip/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+*.bit
+*.xsa
+vivado*.jou
+vivado*.log
+vivado*.str
+# keep Vivado scripts & constraints tracked
+!*.tcl
+!*.xdc
+!*.xpr
+
+# --- Intel / Altera Quartus (future target) ---
+db/
+incremental_db/
+output_files/
+*.sof
+*.pof
+*.qws
+*.qarlog
+
+
+# -----------------------------------------------------------------------------
+# 8. Open-source EDA tool outputs (Yosys / VPR / nextpnr / Apicula)
+#    VPR pack/place/route artifacts + Yosys/BLIF netlists are build outputs.
+# -----------------------------------------------------------------------------
+yosys.log
+*.blif
+*.net
+*.place
+*.route
+*.routed.xml
+critical_path.delay
+packing.log
+nextpnr.log
+*.chipdb
+
+
+# -----------------------------------------------------------------------------
+# 9. Generic build / output / temp directories and files
+# -----------------------------------------------------------------------------
+out/
+output/
+outputs/
+generated/
+gen/
+artifacts/
+release/
+*.tmp
+*.temp
+*.orig
+*.rej
+*.bak
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+
+# -----------------------------------------------------------------------------
+# 10. Docker (keep Dockerfiles & compose specs tracked; ignore local overrides)
+# -----------------------------------------------------------------------------
+docker-compose.override.yml
+.docker/
+
+
+# -----------------------------------------------------------------------------
+# 11. Docs site build (mdBook / mkdocs material)
+# -----------------------------------------------------------------------------
+site/
+_book/
+__docs_build__/
+.mkdocs_cache/
+
+
+# -----------------------------------------------------------------------------
+# 12. Secrets / local environment / keys
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.sample
+*.local
+secrets/
+*.pem
+*.key
+*.p12
+*.keystore
+# but allow test fixtures
+!**/tests/**/test_*.pem
+!**/testdata/**/*.key
+
+
+# -----------------------------------------------------------------------------
+# 13. Logs directory (catch-all)
+# -----------------------------------------------------------------------------
+logs/
+log/

@@ -1,0 +1,640 @@
+# Ethereal Logic Platform — 机器可读任务清单 v2.1
+# 与《Ethereal-平台实施蓝图-v2.md》及《Ethereal-蓝图v2.1-BMC与运行时修订.md》配套。
+# v2.1 变更：弃用 GW5 AE350 硬核（付费工具链）；管理单元改为 fabric 内 RISC-V 软核（BMC，
+# 主选 NEORV32），小器件降级为 mFSM（与 BMC 统一 EMRI 寄存器 ABI）。
+# 字段说明：
+#   id / title / phase / deps / est_days / deliverable / acceptance / status
+
+project:
+  name: Ethereal Logic Platform
+  decisions:
+    route: overlay-first (fine-grained virtual reconfigurable fabric)
+    platforms: [gowin-gw5ast-138, zynq-ultrascale-plus]
+    licenses: {software: MIT, hardware_rtl: CERN-OHL-S-2.0, docs_specs: CC-BY-SA-4.0}
+    bus: EBI (AXI4-Lite + custom NoC + tiny fallback)
+    host_link: {data: SPI, monitor: I2C (PMBus-style)}
+    control_plane: independent-then-unified (ADR-010)
+    management:
+      bmc: soft-core RISC-V in fabric (primary: NEORV32, fallback: VexRiscv)  # ADR-013/016
+      small_devices: mFSM (register-based, host-driven)                        # ADR-014
+      unified_abi: EMRI (BMC and mFSM expose identical register interface)     # ADR-015
+      deprecated: gowin-ae350-hardcore (paid toolchain, unusable software)
+
+phases:
+  - id: phase-0
+    name: 基础设施与仿真验证
+    window: M0-M2
+    exit_criteria:
+      - 仿真内双镜像热替换演示通过
+      - AES-128 与 FIR16 基准在虚拟 fabric 上 bit-true
+      - MAP 路线决策 ADR-012 完成
+      - CI 全绿
+    circuit_breaker: VPR 架构 2 周不收敛则转 FABulous/nextpnr 或自研 placer+router（各 5 人日上限）
+
+  - id: phase-1
+    name: GW5 bring-up 最小闭环（BMC 软核版）
+    window: M2-M5
+    exit_criteria:
+      - BMC 软核运行 daemon，ethctl run/stop/ps/restart 全通
+      - 2 region x 10000 次热替换零故障
+      - v0.1.0 公开发布（视频+博客+文档站）
+    circuit_breaker: BMC 固件通道受阻则临时以上位机直驱 EMRI/OCC 保底（mFSM 语义先行）
+
+  - id: phase-2
+    name: 异构 fabric v2 + Zynq 移植 + mFSM + Astral 聚合 v1
+    window: M5-M9
+    exit_criteria:
+      - 同一 logic image 在 GW5 与 Zynq US+ 直接运行（二进制兼容）
+      - 异构 tile 基准报告（AES-MEM 密度 >=5x, FIR-DSP 吞吐 >=10x）
+      - mFSM 在仿真中由上位机驱动完整部署流程
+      - Astral Type-F 聚合演示
+      - EBI/镜像/BoardManifest/EFP 规范 v1.0 冻结
+
+  - id: phase-3
+    name: Service Tile + 调度 + 安全 + 学术发布
+    window: M9-M15
+    exit_criteria:
+      - NPU-Tiny 推理 demo + 多容器分时复用
+      - 容器迁移/抢占演示（BMC 编排上下文保存）
+      - OCI 镜像仓库 push/pull
+      - 论文投稿（FPL/FCCM/TRETS）
+
+  - id: phase-4
+    name: 编排与生态
+    window: M15-M24
+    exit_criteria:
+      - 统一编排器（bundle/多板/声明式）
+      - BMC 固件迁移 Zephyr，BMC 成为 Astral 节点
+      - 4 个参考设计套件
+      - >=2 名核心外部贡献者
+
+  - id: phase-5
+    name: 商业级演进
+    window: M24+
+    exit_criteria:
+      - 企业版编排/RBAC/远程运维（BMC 健康审计为卖点）
+      - 安全认证预评估材料
+      - 镜像仓库 SaaS / 厂商合作
+
+tasks:
+  # ================= PHASE 0 =================
+  - id: E0-INF1
+    title: GitHub 组织与 8 仓库骨架（许可证/DCO/CONTRIBUTING）
+    phase: phase-0
+    deps: []
+    est_days: 1
+    deliverable: 仓库组（ethereal-fabric/shell/tools/runtime/spec/images/astral-os/docs）
+    acceptance: clone 后 README 与许可证链接全部有效；DCO 检查启用
+    status: todo
+
+  - id: E0-INF2
+    title: CI 骨架（Verilator lint + cocotb 回归 + 文档构建）
+    phase: phase-0
+    deps: [E0-INF1]
+    est_days: 1
+    deliverable: GitHub Actions 工作流
+    acceptance: dummy RTL 测试在 CI 变绿
+    status: todo
+
+  - id: E0-INF3
+    title: 仿真环境 Dockerfile（Verilator5 + cocotb + Yosys + VPR8）
+    phase: phase-0
+    deps: [E0-INF1]
+    est_days: 2
+    deliverable: Dockerfile + Makefile（make sim）
+    acceptance: 干净机器 30 分钟内复现仿真环境
+    status: todo
+
+  - id: E0-INF4
+    title: 商标/名称可用性检查（Ethereal/Astral）
+    phase: phase-0
+    deps: []
+    est_days: 0.5
+    deliverable: 检查记录文档
+    acceptance: GitHub org/域名/开源商标冲突结论明确
+    status: todo
+
+  - id: E0-FAB1
+    title: eLUT4+FF 单元 RTL
+    phase: phase-0
+    deps: [E0-INF3]
+    est_days: 1
+    deliverable: rtl/clb/elut4.sv + cocotb 测试
+    acceptance: 随机真值表 1000 组比对通过
+    status: todo
+
+  - id: E0-FAB2
+    title: CLB-T cluster RTL（N=8, Clos IIB, 参数化）
+    phase: phase-0
+    deps: [E0-FAB1]
+    est_days: 3
+    deliverable: rtl/clb/clb_t.sv
+    acceptance: cluster 内 LUT→LUT 连通性穷举通过
+    status: todo
+
+  - id: E0-FAB3
+    title: Switch box + 通道互联（W=12, 两源轨道优先）
+    phase: phase-0
+    deps: [E0-FAB2]
+    est_days: 4
+    deliverable: rtl/interconnect/ + 拓扑表
+    acceptance: 4x4 cluster 网格例化成功，无组合环
+    status: todo
+
+  - id: E0-FAB4
+    title: 配置帧组织 + OCC v0（WRITE/BLANK/READBACK）
+    phase: phase-0
+    deps: [E0-FAB3]
+    est_days: 4
+    deliverable: rtl/occ/ + 帧地址映射生成脚本
+    acceptance: 经 OCC 写配置后 fabric 行为=指定电路（加法器/计数器样例）
+    status: todo
+
+  - id: E0-FAB5
+    title: blank-before-write 与 region 配置锁
+    phase: phase-0
+    deps: [E0-FAB4]
+    est_days: 2
+    deliverable: OCC 扩展 + 断言
+    acceptance: 改写相邻 region 时本 region 输出无毛刺（断言监测）；LOCK 后写被丢弃
+    status: todo
+
+  - id: E0-FAB6
+    title: fabric-gen v0（fabric.yaml → 顶层 Verilog + 帧映射 JSON）
+    phase: phase-0
+    deps: [E0-FAB3]
+    est_days: 3
+    deliverable: tools/fabric_gen/
+    acceptance: 2x2 与 4x4 两种 fabric 均通过 E0-FAB4 验收用例
+    status: todo
+
+  - id: E0-MAP1
+    title: Yosys 定制综合（eLUT4 techlib + synth_ethereal）
+    phase: phase-0
+    deps: []
+    est_days: 2
+    deliverable: tools/mapper/yosys/
+    acceptance: c17/c432 映射为 eLUT4 网表，LUT 数合理
+    status: todo
+
+  - id: E0-MAP2
+    title: VPR 架构文件（eLUT4 cluster + W=12）
+    phase: phase-0
+    deps: [E0-FAB2, E0-FAB3]
+    est_days: 4
+    deliverable: tools/mapper/vpr/arch_ethereal.xml
+    acceptance: VPR 对 c432 完成 pack/place/route，时序报告可读
+    status: todo
+
+  - id: E0-MAP3
+    title: bitgen v0（VPR 结果 → 配置帧比特流）
+    phase: phase-0
+    deps: [E0-MAP2, E0-FAB4]
+    est_days: 5
+    deliverable: tools/mapper/bitgen/
+    acceptance: c432 端到端载入仿真 fabric，输出与参考模型 bit-true
+    status: todo
+
+  - id: E0-MAP4
+    title: FABulous 流程评估 spike → ADR-012（MAP 路线决策）
+    phase: phase-0
+    deps: []
+    est_days: 3
+    deliverable: 评估笔记 + docs/adr/ADR-012.md
+    acceptance: 路线 A(VPR) / B(FABulous) 决策记录完成
+    status: todo
+
+  - id: E0-MAP5
+    title: 基准电路集（AES-128/PRESENT/FIR16/CRC32/PWM + 黄金向量）
+    phase: phase-0
+    deps: [E0-MAP3]
+    est_days: 4
+    deliverable: benchmarks/
+    acceptance: 全部基准经完整流程在仿真 fabric 运行正确
+    status: todo
+
+  - id: E0-SHL1
+    title: EBI-Tiny 总线 RTL + 地址映射 decoder
+    phase: phase-0
+    deps: []
+    est_days: 1
+    deliverable: rtl/ebi/ebi_tiny.sv
+    acceptance: BFM 随机读写一致性测试通过
+    status: todo
+
+  - id: E0-SHL2
+    title: Shell v0 仿真集成（EBI+OCC+fabric+宿主 BFM）
+    phase: phase-0
+    deps: [E0-FAB4, E0-SHL1]
+    est_days: 3
+    deliverable: sim/tb_shell/
+    acceptance: 仿真内完成完整容器部署周期：写配置→启动→读结果→blank→换镜像→再运行
+    status: todo
+
+  - id: E0-SHL3
+    title: 性能建模（配置字节数/时延模型/虚拟 Fmax 初值）
+    phase: phase-0
+    deps: [E0-SHL2]
+    est_days: 2
+    deliverable: docs/performance-model.md
+    acceptance: 给出 4x4 fabric 配置字节数与 Fmax 估算并归档
+    status: todo
+
+  # ================= PHASE 1 =================
+  - id: E1-PLT1
+    title: GW5 宿主映射层 hal/gowin_gw5（CFU memory 模式/BSRAM/DSP wrapper）
+    phase: phase-1
+    deps: [E0-FAB6]
+    est_days: 4
+    deliverable: ethereal-fabric/hal/gowin_gw5/
+    acceptance: 4x4 fabric 综合后物理 LUT 开销 ≤45:1 并报告实际值
+    status: todo
+
+  - id: E1-PLT2
+    title: Base image 构建流（Gowin EDA 工程模板 + 脚本化）
+    phase: phase-1
+    deps: [E1-PLT1]
+    est_days: 3
+    deliverable: build/gowin/ + 构建脚本
+    acceptance: Tang Mega 138K 烧写后经 SPI 读出 Shell magic number
+    status: todo
+
+  - id: E1-PLT4
+    title: Apicula/nextpnr Aurora V 备选构建链评估
+    phase: phase-1
+    deps: [E1-PLT1]
+    est_days: 3
+    deliverable: 评估笔记
+    acceptance: 可行性结论（CI 构建通道是否可用）
+    status: todo
+
+  - id: E1-BMC1
+    title: BMC SoC 集成（NEORV32 + Boot ROM + 128KB FW SRAM + UART + EBI 桥）
+    phase: phase-1
+    deps: [E0-SHL1]
+    est_days: 4
+    deliverable: ethereal-shell/bmc/（bmc_core wrapper，核可替换）
+    acceptance: 仿真与 GW5 双平台 hello-world + Shell CSR 读写；BMC 总开销报告（LUT+BSRAM）
+    status: todo
+
+  - id: E1-BMC2
+    title: BMC 固件框架（boot 双分区 + 驱动层 + lifecycle 状态机骨架）
+    phase: phase-1
+    deps: [E1-BMC1]
+    est_days: 4
+    deliverable: ethereal-runtime/bmc-fw/
+    acceptance: 固件 UART 启动；region 状态机空转演示；FW 双分区自更新演示
+    status: todo
+
+  - id: E1-BMC3
+    title: BMC 调试通道（UART 控制台 + JTAG 排针 + OpenOCD 配置）
+    phase: phase-1
+    deps: [E1-BMC1]
+    est_days: 2
+    deliverable: 调试指南 + openocd cfg
+    acceptance: GDB 断点/单步调试 BMC 固件成功；全程无付费工具
+    status: todo
+
+  - id: E1-BMC4
+    title: EMRI 寄存器面实现（ADR-015）+ 上位机模式探测
+    phase: phase-1
+    deps: [E1-BMC1]
+    est_days: 2
+    deliverable: rtl/emri/ + ethctl 探测逻辑
+    acceptance: ethctl 自动识别 BMC/mFSM 模式并调整会话语义
+    status: todo
+
+  - id: E1-IO1
+    title: SPI 数据通道（NEORV32 SDI + EFP-SPI 帧协议固件栈 + CRC16）
+    phase: phase-1
+    deps: [E1-BMC2]
+    est_days: 2
+    deliverable: bmc-fw/efp-spi/ + spec EFP-SPI
+    acceptance: 上位机经 SPI 完成完整 logic image 部署；CRC 错误注入通过
+    status: todo
+
+  - id: E1-IO2
+    title: I2C 监控通道 v1（NEORV32 TWD + PMBus 风格命令固件）
+    phase: phase-1
+    deps: [E1-BMC2]
+    est_days: 2
+    deliverable: bmc-fw/monitor/ + spec RFC-003
+    acceptance: 树莓派 i2cget 读出 slot 状态；24h 轮询无锁死
+    status: todo
+
+  - id: E1-IO3
+    title: L1 引脚 Mux v1（8 脚组 x4）+ Board Manifest
+    phase: phase-1
+    deps: [E0-SHL1]
+    est_days: 3
+    deliverable: rtl/io/pinmux/ + boards/tang-mega-138k.yaml
+    acceptance: PWM 镜像经 mux 输出到任意两组引脚，示波器验证
+    status: todo
+
+  - id: E1-IO4
+    title: L2 协议代理 v1（UART + GPIO）
+    phase: phase-1
+    deps: [E0-SHL1]
+    est_days: 3
+    deliverable: rtl/io/proxy_uart/ + proxy_gpio/
+    acceptance: region 内虚拟逻辑经 UART 代理 115200 收发无丢字节
+    status: todo
+
+  - id: E1-RUN1
+    title: ethimg 镜像工具（pack/unpack/verify + Ed25519）
+    phase: phase-1
+    deps: [E0-MAP3]
+    est_days: 2
+    deliverable: tools/ethimg/
+    acceptance: 篡改任意字节即验签失败
+    status: todo
+
+  - id: E1-RUN2
+    title: ethereal-daemon v1（BMC 固件：验签→region 分配→OCC(DMA) 加载→生命周期）
+    phase: phase-1
+    deps: [E1-BMC2, E1-IO1]
+    est_days: 4
+    deliverable: bmc-fw/daemon/
+    acceptance: run/stop/ps/restart 全通；坏签名/满 region/写冲突优雅报错
+    status: todo
+
+  - id: E1-RUN3
+    title: ethctl CLI（Docker 风格命令集）
+    phase: phase-1
+    deps: [E1-RUN2, E1-BMC4]
+    est_days: 3
+    deliverable: tools/ethctl/
+    acceptance: ethctl run aes128.eth --region 0 在 30s 内完成部署
+    status: todo
+
+  - id: E1-RUN4
+    title: region 看门狗 v1（心跳+超时 blank+事件日志）
+    phase: phase-1
+    deps: [E1-RUN2]
+    est_days: 2
+    deliverable: bmc-fw/watchdog/
+    acceptance: 死锁镜像超时自动 blank，相邻 region 无损
+    status: todo
+
+  - id: E1-DMO1
+    title: 三个演示镜像（PWM/UART 回显/AES-128）
+    phase: phase-1
+    deps: [E0-MAP5, E1-RUN3]
+    est_days: 4
+    deliverable: ethereal-images/ 三个镜像
+    acceptance: 2 region 轮换运行；热替换 <10ms(BMC+DMA) / <100ms(上位机经 SPI)
+    status: todo
+
+  - id: E1-DMO2
+    title: 热替换稳定性测试（2x10000 次 + 干扰监测）
+    phase: phase-1
+    deps: [E1-DMO1]
+    est_days: 2
+    deliverable: tests/stress/ + 报告
+    acceptance: 零配置损坏、零跨区干扰
+    status: todo
+
+  - id: E1-DMO3
+    title: v0.1.0 里程碑发布（视频+博客+文档站）
+    phase: phase-1
+    deps: [E1-DMO2]
+    est_days: 2
+    deliverable: release v0.1.0 + 博客文章
+    acceptance: 仓库公开，文档站上线
+    status: todo
+
+  # ================= PHASE 2（中粒度） =================
+  - id: E2-FAB1
+    title: MEM-T tile（BSRAM 包装：位宽/双口/FIFO/ROM 预载）
+    phase: phase-2
+    deps: [E1-PLT1]
+    est_days: 5
+    deliverable: rtl/tiles/mem_t/
+    acceptance: AES S-box MEM-T 版 vs LUT 版 eLUT 占用降 ≥5x
+    status: todo
+
+  - id: E2-FAB2
+    title: DSP-T tile（27x18 MAC 模式封装）
+    phase: phase-2
+    deps: [E1-PLT1]
+    est_days: 5
+    deliverable: rtl/tiles/dsp_t/
+    acceptance: FIR16 DSP-T 链实测 Fmax 与吞吐达标（vs LUT 版 ≥10x 吞吐）
+    status: todo
+
+  - id: E2-FAB3
+    title: SSM-T tile + 上下文保存 v1（FF 状态扫描读/写，BMC 编排）
+    phase: phase-2
+    deps: [E1-RUN2]
+    est_days: 5
+    deliverable: rtl/tiles/ssm_t/ + context save/restore
+    acceptance: 容器暂停/恢复演示通过
+    status: todo
+
+  - id: E2-FAB4
+    title: fabric.yaml v2（异构 region 组合 + supertile）
+    phase: phase-2
+    deps: [E2-FAB1, E2-FAB2]
+    est_days: 5
+    deliverable: fabric-gen v2 + 帧映射 v2
+    acceptance: 混合 tile region 生成/配置/运行全链路通过
+    status: todo
+
+  - id: E2-FAB5
+    title: 互联优化 v2（两源轨道 + LUT 平台期对齐）
+    phase: phase-2
+    deps: [E1-PLT1]
+    est_days: 5
+    deliverable: rtl/interconnect v2
+    acceptance: 同规模 fabric 物理 LUT 降 ≥20%
+    status: todo
+
+  - id: E2-MAP1
+    title: 异构映射（Yosys mem/dsp 推断 + VPR 异构 arch + bitgen v2）
+    phase: phase-2
+    deps: [E2-FAB4]
+    est_days: 8
+    deliverable: tools/mapper v2
+    acceptance: 含 RAM/DSP 的基准端到端 bit-true
+    status: todo
+
+  - id: E2-IO1
+    title: L2 代理库扩展（SPI/I2C master/PWM/QEI）+ RFC-004 冻结
+    phase: phase-2
+    deps: [E1-IO4]
+    est_days: 6
+    deliverable: rtl/io/proxy_*/ + spec RFC-004
+    acceptance: 虚拟设备寄存器规范 v1.0 发布
+    status: todo
+
+  - id: E2-IO2
+    title: L1 mux v2 + 引脚时序表征
+    phase: phase-2
+    deps: [E1-IO3]
+    est_days: 3
+    deliverable: pinmux v2 + manifest 更新
+    acceptance: 8 组引脚池；各路 max 频率实测写入 manifest
+    status: todo
+
+  - id: E2-BMC1
+    title: mFSM 精简管理单元（无 CPU 寄存器式，Profile-E）
+    phase: phase-2
+    deps: [E1-BMC4]
+    est_days: 4
+    deliverable: rtl/mfsm/
+    acceptance: 仿真中上位机脚本经 EMRI 驱动完整部署流程；ethctl 无感切换
+    status: todo
+
+  - id: E2-BMC2
+    title: （可选）VexRiscv 备选核 wrapper 验证
+    phase: phase-2
+    deps: [E1-BMC2]
+    est_days: 3
+    deliverable: bmc_core/vexriscv 变体
+    acceptance: 同一固件 ABI 在备选核跑通，验证核可替换性
+    status: todo
+
+  - id: E2-PLT1
+    title: Zynq US+ 移植（hal/xilinx_us + BMC 同款软核 + Linux 上位机）
+    phase: phase-2
+    deps: [E2-FAB4, E1-RUN2]
+    est_days: 8
+    deliverable: hal/xilinx_us/ + runtime/linux/
+    acceptance: Phase 1 全部演示在 US+ 复现；同一 image 双平台直接运行
+    status: todo
+
+  - id: E2-PLT2
+    title: 原生 DFX 槽位并存（DFX Controller 接入生命周期）
+    phase: phase-2
+    deps: [E2-PLT1]
+    est_days: 6
+    deliverable: runtime/dfx/
+    acceptance: overlay 容器 + 原生 DFX 加速核混合运行演示
+    status: todo
+
+  - id: E2-SEC1
+    title: 安全 v1（强制验签 + region 锁矩阵 + 能力清单校验）
+    phase: phase-2
+    deps: [E1-RUN2]
+    est_days: 4
+    deliverable: runtime/security/
+    acceptance: 未签名镜像拒绝；越权 IO 分配拒绝
+    status: todo
+
+  - id: E2-AST1
+    title: Astral 聚合 v1（Zephyr+WAMR + Type-F 容器经 EFP 调 vFPGA）
+    phase: phase-2
+    deps: [E1-RUN3]
+    est_days: 8
+    deliverable: astral-os/ 最小运行时 + 聚合 demo
+    acceptance: WASM 容器与 vFPGA 逻辑双向数据通路演示
+    status: todo
+
+  - id: E2-DOC1
+    title: 规范冻结（EBI/镜像/BoardManifest/EFP v1.0）
+    phase: phase-2
+    deps: [E2-IO1, E2-PLT1]
+    est_days: 3
+    deliverable: ethereal-spec/ v1.0 tags
+    acceptance: 四份规范语义化版本发布
+    status: todo
+
+  # ================= PHASE 3+（里程碑级） =================
+  - id: E3-SVC1
+    title: NPU-Tiny Service Tile（INT8 8x8 systolic + TinyML demo）
+    phase: phase-3
+    deps: [E2-FAB4]
+    est_days: 15
+    deliverable: service tiles + 推理 demo
+    acceptance: 吞吐/能效报告；多容器分时复用无状态泄漏
+    status: todo
+
+  - id: E3-SCH1
+    title: 配置调度器（镜像分组 + 预取 + 缓存，BMC 执行）
+    phase: phase-3
+    deps: [E2-PLT1]
+    est_days: 8
+    deliverable: bmc-fw/scheduler/
+    acceptance: 预取命中冷启动 P50 <100ms
+    status: todo
+
+  - id: E3-SCH2
+    title: 容器迁移/抢占 + 碎片整理 v1
+    phase: phase-3
+    deps: [E2-FAB3]
+    est_days: 10
+    deliverable: bmc-fw/migration/
+    acceptance: region 间迁移演示通过
+    status: todo
+
+  - id: E3-SEC2
+    title: 安全 v2（虚拟配置静态检查钩子 + 异常功耗/时序监控）
+    phase: phase-3
+    deps: [E2-SEC1]
+    est_days: 8
+    deliverable: runtime/security/v2/
+    acceptance: 环振/短路结构扫描检出率报告
+    status: todo
+
+  - id: E3-REP1
+    title: OCI 兼容镜像仓库 v1（ethctl push/pull）
+    phase: phase-3
+    deps: [E1-RUN1]
+    est_days: 5
+    deliverable: tools/registry/
+    acceptance: push/pull/版本管理可用
+    status: todo
+
+  - id: E3-PUB1
+    title: 论文投稿（FPL/FCCM/TRETS）
+    phase: phase-3
+    deps: [E2-FAB5, E2-PLT1]
+    est_days: 15
+    deliverable: 论文草稿
+    acceptance: 投稿完成
+    status: todo
+
+  - id: E3-MON1
+    title: 监控 v2（Zynq SEM 擦洗由 BMC 调度；I2C 命令集扩展）
+    phase: phase-3
+    deps: [E2-PLT1]
+    est_days: 6
+    deliverable: bmc-fw/scrub/ + monitor v2
+    acceptance: SEU 注入实验自动修复演示
+    status: todo
+
+  - id: E4-ORC1
+    title: 统一编排器（bundle/多板/声明式 YAML）
+    phase: phase-4
+    deps: [E3-SCH1]
+    est_days: 20
+    deliverable: ethereal-orchestrator/
+    acceptance: 多板部署 demo
+    status: todo
+
+  - id: E4-BMC1
+    title: BMC 固件迁移 Zephyr → BMC 成为 Astral 节点
+    phase: phase-4
+    deps: [E3-SCH1]
+    est_days: 10
+    deliverable: bmc-fw/zephyr/
+    acceptance: Astral 运行时在 BMC 上运行，Type-F 容器本机部署
+    status: todo
+
+  - id: E4-DEV1
+    title: 开发者体验（VS Code 扩展 + TUI 仪表盘）
+    phase: phase-4
+    deps: [E3-REP1]
+    est_days: 15
+    deliverable: tools/ide/
+    acceptance: 镜像构建/部署/调试 IDE 内闭环
+    status: todo
+
+  - id: E4-KIT1
+    title: 参考设计套件 x4（电机控制/SDR/工业网关/NPU 协处理）
+    phase: phase-4
+    deps: [E3-SVC1]
+    est_days: 25
+    deliverable: kits/
+    acceptance: 每个套件含完整文档与演示
+    status: todo
