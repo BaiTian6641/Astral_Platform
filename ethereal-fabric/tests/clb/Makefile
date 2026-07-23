@@ -1,16 +1,17 @@
-# cocotb test for elut4.sv (task E0-FAB1)
+# cocotb tests for the CLB: elut4.sv (E0-FAB1) and clb_t.sv (E0-FAB2)
 # -----------------------------------------------------------------------------
-# Invoked by the root Makefile as:
+# Default runs the elut4 test. Override TOPLEVEL/MODULE for clb_t:
+#     make -C ethereal-fabric/tests/clb sim TOPLEVEL=clb_t MODULE=test_clb_t
 #     make -C ethereal-fabric/tests/clb {sim|test|lint} SIM=verilator
-# The golden model elut4_model.py lives next to this test; it is put on
-# PYTHONPATH so `from elut4_model import Elut4, Elut4Config` resolves.
+# The golden models (elut4_model.py, clb_t_model.py) live next to the tests and
+# are put on PYTHONPATH so the imports resolve.
 # GNU make required. Recipes use TABS.
 
 SIM            ?= verilator
 TOPLEVEL_LANG  ?= verilog
-VERILOG_SOURCES += $(CURDIR)/../../rtl/clb/elut4.sv
-TOPLEVEL        = elut4
-MODULE          = test_elut4
+VERILOG_SOURCES += $(CURDIR)/../../rtl/clb/elut4.sv $(CURDIR)/../../rtl/clb/clb_t.sv
+TOPLEVEL        ?= elut4
+MODULE          ?= test_elut4
 
 # Golden model lives in this dir; export it on PYTHONPATH for the test import.
 export PYTHONPATH := $(CURDIR):$(PYTHONPATH)
@@ -28,4 +29,4 @@ include $(shell cocotb-config --makefiles)/Makefile.simules
 test: sim
 
 lint:
-	verilator --lint-only -Wall $(CURDIR)/../../rtl/clb/elut4.sv
+	verilator --lint-only -Wall $(CURDIR)/../../rtl/clb/elut4.sv $(CURDIR)/../../rtl/clb/clb_t.sv

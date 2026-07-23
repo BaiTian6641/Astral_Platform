@@ -7,7 +7,8 @@
 - **Wk1 infrastructure ✅ (committed `78ab251`):** E0-INF1 (8-repo skeleton) + E0-INF2 (CI) + E0-INF3 (Docker+Makefile+smoke) + E0-INF4 (trademark) + S04-P0#1 (mailbox migrated to ethereal-shell, CERN-OHL-S, lint cleanup pending `S04-P0#2`). Docker-gated validations pending.
 - **E0-FAB1 ✅ (elut4+FF):** `ethereal-fabric/rtl/clb/elut4.sv` G1-clean (in lint glob); golden model `elut4_model.py` validated by **1211 local pytest**; cocotb DUT-vs-model Docker-gated. Bitfield frozen in `ethereal-spec/fabric/elut4-config-v0.md`. Report: `docs/reports/report-E0-FAB1-elut4-20260724.md`.
 - **Convention established:** `make test-model` = local pure-Python golden-model pytest (no simulator); cocotb tests `test_<unit>.py` (Docker-gated), model tests `test_<unit>_model.py` (local).
-- **Next:** E0-FAB2 (CLB-T cluster, N=8 eLUT4 + Clos IIB I=26).
+- **Next:** E0-FAB3 (SB + channel interconnect W=12, 4×4 grid no comb loop).
+- **E0-FAB2 ✅ (clb_t):** `ethereal-fabric/rtl/clb/clb_t.sv` (N=8 eLUT4 + flat full-input crossbar IIB, I=26; scoped UNOPTFLAT waiver for the feedback loop); golden model `clb_t_model.py` validated locally (**1218 total pytest** incl. 832-route connectivity exhaustion + toggle-FF + comb-loop detect); cocotb Docker-gated. v1 IIB = **flat crossbar** (frozen + ASSUMPTION — two-level Clos is the v2 optimization). Spec `ethereal-spec/fabric/clb-t-config-v0.md`. Report `docs/reports/report-E0-FAB2-clb-t-20260724.md`.
 
 ## Phase summary
 | Phase | Window | Core goal | Key exit criteria | Budget |
