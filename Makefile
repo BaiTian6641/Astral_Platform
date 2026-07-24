@@ -105,7 +105,7 @@ else
 endif
 
 test-model: ## Run pure-Python golden-model pytest (no simulator needed; runs locally)
-	@MODELS=$$(find ethereal-fabric/tests -name 'test_*_model.py' 2>/dev/null); \
+	@MODELS=$$( (find ethereal-fabric/tests -name 'test_*_model.py'; find ethereal-tools -name 'test_*.py') 2>/dev/null); \
 	if [ -z "$$MODELS" ]; then \
 		echo "[test-model] No test_*_model.py found under ethereal-fabric/tests."; \
 		exit 0; \
