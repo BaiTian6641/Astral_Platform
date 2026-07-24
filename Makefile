@@ -36,7 +36,7 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/occ/occ_top.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
 RTL_FILES := $(RTL_FABRIC_DEPS)
 # Imported (not-yet-G1-clean) Mailbox RTL — linted separately, never fatal.
@@ -66,9 +66,11 @@ ifeq ($(VERILATOR),)
 	@echo "[lint]   (reproducible img):  make docker-build && make docker-shell  # then make lint"
 	@exit 1
 else
-	@echo "[lint] clean modules (strict -Wall): elut4, switch_box"
-	verilator --lint-only -Wall --top-module elut4 -Mdir obj_dir/lint_elut4 ethereal-fabric/rtl/clb/elut4.sv
-	verilator --lint-only -Wall --top-module switch_box -Mdir obj_dir/lint_switch_box ethereal-fabric/rtl/interconnect/switch_box.sv
+	@echo "[lint] clean modules (strict -Wall): $(RTL_CLEAN)"
+	@for f in $(RTL_CLEAN); do \
+	  m=$$(basename $$f .sv); \
+	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m $$f || exit 1; \
+	done
 	@echo "[lint] fabric modules (-Wall -Wno-UNOPTFLAT; intended loops per C01 sec2.4): clb_t, fabric_top"
 	verilator --lint-only -Wall -Wno-UNOPTFLAT --top-module fabric_top -Mdir obj_dir/lint_fabric $(RTL_FABRIC_DEPS)
 	@echo "[lint] OK - all project RTL lint-clean."
@@ -93,6 +95,7 @@ else
 	@echo "[test-sv] tb_elut4";      $(IVERILOG) -g2012 -o /tmp/tb_elut4 ethereal-fabric/tests/clb/tb_elut4.sv ethereal-fabric/rtl/clb/elut4.sv && vvp /tmp/tb_elut4 | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_clb_t";      $(IVERILOG) -g2012 -o /tmp/tb_clb_t ethereal-fabric/tests/clb/tb_clb_t.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/clb/elut4.sv && vvp /tmp/tb_clb_t | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_switch_box"; $(IVERILOG) -g2012 -o /tmp/tb_sb ethereal-fabric/tests/interconnect/tb_switch_box.sv ethereal-fabric/rtl/interconnect/switch_box.sv && vvp /tmp/tb_sb | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_occ";       $(IVERILOG) -g2012 -o /tmp/tb_occ ethereal-fabric/tests/occ/tb_occ.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_occ | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
