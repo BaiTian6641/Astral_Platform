@@ -25,6 +25,7 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB4)
+// Modified:    2026-07-24 - blank-before-write enforcement + NEEDS_BLANK (task E0-FAB5)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C03-OCC组件.md §2
 // Notes:       v0 scope per C03 §2.2 (simplified): no mailbox/DMA, no col_ack
@@ -33,7 +34,9 @@
 //              (single region_locked_i gate). FABulous blank-before-write red
 //              line (C03 §0) is respected at the protocol level: a region must be
 //              blanked before its first config WRITE — enforced by the BMC, not
-//              by occ_top v0.
+//              by occ_top v0.  [SUPERSEDED in E0-FAB5: blank-before-write is
+//              now HARDWARE-ENFORCED in occ_top via a per-region dirty bit and
+//              the S_NEEDS_BLANK status -- see dirty_r / region_id_r below.]
 //              ASSUMPTION (TBD 2026-07-24): DATA_W must equal 32 — crc32_next is
 //              a fixed 32-bit/4-byte tableless function (matches the frozen
 //              DATA_W=32 frame word width, C03 §1.1). Parameterized for interface
@@ -97,6 +100,7 @@ module occ_top #(
     localparam logic [2:0] S_DONE   = 3'd2;
     localparam logic [2:0] S_ERROR  = 3'd3;
     localparam logic [2:0] S_LOCKED = 3'd4;
+    localparam logic [2:0] S_NEEDS_BLANK = 3'd5;   // E0-FAB5: WRITE to a dirty region
 
     // --------------------------------------------------------------------
     // Streaming CRC32 (Ethernet poly 0x04C11DB7, init 0xFFFFFFFF, no final xor,
@@ -160,6 +164,13 @@ module occ_top #(
     logic              c_read_word;     // READBACK: a word is being read
     logic              c_cmp_mismatch;  // CMP: crc_r != write_crc_r
 
+    // blank-before-write (E0-FAB5, C03 sec3): per-region dirty tracking
+    logic [3:0]  region_id_w;       // current cmd region = frame_addr top 4 bits
+    logic [3:0]  region_id_r;       // latched region of the in-flight op
+    logic [15:0] dirty_r;           // 1 = region has live config (must BLANK before WRITE)
+    logic        c_write_done;      // WRITE completion cycle
+    logic        c_blank_done;      // BLANK completion cycle
+
     always_comb begin
         // ---- defaults (no latches) ----
         state_nxt      = state_r;
@@ -176,20 +187,32 @@ module occ_top #(
         c_blank_word   = 1'b0;
         c_read_word    = 1'b0;
         c_cmp_mismatch = 1'b0;
+        c_write_done   = 1'b0;
+        c_blank_done   = 1'b0;
 
         case (state_r)
             ST_IDLE: begin
                 status_c = S_IDLE;
                 if (cmd_valid_i) begin
                     case (cmd_i)
-                        CMD_WRITE, CMD_BLANK: begin
+                        CMD_WRITE: begin
                             if (region_locked_i) begin
-                                // reject: stay IDLE, signal LOCKED this cycle
+                                status_c = S_LOCKED;          // reject: region locked
+                            end else if (dirty_r[region_id_w]) begin
+                                status_c = S_NEEDS_BLANK;     // E0-FAB5: must BLANK first
+                            end else begin
+                                cmd_ready = 1'b1;
+                                c_accept  = 1'b1;
+                                state_nxt = ST_WRITE;
+                            end
+                        end
+                        CMD_BLANK: begin
+                            if (region_locked_i) begin
                                 status_c = S_LOCKED;
                             end else begin
                                 cmd_ready = 1'b1;
                                 c_accept  = 1'b1;
-                                state_nxt = state_e'((cmd_i == CMD_WRITE) ? ST_WRITE : ST_BLANK);
+                                state_nxt = ST_BLANK;
                             end
                         end
                         CMD_READBACK: begin
@@ -207,8 +230,9 @@ module occ_top #(
             ST_WRITE: begin
                 if (idx_r == word_count_r) begin
                     // completion cycle: all words streamed
-                    status_c  = S_DONE;
-                    state_nxt = ST_IDLE;
+                    status_c     = S_DONE;
+                    c_write_done = 1'b1;
+                    state_nxt    = ST_IDLE;
                 end else begin
                     status_c   = S_BUSY;
                     wdata_ready = 1'b1;
@@ -225,8 +249,9 @@ module occ_top #(
 
             ST_BLANK: begin
                 if (idx_r == word_count_r) begin
-                    status_c  = S_DONE;
-                    state_nxt = ST_IDLE;
+                    status_c     = S_DONE;
+                    c_blank_done = 1'b1;
+                    state_nxt    = ST_IDLE;
                 end else begin
                     status_c     = S_BUSY;
                     fbus_we      = 1'b1;
@@ -286,6 +311,8 @@ module occ_top #(
             crc_r        <= 32'hFFFF_FFFF;
             write_crc_r  <= 32'hFFFF_FFFF;
             crc_error_r  <= 1'b0;
+            region_id_r  <= '0;
+            dirty_r      <= '0;            // E0-FAB5: regions start CLEAN
         end else begin
             if (c_accept) begin
                 // latch command context, (re)seed CRC, clear sticky error
@@ -294,6 +321,7 @@ module occ_top #(
                 idx_r        <= '0;
                 crc_r        <= 32'hFFFF_FFFF;
                 crc_error_r  <= 1'b0;
+                region_id_r  <= region_id_w;   // E0-FAB5: latch region of in-flight op
             end else if (c_write_word) begin
                 idx_r   <= idx_r + 16'd1;
                 crc_r   <= crc32_next(crc_r, wdata_i);
@@ -310,6 +338,10 @@ module occ_top #(
             end else if (c_cmp_mismatch) begin
                 crc_error_r <= 1'b1;            // sticky until next accepted cmd
             end
+            // E0-FAB5: mark region dirty on WRITE completion, clean on BLANK
+            // completion. Independent of the word-level chain above.
+            if (c_write_done) dirty_r[region_id_r] <= 1'b1;
+            if (c_blank_done) dirty_r[region_id_r] <= 1'b0;
         end
     end
 
@@ -324,6 +356,7 @@ module occ_top #(
     assign fbus_re_o    = fbus_re;
     assign status_o     = status_c;
     assign crc_error_o  = crc_error_r;
+    assign region_id_w  = frame_addr_i[ADDR_W-1 -: 4];   // E0-FAB5: top-4-bit region id
 
 endmodule
 

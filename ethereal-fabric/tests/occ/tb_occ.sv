@@ -85,7 +85,7 @@ module tb_occ;
     );
 
     // ---- frame-bus target: column config RAM model ----
-    column_cfg_ram #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .DEPTH(4096)) u_ram (
+    column_cfg_ram #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .DEPTH(8192)) u_ram (
         .clk   (clk),
         .we    (fbus_we),
         .re    (fbus_re),
@@ -250,15 +250,16 @@ module tb_occ;
         // ================================================================
         $display("== check 3: BLANK zeroes the frame ==");
         // ================================================================
-        // first seed non-zero data at 0x0200 (also clears the sticky crc_error
-        // via the new-command accept)
-        run_write(16'h0200, N);
+        // first seed non-zero data at 0x1200 (region 1, CLEAN -- region 0 is dirty
+        // from check 1 and would be rejected by blank-before-write, E0-FAB5).
+        // This accepted WRITE also clears the sticky crc_error.
+        run_write(16'h1200, N);
         wait_done;
         if (crc_error !== 1'b0) begin
             $display("FAIL: sticky crc_error not cleared by new WRITE");
             errors = errors + 1;
         end
-        run_blank(16'h0200, N);
+        run_blank(16'h1200, N);
         wait_done;
         if (status !== S_DONE) begin
             $display("FAIL: blank status=%0d (expected DONE=2)", status);
@@ -271,10 +272,10 @@ module tb_occ;
             integer k, nonzero;
             nonzero = 0;
             for (k = 0; k < N; k = k + 1) begin
-                if (u_ram.mem[16'h0200 + k] !== 32'h0) nonzero = nonzero + 1;
+                if (u_ram.mem[16'h1200 + k] !== 32'h0) nonzero = nonzero + 1;
             end
             if (nonzero !== 0) begin
-                $display("FAIL: BLANK left %0d non-zero word(s) at 0x0200", nonzero);
+                $display("FAIL: BLANK left %0d non-zero word(s) at 0x1200", nonzero);
                 errors = errors + 1;
             end else begin
                 $display("PASS: BLANK zeroed all 8 words");

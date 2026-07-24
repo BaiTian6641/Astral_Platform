@@ -96,6 +96,7 @@ else
 	@echo "[test-sv] tb_clb_t";      $(IVERILOG) -g2012 -o /tmp/tb_clb_t ethereal-fabric/tests/clb/tb_clb_t.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/clb/elut4.sv && vvp /tmp/tb_clb_t | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_switch_box"; $(IVERILOG) -g2012 -o /tmp/tb_sb ethereal-fabric/tests/interconnect/tb_switch_box.sv ethereal-fabric/rtl/interconnect/switch_box.sv && vvp /tmp/tb_sb | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_occ";       $(IVERILOG) -g2012 -o /tmp/tb_occ ethereal-fabric/tests/occ/tb_occ.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_occ | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_blank";     $(IVERILOG) -g2012 -o /tmp/tb_blank ethereal-fabric/tests/occ/tb_blank.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_blank | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 

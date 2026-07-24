@@ -26,7 +26,7 @@
 module column_cfg_ram #(
     parameter int ADDR_W = 16,
     parameter int DATA_W = 32,
-    parameter int DEPTH  = 4096
+    parameter int DEPTH  = 8192
 )(
     input  logic                clk,
     input  logic                we,
