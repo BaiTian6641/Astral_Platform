@@ -44,6 +44,11 @@ module fabric_top #(
     localparam int TIW    = $clog2(NTILES);   // tile-index width
     localparam int AW_SB  = $clog2(4*W);      // switch_box cfg-addr width (=6)
 
+    // cfg_addr_i is 16-bit; only the low (7+TIW) bits are decoded. Sink the
+    // reserved upper bits so the lint tool does not flag them unused.
+    logic _unused_ok;
+    assign _unused_ok = ^{cfg_addr_i[15:11]};
+
     // ---- cfg field decode ----
     logic [5:0]     intra;
     logic           unit_is_sb;               // 0 = CLB, 1 = SB
@@ -84,7 +89,7 @@ module fabric_top #(
                 end
 
                 // ---- tile select + per-unit config decode ----
-                localparam logic [TIW-1:0] MY_IDX = (r*C + c)[TIW-1:0];
+                localparam logic [TIW-1:0] MY_IDX = TIW'(r*C + c);
                 wire sel_tile   = (tile_idx == MY_IDX);
                 wire clb_cfg_we = cfg_we_i &&  sel_tile && ~unit_is_sb;
                 wire sb_cfg_we  = cfg_we_i &&  sel_tile &&  unit_is_sb;

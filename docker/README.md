@@ -12,6 +12,29 @@ pinned in [`Dockerfile`](Dockerfile) and consumed by CI (task `E0-INF2`).
 
 ---
 
+## Local alternative: OSS-CAD Suite (no Docker needed for lint/sim)
+
+The authoring machine has **OSS-CAD Suite** installed at `~/oss-cad-suite`
+(Verilator 5.051, Yosys 0.67, iverilog 14, cocotb). With it on `PATH` you can run
+the **lint + simulation** part of the toolchain **locally, without Docker**:
+
+```bash
+export PATH=~/oss-cad-suite/bin:$PATH
+make lint        # verilator --lint-only -Wall over project RTL (clean)
+make test-sv     # SystemVerilog testbenches via iverilog/vvp
+make test-model  # pure-Python golden-model pytest (any Python 3.12)
+```
+
+The **Docker `ethereal-sim` image is still the pinned/reproducible source of
+truth** (above) and is required for: the **VPR/VTR** mapping toolchain (`E0-MAP2`,
+not in OSS-CAD's scope), **CI parity**, and any contributor without OSS-CAD.
+Use OSS-CAD for fast local lint/sim; use the image for reproducible full-chain +
+CI. (Note: OSS-CAD's bundled cocotb is a py3.11 egg vs the system py3.12 — hence
+`make test-sv` via iverilog is the local DUT validation path; cocotb DUT tests
+run inside the Docker image.)
+
+---
+
 ## What's inside (pinned versions)
 
 | Tool | Version | Tag / source | Why this pin |
@@ -26,10 +49,11 @@ pinned in [`Dockerfile`](Dockerfile) and consumed by CI (task `E0-INF2`).
 
 > **ASSUMPTION (G6, 2026-07-24):** the three EDA tags build cleanly on
 > Ubuntu 22.04 / GCC 11. This image is **NOT build-tested locally** — the
-> authoring environment has no `docker`/`verilator`/`yosys`/`vpr`. The
-> maintainer must run `make docker-build` once and paste results; if any tag
-> fails, see the per-RUN fallback notes in [`Dockerfile`](Dockerfile) and
-> update the report.
+> authoring environment has no `docker` and no `vpr`/`VTR` (OSS-CAD Suite
+> provides Verilator/Yosys/iverilog for local lint/sim — see above — but not
+> VPR, and Docker itself is absent). The maintainer must run `make docker-build`
+> once and paste results; if any tag fails, see the per-RUN fallback notes in
+> [`Dockerfile`](Dockerfile) and update the report.
 
 ---
 

@@ -46,14 +46,25 @@ module clb_t #(
     input  logic [5:0]        cfg_addr_i,
     input  logic [31:0]       cfg_data_i
 );
+    // Scoped UNOPTFLAT waiver (module scope): the CLB feedback
+    // (clb_out_o -> pool -> eLUTs -> clb_out_o) is intended virtual logic
+    // (C01 §2.4 problem 2). At module scope so it covers the port signal the
+    // lint tool attributes the cycle to.
+    /* verilator lint_off UNOPTFLAT */
     // ---- derived parameters ----
     localparam int I    = EXT_IN + N;              // total cluster inputs (26)
     localparam int NK   = N * K;                   // LUT-input mux count (32)
     localparam int POOL = 1 << $clog2(I);          // pow2 >= I (32): index space
     localparam int SELW = $clog2(POOL);            // mux select width (5)
     localparam int AW   = 6;                       // cfg_addr width (frozen)
-    localparam logic [AW-1:0] LUT_END = N[AW-1:0];        // 8
-    localparam logic [AW-1:0] MUX_END = (N + NK)[AW-1:0]; // 40
+    localparam logic [AW-1:0] LUT_END = AW'(N);           // 8
+    localparam logic [AW-1:0] MUX_END = AW'(N + NK);      // 40
+
+    // cfg_data_i is 32-bit per the frozen C01 §2.3 interface; only [19:0]
+    // (eLUT) / [SELW-1:0] (mux) are used. Sink the reserved upper bits so the
+    // lint tool does not flag them unused.
+    logic _unused_ok;
+    assign _unused_ok = ^{cfg_data_i[31:20]};
 
     // ---- IIB mux-select configuration (packed: NK selects x SELW bits) ----
     logic [NK*SELW-1:0] mux_sel_r;
@@ -70,7 +81,7 @@ module clb_t #(
     // ---- IIB mux-select config write ----
     always_ff @(posedge clk_i) begin
         if (cfg_we_i && (cfg_addr_i >= LUT_END) && (cfg_addr_i < MUX_END)) begin
-            mux_sel_r[(cfg_addr_i - LUT_END)*SELW +: SELW] <= cfg_data_i[SELW-1:0];
+            mux_sel_r[(int'(cfg_addr_i) - int'(LUT_END))*SELW +: SELW] <= cfg_data_i[SELW-1:0];
         end
     end
 

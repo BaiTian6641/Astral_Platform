@@ -9,6 +9,7 @@
 #     make lint          verilator --lint-only -Wall over all RTL
 #     make test          cocotb regression (smoke test minimum)
 #     make test-model    pure-Python golden-model pytest (LOCAL, no simulator)
+#     make test-sv       SystemVerilog testbenches via iverilog/vvp (LOCAL OSS-CAD)
 #     make sim           quick smoke simulation (counter)
 #     make docker-build  docker build -f docker/Dockerfile -t ethereal-sim docker/
 #     make docker-shell  run ethereal-sim interactively, repo mounted at /work
@@ -24,18 +25,20 @@ SHELL := /bin/bash
 
 # --- Tool detection (override on the command line if needed, e.g. VERILATOR=...) ---
 VERILATOR ?= $(shell command -v verilator 2>/dev/null)
+IVERILOG   ?= $(shell command -v iverilog 2>/dev/null)
 DOCKER     ?= $(shell command -v docker 2>/dev/null)
 
 # --- Repo layout ---
-# RTL globbed over the project trees. EXCEPTION: the IMPORTED Mailbox NoC +
-# SPI/UART adapters under ethereal-shell/rtl/{mailbox,interface}/ (task S04-P0#1)
-# carry a KNOWN G1-cleanup backlog (~22 procedural loops, plain-logic FSMs — see
-# ethereal-shell/docs/MIGRATION-mailbox.md §5). They are EXCLUDED from the
-# default `lint` so CI stays green AND we never pretend imported code is
-# project-lint-clean. Lint them explicitly via `make lint-mailbox` (advisory,
-# expected to warn until the cleanup task lands). This glob still picks up
-# tests/smoke/counter.sv so `make lint` exercises the smoke test too.
-RTL_FILES := $(shell find ethereal-fabric ethereal-shell -type f \( -name '*.sv' -o -name '*.v' \) 2>/dev/null | grep -v -E 'ethereal-shell/rtl/(mailbox|interface)/')
+# `make lint` covers PROJECT RTL only: ethereal-fabric/rtl/{clb,interconnect}/*.sv.
+# Testbenches (tests/**/tb_*.sv) and the smoke DUT (tests/smoke/counter.sv) are
+# NOT linted here (lint them via their test Makefiles). The IMPORTED Mailbox NoC
+# + SPI/UART adapters under ethereal-shell/rtl/{mailbox,interface}/ (S04-P0#1)
+# carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
+# (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
+# linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv
+RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
+RTL_FILES := $(RTL_FABRIC_DEPS)
 # Imported (not-yet-G1-clean) Mailbox RTL — linted separately, never fatal.
 MAILBOX_RTL := $(shell find ethereal-shell/rtl/mailbox ethereal-shell/rtl/interface -type f \( -name '*.sv' -o -name '*.v' \) 2>/dev/null)
 
@@ -45,7 +48,7 @@ SMOKE_DIR := ethereal-fabric/tests/smoke
 IMAGE    := ethereal-sim
 WORKDIR  := /work
 
-.PHONY: help lint lint-mailbox test test-model sim docker-build docker-shell clean
+.PHONY: help lint lint-mailbox test test-model test-sv sim docker-build docker-shell clean
 
 help: ## Show this help
 	@echo "Ethereal Logic Platform — root Makefile (GNU make)"
@@ -56,22 +59,19 @@ help: ## Show this help
 	@echo "RTL currently picked up by 'lint':"
 	@echo "  $(if $(strip $(RTL_FILES)),$(strip $(RTL_FILES)),<none yet — fabric RTL lands in E0-FAB1..6>)"
 
-lint: ## Verilator --lint-only -Wall over all RTL (ethereal-fabric + ethereal-shell)
-ifeq ($(strip $(RTL_FILES)),)
-	@echo "[lint] No *.sv/*.v files found under ethereal-fabric/ or ethereal-shell/."
-	@echo "[lint] (Fabric RTL lands in tasks E0-FAB1..6; this is expected at Phase-0 start.)"
-	@echo "[lint] To lint just the smoke test: make -C $(SMOKE_DIR) lint"
-else
+lint: ## Verilator --lint-only -Wall over project RTL (clean modules strict; fabric loop-modules with documented -Wno-UNOPTFLAT, C01 sec2.4)
 ifeq ($(VERILATOR),)
-	@echo "[lint] ERROR: verilator not found on PATH."
-	@echo "[lint] Native lint requires the ethereal-sim image. Run:"
-	@echo "[lint]     make docker-build && make docker-shell"
-	@echo "[lint] then inside the container: make lint"
-	@echo "[lint] (CI task E0-INF2 also runs this inside ethereal-sim.)"
+	@echo "[lint] ERROR: verilator not found on PATH. Options:"
+	@echo "[lint]   (local, no Docker):  PATH=\$$HOME/oss-cad-suite/bin:\$$PATH make lint"
+	@echo "[lint]   (reproducible img):  make docker-build && make docker-shell  # then make lint"
 	@exit 1
 else
-	verilator --lint-only -Wall $(RTL_FILES)
-endif
+	@echo "[lint] clean modules (strict -Wall): elut4, switch_box"
+	verilator --lint-only -Wall --top-module elut4 -Mdir obj_dir/lint_elut4 ethereal-fabric/rtl/clb/elut4.sv
+	verilator --lint-only -Wall --top-module switch_box -Mdir obj_dir/lint_switch_box ethereal-fabric/rtl/interconnect/switch_box.sv
+	@echo "[lint] fabric modules (-Wall -Wno-UNOPTFLAT; intended loops per C01 sec2.4): clb_t, fabric_top"
+	verilator --lint-only -Wall -Wno-UNOPTFLAT --top-module fabric_top -Mdir obj_dir/lint_fabric $(RTL_FABRIC_DEPS)
+	@echo "[lint] OK - all project RTL lint-clean."
 endif
 
 lint-mailbox: ## Lint the IMPORTED Mailbox NoC (NOT G1-clean yet — see MIGRATION-mailbox.md §5). Advisory; warnings expected.
@@ -83,6 +83,17 @@ else ifeq ($(strip $(MAILBOX_RTL)),)
 else
 	@echo "[lint-mailbox] Imported Mailbox RTL is NOT yet G1-clean (cleanup backlog pending). Warnings are EXPECTED; this target never fails CI."
 	-verilator --lint-only -Wall $(MAILBOX_RTL)
+endif
+
+test-sv: ## Run self-checking SystemVerilog testbenches via iverilog/vvp (local OSS-CAD)
+ifeq ($(IVERILOG),)
+	@echo "[test-sv] ERROR: iverilog not found. PATH=\$$HOME/oss-cad-suite/bin:\$$PATH make test-sv"
+	@exit 1
+else
+	@echo "[test-sv] tb_elut4";      $(IVERILOG) -g2012 -o /tmp/tb_elut4 ethereal-fabric/tests/clb/tb_elut4.sv ethereal-fabric/rtl/clb/elut4.sv && vvp /tmp/tb_elut4 | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_clb_t";      $(IVERILOG) -g2012 -o /tmp/tb_clb_t ethereal-fabric/tests/clb/tb_clb_t.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/clb/elut4.sv && vvp /tmp/tb_clb_t | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_switch_box"; $(IVERILOG) -g2012 -o /tmp/tb_sb ethereal-fabric/tests/interconnect/tb_switch_box.sv ethereal-fabric/rtl/interconnect/switch_box.sv && vvp /tmp/tb_sb | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
 sim: ## Quick smoke simulation (counter) via cocotb + Verilator
