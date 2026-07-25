@@ -24,7 +24,11 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB3)
-// Modified:    2026-07-25 - routable CB: clb_out injection on out_e[0..N_INJ-1]
+//              2026-07-25 - routable CB: clb_out injection on out_e[0..N_INJ-1]
+//              2026-07-26 - BIDIRECTIONAL inject (Option B): clb_out[j] injects
+//                            onto a CONFIGURABLE out_D[j] (D=inj_dir[j]), not
+//                            east-only. Fixes east-edge driver stranding found
+//                            by the c432 routing (E0-MAP3 incr 4a). cfg_data->3 bit.
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3
 // Notes:       ASSUMPTION (TBD 2026-07-24): v1 topology is DISJOINT
@@ -51,13 +55,13 @@ module switch_box #(
 ) (
     input  logic                            clk_i,
     input  logic                            cfg_we_i,
-    input  logic [$clog2(4*W+N_INJ)-1:0]    cfg_addr_i,  // 0..4W-1 = sel | 4W..4W+N_INJ-1 = inject_en
-    input  logic [1:0]                      cfg_data_i,  // sel: 0=disc, 1/2/3=srcs (inject_en uses [0])
+    input  logic [$clog2(4*W+N_INJ)-1:0]    cfg_addr_i,  // 0..4W-1 = sel | 4W..4W+N_INJ-1 = inject(en+dir)
+    input  logic [2:0]                      cfg_data_i,  // sel:[1:0]; inject: [0]=en, [2:1]=dir(0=N,1=S,2=E,3=W)
     input  logic [W-1:0]                    in_n,
     input  logic [W-1:0]                    in_s,
     input  logic [W-1:0]                    in_e,
     input  logic [W-1:0]                    in_w,
-    input  logic [N_INJ-1:0]                clb_out_i,   // local CLB outputs -> inject onto out_e[0..N_INJ-1]
+    input  logic [N_INJ-1:0]                clb_out_i,   // local CLB outputs -> inject onto out_D[j] (D=inj_dir[j])
     output logic [W-1:0]                    out_n,
     output logic [W-1:0]                    out_s,
     output logic [W-1:0]                    out_e,
@@ -79,18 +83,23 @@ module switch_box #(
 
     // ---- per-(DIR,t) disjoint select config (packed: 4*W selects x 2 bits) ----
     logic [NSEL*DW-1:0] sel_r;
-    // ---- routable CB: per-clb_out inject_en (clb_out[j] -> out_e[j]) ----
-    logic [NINJ-1:0] inj_en_r;
+    // ---- routable CB (bidirectional): per-clb_out inject enable + direction ----
+    //   inj_en_r[j] : 1 = inject clb_out[j] onto out_D[j] (D = inj_dir_r[j])
+    //   inj_dir_r[j]: 0=N, 1=S, 2=E, 3=W (== DIR_* codes). One direction per j
+    //                 -> SB stays the single driver of every track (no multi-drive).
+    logic [NINJ-1:0]   inj_en_r;
+    logic [NINJ*2-1:0] inj_dir_r;
 
     // ---- config write (no reset; OCC configures before run) ----
     //   addr 0..NSEL-1      -> sel_r (2-bit disjoint select)
-    //   addr NSEL..SB_END-1 -> inj_en_r (1-bit; clb_out index = addr - NSEL)
+    //   addr NSEL..SB_END-1 -> inj_en_r[addr-NSEL] <- data[0]; inj_dir_r[..] <- data[2:1]
     always_ff @(posedge clk_i) begin
         if (cfg_we_i) begin
             if (cfg_addr_i < SEL_END) begin
                 sel_r[cfg_addr_i*DW +: DW] <= cfg_data_i[DW-1:0];
             end else if (cfg_addr_i < SB_END) begin
-                inj_en_r[int'(cfg_addr_i) - int'(SEL_END)] <= cfg_data_i[0];
+                inj_en_r[int'(cfg_addr_i) - int'(SEL_END)]             <= cfg_data_i[0];
+                inj_dir_r[(int'(cfg_addr_i) - int'(SEL_END))*2 +: 2]   <= cfg_data_i[2:1];
             end
         end
     end
@@ -104,42 +113,60 @@ module switch_box #(
     /* verilator lint_off UNOPTFLAT */
     genvar gt;
     generate
-        // out_n[t]: sources S(1),E(2),W(3)
+        // Bidirectional inject: for each dir D and track t<N_INJ, if inj_en_r[t]
+        // and inj_dir_r[t]==D, out_D[t] = clb_out_i[t] (overrides disjoint sel).
+        // inj_dir encoding: 0=N(out_n), 1=S(out_s), 2=E(out_e), 3=W(out_w).
+        // out_n[t] (DIR_N): disjoint sources S,E,W; inject when inj_dir==N(0)
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_n
-            assign out_n[gt] = (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd1) ? in_s[gt] :
-                               (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                               (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] :
-                                                                          1'b0;
+            if (gt < N_INJ) begin : gen_n_inj
+                assign out_n[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd0)) ? clb_out_i[gt] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd1) ? in_s[gt] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+            end else begin : gen_n_disj
+                assign out_n[gt] = (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd1) ? in_s[gt] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+            end
         end
-        // out_s[t]: sources N(0),E(2),W(3)
+        // out_s[t] (DIR_S): disjoint sources N,E,W; inject when inj_dir==S(1)
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_s
-            assign out_s[gt] = (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                               (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                               (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] :
-                                                                          1'b0;
+            if (gt < N_INJ) begin : gen_s_inj
+                assign out_s[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd1)) ? clb_out_i[gt] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+            end else begin : gen_s_disj
+                assign out_s[gt] = (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+            end
         end
-        // out_e[t]: sources N(0),S(1),W(3); PLUS routable-CB injection:
-        //   out_e[j<N_INJ] can instead carry the local clb_out[j] (inj_en_r[j]).
+        // out_e[t] (DIR_E): disjoint sources N,S,W; inject when inj_dir==E(2)
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_e
             if (gt < N_INJ) begin : gen_e_inj
-                assign out_e[gt] = inj_en_r[gt] ? clb_out_i[gt] :
+                assign out_e[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd2)) ? clb_out_i[gt] :
                                    (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
                                    (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
-                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] :
-                                                                              1'b0;
+                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
             end else begin : gen_e_disj
                 assign out_e[gt] = (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
                                    (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
-                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] :
-                                                                              1'b0;
+                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
             end
         end
-        // out_w[t]: sources N(0),S(1),E(2)
+        // out_w[t] (DIR_W): disjoint sources N,S,E; inject when inj_dir==W(3)
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_w
-            assign out_w[gt] = (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                               (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
-                               (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd3) ? in_e[gt] :
-                                                                          1'b0;
+            if (gt < N_INJ) begin : gen_w_inj
+                assign out_w[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd3)) ? clb_out_i[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd3) ? in_e[gt] : 1'b0;
+            end else begin : gen_w_disj
+                assign out_w[gt] = (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd3) ? in_e[gt] : 1'b0;
+            end
         end
     endgenerate
     /* verilator lint_on UNOPTFLAT */

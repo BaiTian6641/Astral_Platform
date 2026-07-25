@@ -111,7 +111,8 @@ def test_injection_keeps_default_fabric_acyclic():
     """Injection edges are clb_out -> out_e source edges (no incoming edge on
     clb_out) -> cannot form a cycle. Default fabric stays acyclic."""
     g = FabricGrid(4, 4, W)
-    g.configure_sb(1, 1, 4 * W + 0, 1)   # inject_en[0] on tile (1,1)
+    # inject_en[0]=1, dir=2(E); data = 1 | (2<<1) = 5
+    g.configure_sb(1, 1, 4 * W + 0, 5)
     g.set_clb_out(1, 1, 1)               # clb_out[0] = 1
     assert g.has_comb_loop() is False
     # the injection edge must appear, localized to tile (1,1)
@@ -123,7 +124,7 @@ def test_injection_breaks_ring_via_source():
     combinational cycle: clb_out has no incoming edge, so the chain dead-ends."""
     g = FabricGrid(2, 2, W)
     g.set_clb_out(0, 0, 1)               # tile (0,0) clb_out[0] = 1
-    g.configure_sb(0, 0, 4 * W + 0, 1)   # (0,0) out_e[0] <- clb_out[0] (inject)
+    g.configure_sb(0, 0, 4 * W + 0, 5)   # (0,0) inject east: out_e[0] <- clb_out[0]
     g.configure_sb(0, 1, 1 * W + 0, 3)   # (0,1) out_s <- in_w
     g.configure_sb(1, 1, 3 * W + 0, 1)   # (1,1) out_w <- in_n
     g.configure_sb(1, 0, 0 * W + 0, 2)   # (1,0) out_n <- in_e
@@ -133,7 +134,7 @@ def test_injection_breaks_ring_via_source():
 def test_injection_tile_outputs_passes_clb_out():
     """tile_outputs() feeds the stored clb_out vector to the tile's SB."""
     g = FabricGrid(2, 2, W)
-    g.configure_sb(0, 0, 4 * W + 2, 1)   # inject_en[2]
+    g.configure_sb(0, 0, 4 * W + 2, 5)   # inject_en[2], dir=E; data = 1|(2<<1)
     g.set_clb_out(0, 0, 1 << 2)          # clb_out[2] = 1
     _on, _os, oe, _ow = g.tile_outputs(0, 0, 0, 0, 0, 0)
     assert ((oe >> 2) & 1) == 1
@@ -198,8 +199,8 @@ def test_routability_end_to_end():
     """1x2 grid: tile0.clb_out[0] -> tile1.clb_in[0] is routable."""
     g = FabricGrid(R=1, C=2, W=W, N_INJ=8, EXT_IN=18)
 
-    # tile0 (idx 0): SB inject_en[0]=1 -> clb_out[0] drives out_e[0]
-    g.configure(tile_idx=0, unit=FabricGrid.UNIT_SB, intra=4 * W + 0, data=1)
+    # tile0 (idx 0): SB inject_en[0]=1, dir=E (data=5) -> out_e[0] <- clb_out[0]
+    g.configure(tile_idx=0, unit=FabricGrid.UNIT_SB, intra=4 * W + 0, data=5)
     # tile1 (idx 1): SB route in_w[0] -> out_n[0]. out_n sources=[s,e,w], sel=3=w
     g.configure(tile_idx=1, unit=FabricGrid.UNIT_SB, intra=0, data=3)
     # tile1 (idx 1): CB clb_in[0] sel=0 -> out_n[0]
@@ -232,3 +233,41 @@ def test_routability_no_path_to_isolated_node():
     g = FabricGrid(1, 2, W)
     # default config: clb_out[0]@(0,0) has no edge (inject disabled)
     assert g.route_exists((0, 0, "clb_out", 0), (0, 1, "clb_in", 0)) is False
+
+
+# ---- 8. bidirectional inject routability (west/south/north) -----------------
+#
+# Bidirectional inject (Option B): clb_out[j] can exit in ANY of the 4 dirs.
+# Each test places the driver so its inject direction points at the sink.
+
+@pytest.mark.parametrize(
+    "inject_dir, R, C, drv_idx, sink_idx, sink_sb_addr, sink_sb_sel, sink_cb_sel",
+    [
+        # east  : drv west of sink;  channel out_e -> in_w;  sink out_n<-in_w sel3
+        ("e", 1, 2, 0, 1, 0 * W + 0, 3, 0),
+        # west  : drv east of sink;  channel out_w -> in_e;  sink out_n<-in_e sel2
+        ("w", 1, 2, 1, 0, 0 * W + 0, 2, 0),
+        # south : drv north of sink; channel out_s -> in_n;  sink out_e<-in_n sel1
+        ("s", 2, 1, 0, 1, 2 * W + 0, 1, 2 * W),
+        # north : drv south of sink; channel out_n -> in_s;  sink out_n<-in_s sel1
+        ("n", 2, 1, 1, 0, 0 * W + 0, 1, 0),
+    ],
+)
+def test_routability_inject_all_directions(
+    inject_dir, R, C, drv_idx, sink_idx, sink_sb_addr, sink_sb_sel, sink_cb_sel):
+    """clb_out[0]@drv injects toward inject_dir -> reaches clb_in[0]@sink."""
+    g = FabricGrid(R=R, C=C, W=W, N_INJ=8, EXT_IN=18)
+    dir_idx = {"n": 0, "s": 1, "e": 2, "w": 3}[inject_dir]
+    inject_data = 1 | (dir_idx << 1)               # en=1, dir
+    g.configure(tile_idx=drv_idx, unit=FabricGrid.UNIT_SB,
+                intra=4 * W + 0, data=inject_data)
+    g.configure(tile_idx=sink_idx, unit=FabricGrid.UNIT_SB,
+                intra=sink_sb_addr, data=sink_sb_sel)
+    g.configure(tile_idx=sink_idx, unit=FabricGrid.UNIT_CB,
+                intra=0, data=sink_cb_sel)
+    drv_rc = g.tile_rc(drv_idx)
+    sink_rc = g.tile_rc(sink_idx)
+    assert g.route_exists(
+        (drv_rc[0], drv_rc[1], "clb_out", 0),
+        (sink_rc[0], sink_rc[1], "clb_in", 0)) is True
+    assert g.has_comb_loop() is False

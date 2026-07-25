@@ -16,12 +16,13 @@ Graph nodes: ``(r, c, side, dir, t)`` where side in {"in","out"}, dir in
 A node with no driving edge reads as 0. Default SB config (all sel=0/disconnect)
 adds no SB-internal edges -> the graph has only out->in channel edges -> acyclic.
 
-NOTE (routable CB): each tile's SB can inject its local CLB outputs onto
-out_e[0..N_INJ-1] via inject_en (cfg addr 4W+j). The per-tile ``clb_out`` vector
-(default 0, set via :meth:`set_clb_out`) models the ClbT outputs as an
-externally-set source -- no CLB logic is simulated. ``dependency_edges`` emits
-``clb_out`` -> ``out_e`` source edges (clb_out has no incoming edge -> cannot
-form a cycle by itself); default config (no inject_en) adds no such edges.
+NOTE (bidirectional inject): each tile's SB can inject its local CLB outputs
+onto out_D[0..N_INJ-1] via inject_en (cfg addr 4W+j, data[0]=en, data[2:1]=dir
+0=N/1=S/2=E/3=W). The per-tile ``clb_out`` vector (default 0, set via
+:meth:`set_clb_out`) models the ClbT outputs as an externally-set source -- no
+CLB logic is simulated. ``dependency_edges`` emits ``clb_out`` -> ``out_D``
+source edges (clb_out has no incoming edge -> cannot form a cycle by itself);
+default config (no inject_en) adds no such edges.
 """
 from __future__ import annotations
 

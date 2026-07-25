@@ -19,10 +19,12 @@ OCC (`E0-FAB4`), VPR arch (`E0-MAP2`), and the RTL.
 
 Interface: `in_n/in_s/in_e/in_w`, `out_n/out_s/out_e/out_w` (each `[W-1:0]`);
 config `cfg_we_i`, `cfg_data_i`. **mux selects**: `cfg_addr_i[$clog2(4*W)-1:0]`
-(= `DIR*W + t`, DIR 0=N,1=S,2=E,3=W), `cfg_data_i[1:0]` (sel). **inject_en**
-(routable CB Step 1): `cfg_addr_i = 4*W + j` (j=0..N_INJ-1, N_INJ=N=8),
-`cfg_data_i[0]` = inject_en[j]; when set, `out_e[j] = clb_out[j]` **overriding**
-the disjoint sel — the SB stays the single driver of every track (no multi-drive).
+(= `DIR*W + t`, DIR 0=N,1=S,2=E,3=W), `cfg_data_i[1:0]` (sel). **bidirectional
+inject** (Option B, 2026-07-26): `cfg_addr_i = 4*W + j` (j=0..N_INJ-1, N_INJ=N=8),
+`cfg_data_i[0]` = `inj_en[j]`, `cfg_data_i[2:1]` = `inj_dir[j]` (0=N,1=S,2=E,3=W);
+when `inj_en[j]`, `out_D[j] = clb_out[j]` where `D = inj_dir[j]` (ONE configurable
+direction per j) **overriding** the disjoint sel for that (D, j) pair — the SB
+stays the single driver of every track (no multi-drive).
 
 Topology (v1 reference): each output track `t` in direction `D` mux-selects among
 the **same-index** input tracks of the **3 other directions** + disconnect:

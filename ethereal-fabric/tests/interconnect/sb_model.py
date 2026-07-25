@@ -6,11 +6,12 @@ Disjoint unidirectional topology (v1, C01 §3.3): for each output track t in
 each direction D in {N,S,E,W}, a registered 2-bit select picks one of the 3
 SAME-INDEX input tracks of the OTHER 3 directions, or disconnects (drives 0).
 
-cfg addressing (v2, C01 §3.3 + routable CB)::
+cfg addressing (v3, C01 §3.3 + bidirectional inject)::
     addr = DIR*W + t           ;  DIR: 0=N,1=S,2=E,3=W ;  t: 0..W-1  (range 0..4W-1)
     data = sel                 ;  0=disconnect, 1/2/3 = the 3 sources (ascending order)
     addr = 4W + j              ;  j: 0..N_INJ-1  (range 4W..4W+N_INJ-1)
-    data[0] = inject_en[j]     ;  1 = out_e[j] <- clb_out[j] (overrides disjoint sel)
+    data[0]   = inject_en[j]   ;  1 = out_D[j] <- clb_out[j] (D = inject_dir[j])
+    data[2:1] = inject_dir[j]  ;  0=N, 1=S, 2=E, 3=W (one configurable dir per j)
 
 Per-output-direction source map (sel 1/2/3 -> the 3 other dirs, ascending)::
     N(0) -> [S(1), E(2), W(3)]
@@ -49,10 +50,12 @@ def sources(direction: str) -> tuple[str, str, str]:
 
 
 class SwitchBox:
-    """Cycle-accurate switch-box reference model (v2: disjoint unidir + routable CB).
+    """Cycle-accurate switch-box reference model (v3: disjoint unidir + bidir inject).
 
-    W tracks per direction (default 12); N_INJ injectable CLB outputs (default 8)
-    that can override out_e[0..N_INJ-1] via inject_en (routable connection block).
+    W tracks per direction (default 12); N_INJ injectable CLB outputs (default 8).
+    Each clb_out[j] can be injected onto ONE configurable output direction
+    out_D[j] (D = inject_dir[j], default "e" for backward compat) via inject_en —
+    bidirectional inject (Option B, fixes east-edge driver stranding).
     """
 
     def __init__(self, W: int = 12, N_INJ: int = 8) -> None:
@@ -68,8 +71,10 @@ class SwitchBox:
         self.NINJ = N_INJ                       # inject_en bits (routable CB)
         # sel[(dir_idx, track)] in {0,1,2,3}; absent entry == 0 (disconnect)
         self.sel: dict[tuple[int, int], int] = {}
-        # inject_en: set of clb_out indices j (0..N_INJ-1) driving out_e[j]
+        # inject_en: set of clb_out indices j (0..N_INJ-1) driving out_D[j]
+        # inject_dir[j]: direction index 0..3 (N/S/E/W) for that injection
         self.inject_en: set[int] = set()
+        self.inject_dir: dict[int, int] = {}
 
     # -- addressing helpers -------------------------------------------------
     def addr(self, direction: str, track: int) -> int:
@@ -85,7 +90,7 @@ class SwitchBox:
         """Write config for cfg_addr (mirrors the RTL config-write port).
 
         addr 0..4W-1            -> sel (data & 0b11)
-        addr 4W..4W+N_INJ-1     -> inject_en[addr-4W] (data & 1)
+        addr 4W..4W+N_INJ-1     -> inject_en[addr-4W] = data[0]; inject_dir = data[2:1]
         addr >= 4W+N_INJ        -> ignored (out of range after AW-bit masking)
         """
         addr &= (1 << self.AW) - 1               # mask to AW bits (port width)
@@ -96,8 +101,10 @@ class SwitchBox:
             j = addr - self.NSEL
             if data & 1:
                 self.inject_en.add(j)
+                self.inject_dir[j] = (data >> 1) & 0b11
             else:
                 self.inject_en.discard(j)
+                self.inject_dir.pop(j, None)
         return self
 
     def route(self, direction: str, track: int, sel: int) -> "SwitchBox":
@@ -113,19 +120,30 @@ class SwitchBox:
         """Read back the configured select (0 if unconfigured)."""
         return self.sel.get((DIR_IDX[direction], track), 0)
 
-    def inject(self, track: int, enable: bool) -> "SwitchBox":
-        """High-level helper: set/clear inject_en[track] (clb_out -> out_e)."""
+    def inject(self, track: int, enable: bool, direction: str = "e") -> "SwitchBox":
+        """High-level helper: set/clear inject_en[track] toward ``direction``.
+
+        ``direction`` is one of {"n","s","e","w"} (default "e" for backward
+        compat with the pre-bidirectional API). When ``enable`` is False the
+        direction is ignored and the inject is cleared (both en + dir).
+        """
         if not 0 <= track < self.NINJ:
             raise ValueError(f"track out of range 0..{self.NINJ - 1}")
+        if direction not in DIR_IDX:
+            raise ValueError(f"direction must be one of {DIRS}")
         if enable:
             self.inject_en.add(track)
+            self.inject_dir[track] = DIR_IDX[direction]
         else:
             self.inject_en.discard(track)
+            self.inject_dir.pop(track, None)
         return self
 
-    def inject_of(self, track: int) -> bool:
-        """Read back inject_en[track] (False if unconfigured)."""
-        return track in self.inject_en
+    def inject_of(self, track: int) -> tuple[bool, str | None]:
+        """Read back (inject_en[track], direction_name) or (False, None)."""
+        if track in self.inject_en:
+            return True, DIRS[self.inject_dir[track]]
+        return False, None
 
     # -- combinational evaluation ------------------------------------------
     @staticmethod
@@ -146,10 +164,14 @@ class SwitchBox:
         Inputs are bitmasks (LSB = track 0); lists/tuples of bits are also
         accepted (index i -> track i). Disconnect (sel 0) drives 0.
 
-        ``clb_out`` is the N_INJ-bit local CLB-output vector (routable CB):
-        for each j with inject_en[j] set, out_e[j] = clb_out[j], OVERRIDING the
-        disjoint sel (mirrors the RTL ``inj_en_r[j] ? clb_out_i[j] : <sel>``).
-        Default 0 -> disjoint-only behavior (backward compatible).
+        ``clb_out`` is the N_INJ-bit local CLB-output vector (bidirectional
+        inject): for each j with inject_en[j] set, out_D[j] = clb_out[j] where
+        D = inject_dir[j] (one configurable direction per j), OVERRIDING the
+        disjoint sel for that (D, j) pair (mirrors the RTL
+        ``inj_en && dir==D ? clb_out_i[gt] : <sel>``). The inject drives
+        clb_out[j] exactly (0 or 1) — i.e. it CLEARS out_D[j] to 0 when
+        clb_out[j]=0. Default clb_out=0 -> disjoint-only behavior (backward
+        compatible).
         """
         ins = {
             "n": self._to_int(in_n, self.W),
@@ -162,20 +184,22 @@ class SwitchBox:
             if sel == 0:
                 continue                        # disconnect: drives 0
             d = DIRS[d_idx]
-            # routable CB: out_e[t<N_INJ] with inject_en[t] set is driven by
-            # clb_out, NOT the disjoint sel -> skip the disjoint contribution.
-            if d == "e" and t < self.NINJ and t in self.inject_en:
+            # bidirectional inject: out_D[t] with t<N_INJ, inject_en[t] set,
+            # inject_dir[t]==d_idx is driven by clb_out (not disjoint sel).
+            if (t < self.NINJ and t in self.inject_en
+                    and self.inject_dir[t] == d_idx):
                 continue
             src = _SOURCES[d][sel - 1]          # sel 1..3 -> sources index 0..2
             if (ins[src] >> t) & 1:
                 out[d] |= 1 << t
-        # routable CB: inject clb_out[j] -> out_e[j] for each enabled j
+        # bidirectional inject: out_D[j] = clb_out[j] for each enabled j
         clb = self._to_int(clb_out, self.NINJ)
         for j in self.inject_en:
+            d = DIRS[self.inject_dir[j]]
             if (clb >> j) & 1:
-                out["e"] |= 1 << j
+                out[d] |= 1 << j
             else:
-                out["e"] &= ~(1 << j)
+                out[d] &= ~(1 << j)
         return out["n"], out["s"], out["e"], out["w"]
 
     # -- fabric cycle-detector interface -----------------------------------
@@ -184,23 +208,26 @@ class SwitchBox:
 
         One edge per active (non-disconnect) disjoint mux::
             (("in",  <src_dir>, t), ("out", <dst_dir>, t))
-        sel 0 (disconnect) adds no edge. Routable-CB injection adds, for each
-        j with inject_en[j] set, an edge::
-            (("clb_out", j), ("out", "e", j))
-        and SUPPRESSES the disjoint out_e[j] edge (inject overrides the mux).
-        ``("clb_out", j)`` is a source node (no incoming edge) -> cannot by
-        itself form a cycle. Faithful to the mux selections so the fabric-level
-        cycle detector can compose SB in->out edges with channel out->in edges.
+        sel 0 (disconnect) adds no edge. Bidirectional inject adds, for each j
+        with inject_en[j] set, an edge::
+            (("clb_out", j), ("out", D, j))     D = DIRS[inject_dir[j]]
+        and SUPPRESSES the disjoint out_D[j] edge for that (D, j) (inject
+        overrides the mux). ``("clb_out", j)`` is a source node (no incoming
+        edge) -> cannot by itself form a cycle. Faithful to the mux selections
+        so the fabric-level cycle detector can compose SB in->out edges with
+        channel out->in edges.
         """
         edges: set[tuple[tuple, tuple]] = set()
         for (d_idx, t), sel in self.sel.items():
             if sel == 0:
                 continue
             d = DIRS[d_idx]
-            if d == "e" and t < self.NINJ and t in self.inject_en:
+            if (t < self.NINJ and t in self.inject_en
+                    and self.inject_dir[t] == d_idx):
                 continue                        # inject overrides disjoint sel
             src = _SOURCES[d][sel - 1]
             edges.add((("in", src, t), ("out", d, t)))
         for j in self.inject_en:
-            edges.add((("clb_out", j), ("out", "e", j)))
+            d = DIRS[self.inject_dir[j]]
+            edges.add((("clb_out", j), ("out", d, j)))
         return edges

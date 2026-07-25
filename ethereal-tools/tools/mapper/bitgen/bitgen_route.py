@@ -5,7 +5,7 @@
 Plan-Ref: ethereal-plan/components/C-soft-工具与固件组件.md §2
           (bitgen two-level design — this module is the ROUTING step between
           the LEVEL-1 config DB and the LEVEL-2 frame packer: it produces the
-          SB-mux + inject_en + cb_sel configuration that bitgen_pack leaves
+          SB-mux + inject + cb_sel configuration that bitgen_pack leaves
           blank in increment 3).
 
 ==============================================================================
@@ -31,19 +31,20 @@ Possibility-graph edges (every available mux option is an open edge — the
 PathFinder picks ONE per contended wire):
   * fixed channel:   ``(r,c,"out",D,t) -> (nb,"in",D',t)``            (CHAN_MAP)
   * SB mux:          ``(r,c,"in",src,t) -> (r,c,"out",dst,t)``  src≠dst (3 options)
-  * inject (CB out): ``(r,c,"clb_out",j) -> (r,c,"out","e",j)``  j<N_INJ
+  * inject (CB out): ``(r,c,"clb_out",j) -> (r,c,"out",D,j)``  D∈{n,s,e,w}, j<N_INJ
   * CB (CB in):      ``(r,c,"out",D,t) -> (r,c,"clb_in",i)``    all D,t,i
 
-CRITICAL structural fact (from the disjoint SB + inject model): a net driven by
-``clb_out[j]`` is **locked to track ``t = j``** for its entire route. Inject
-emits onto ``out_e[j]`` (east track j); the disjoint SB preserves the track
-index (``out_D[t]`` ← ``in_?[t]``, same ``t``); there is no track-changing
+CRITICAL structural fact (from the disjoint SB + bidirectional inject model):
+a net driven by ``clb_out[j]`` is **locked to track ``t = j``** for its entire
+route. Bidirectional inject lets the signal exit in ANY of the 4 directions
+(out_D[j], D chosen by the router per net); the disjoint SB preserves the
+track index (``out_D[t]`` ← ``in_?[t]``, same ``t``); there is no track-changing
 mux. The signal may travel east/north/south/west but always on track j. The CB
 at the sink reads ``out_?[j]`` into ``clb_in[i]``. Consequence: two inter nets
 sharing the same driver index ``j`` whose paths must cross on a track-j wire
 are *structurally* unresolvable on this v1 fabric — PathFinder will not
 converge and the net is reported UNROUTABLE (an honest Phase-0 finding, not a
-bug; a track-flexible inject or placement-aware packing would be the fix).
+bug; a track-flexible fabric or placement-aware packing would be the fix).
 
 ==============================================================================
 PATHFINDER (negotiated congestion — McMurchie/Luebben classic)
@@ -126,7 +127,7 @@ class TileRoute:
     """Per-tile routing config derived from the chosen PathFinder paths."""
 
     sb_sel: dict[tuple[str, int], int] = field(default_factory=dict)   # (dir,t)->sel
-    inject_en: set[int] = field(default_factory=set)                   # j's
+    inject: dict[int, str] = field(default_factory=dict)               # j -> dir
     cb_sel: dict[int, int] = field(default_factory=dict)               # clb_in i -> track
 
 
@@ -226,7 +227,7 @@ def _build_possibility_graph(
 
       ``("chan",)``             fixed channel (no config)
       ``("sb", dst_dir, t, src)``  SB mux  -> sb_sel[(dst_dir,t)] = sel(src)
-      ``("inj", j)``            inject  -> inject_en{j}
+      ``("inj", j, d)``         inject  -> inject{j: d}  (D in {n,s,e,w})
       ``("cb", i, dir, t)``     CB      -> cb_sel[i] = track_index(dir,t)
     """
     adj: dict[tuple, list[tuple[tuple, tuple]]] = defaultdict(list)
@@ -256,9 +257,13 @@ def _build_possibility_graph(
                     for t in range(W):
                         add((r, c, "in", sd, t), (r, c, "out", dd, t),
                             ("sb", dd, t, sd))
-            # 3. inject possibility edges: clb_out[j] -> out_e[j] (j < N_INJ)
+            # 3. inject possibility edges: clb_out[j] -> out_D[j] for ALL 4 dirs
+            #    (bidirectional inject, Option B): the router picks the ONE exit
+            #    direction per net (j < N_INJ). SB stays single-driver because
+            #    each (dir, j) pair is a distinct track.
             for j in range(N_INJ):
-                add((r, c, "clb_out", j), (r, c, "out", "e", j), ("inj", j))
+                for d in DIRS:
+                    add((r, c, "clb_out", j), (r, c, "out", d, j), ("inj", j, d))
             # 4. CB possibility edges: out_dir[t] -> clb_in[i] (sinks only)
             for i in sinks_by_tile.get((r, c), ()):
                 for d in DIRS:
@@ -311,33 +316,67 @@ def _route_net(
     adj: dict[tuple, list[tuple[tuple, tuple]]],
     hist: dict[tuple, float],
     present_occ: dict[tuple, int],
+    N_INJ: int = FABRIC_N_INJ,
 ) -> tuple[list[tuple[tuple, tuple, tuple]], set[tuple]] | None:
-    """Route one net (driver -> every sink) via a single source-Dijkstra.
+    """Route one net (driver -> every sink) via a per-direction Dijkstra.
 
-    Returns ``(edges_used, nodes_used)`` or ``None`` if any sink is unreachable
-    in the possibility graph (structurally unroutable — congestion never blocks
-    reachability because all edge costs are finite). The union of all sink
-    paths forms the net's routing tree; shared prefixes are naturally shared
-    (Dijkstra tree)."""
+    Bidirectional inject (Option B) lets ``clb_out[j]@T`` exit on ONE of the 4
+    output directions (out_D[j]) — a per-(tile,j) resource: the net picks ONE
+    direction and ALL sinks must be reachable from that single exit. We run
+    Dijkstra from EACH of the 4 exit nodes (out_n/s/e/w[j]@T) and pick the
+    direction whose tree reaches all sinks with minimum total cost. This
+    enforces single-direction inject at the routing level — the constraint the
+    possibility-graph inject edges alone cannot express for multi-sink nets (a
+    driver Dijkstra through 4 inject edges would let different sinks branch
+    through different directions, which the hardware cannot realize).
+
+    Returns ``(edges_used, nodes_used)`` including the chosen inject edge, or
+    ``None`` if no direction reaches all sinks / driver clb_out[j] >= N_INJ.
+    The inject edge meta ``("inj", j, d)`` is added manually so
+    ``_populate_tiles`` records ``inject{j: d}`` exactly as before.
+    """
     if net.driver_node is None:
         return None
-    dist, prev = _dijkstra(adj, net.driver_node, hist, present_occ)
-    edges_used: list[tuple[tuple, tuple, tuple]] = []
-    nodes_used: set[tuple] = {net.driver_node}
-    for sink in net.sink_nodes:
-        if sink not in dist:
-            return None                      # structural: no path exists
-        cur = sink
-        while cur != net.driver_node:
-            step = prev.get(cur)
-            if step is None:                 # defensive: should not happen
-                return None
-            pu, meta = step
-            edges_used.append((pu, cur, meta))
-            cur = pu
-            nodes_used.add(cur)
-        nodes_used.add(sink)
-    return edges_used, nodes_used
+    r, c, _, j = net.driver_node
+    if not (0 <= j < N_INJ):
+        return None                      # can't inject (j out of range)
+    best_edges: list[tuple[tuple, tuple, tuple]] | None = None
+    best_nodes: set[tuple] | None = None
+    best_cost = float("inf")
+    for d in DIRS:
+        exit_node = (r, c, "out", d, j)
+        dist, prev = _dijkstra(adj, exit_node, hist, present_occ)
+        if not all(s in dist for s in net.sink_nodes):
+            continue                      # this direction can't reach all sinks
+        total = sum(dist[s] for s in net.sink_nodes)
+        if total >= best_cost:
+            continue
+        # reconstruct edges for this direction (inject edge + tree edges)
+        edges: list[tuple[tuple, tuple, tuple]] = [
+            (net.driver_node, exit_node, ("inj", j, d))]
+        nodes: set[tuple] = {net.driver_node, exit_node}
+        ok = True
+        for sink in net.sink_nodes:
+            cur = sink
+            while cur != exit_node:
+                step = prev.get(cur)
+                if step is None:                 # defensive: should not happen
+                    ok = False
+                    break
+                pu, meta = step
+                edges.append((pu, cur, meta))
+                cur = pu
+                nodes.add(cur)
+            nodes.add(sink)
+            if not ok:
+                break
+        if ok:
+            best_cost = total
+            best_edges = edges
+            best_nodes = nodes
+    if best_edges is None or best_nodes is None:
+        return None
+    return best_edges, best_nodes
 
 
 def route(
@@ -352,10 +391,9 @@ def route(
     """Route every inter-cluster net in ``db`` on the real fabric topology.
 
     Returns a :class:`RouteConfig`. Nets that cannot be routed (structural —
-    e.g. driver ``clb_out[j>=N_INJ]``, multi-driver netlist error, east-edge
-    driver whose sinks lie outside its own tile, or track-lock congestion that
-    never converges) are listed in ``rc.unrouted`` with a reason; the routed
-    nets' per-tile SB/inject/CB config is in ``rc.tiles``.
+    e.g. driver ``clb_out[j>=N_INJ]``, multi-driver netlist error, or track-lock
+    congestion that never converges) are listed in ``rc.unrouted`` with a
+    reason; the routed nets' per-tile SB/inject/CB config is in ``rc.tiles``.
 
     PathFinder uses **seeded per-iteration net shuffling** (classic
     negotiated-congestion technique to avoid the systematic bias of a fixed net
@@ -410,7 +448,7 @@ def route(
 
     # ---- PathFinder negotiated-congestion loop ------------------------------
     converged, n_iters, n_overuse_final, best_net_edges = _run_pathfinder(
-        active, adj, max_iters, seed, verbose)
+        active, adj, max_iters, seed, verbose, N_INJ)
     rc.converged = converged
     rc.n_iters = n_iters
     rc.n_overuse_final = n_overuse_final
@@ -437,6 +475,7 @@ def _run_pathfinder(
     max_iters: int,
     seed: int,
     verbose: bool,
+    N_INJ: int = FABRIC_N_INJ,
 ) -> tuple[bool, int, int, dict[str, list[tuple[tuple, tuple, tuple]]]]:
     """Negotiated-congestion PathFinder over an explicit net list.
 
@@ -462,7 +501,7 @@ def _run_pathfinder(
         present_occ: dict[tuple, int] = defaultdict(int)
         net_edges: dict[str, list[tuple[tuple, tuple, tuple]]] = {}
         for n in order:
-            res = _route_net(n, adj, hist, present_occ)
+            res = _route_net(n, adj, hist, present_occ, N_INJ)
             if res is None:                                   # structural (shouldn't
                 continue                                      #  happen post-reachability)
             edges, nodes = res
@@ -500,7 +539,8 @@ def _populate_tiles(
                 _, dd, t, sd = meta
                 tr.sb_sel[(dd, t)] = _src_to_sel(dd, sd)
             elif kind == "inj":
-                tr.inject_en.add(meta[1])
+                _, j, d = meta
+                tr.inject[j] = d
             elif kind == "cb":
                 _, i, d, t = meta
                 tr.cb_sel[i] = ConnectionBlock.track_index(d, t, W)
@@ -523,8 +563,8 @@ def apply_route_to_grid(grid: FabricGrid, rc: RouteConfig) -> None:
         sb = grid.sb[r][c]
         for (dd, t), sel in tr.sb_sel.items():
             sb.route(dd, t, sel)
-        for j in tr.inject_en:
-            sb.inject(j, True)
+        for j, d in tr.inject.items():
+            sb.inject(j, True, d)
         cb = grid.cb[r][c]
         for i, track in tr.cb_sel.items():
             cb.configure(i, track)

@@ -121,7 +121,7 @@ module fabric_top #(
                     .clk_i      (clk_i),
                     .cfg_we_i   (sb_cfg_we),
                     .cfg_addr_i (intra[AW_SB-1:0]),
-                    .cfg_data_i (cfg_data_i[1:0]),
+                    .cfg_data_i (cfg_data_i[2:0]),
                     .in_n       (sb_in_n[r][c]),
                     .in_s       (sb_in_s[r][c]),
                     .in_e       (sb_in_e[r][c]),

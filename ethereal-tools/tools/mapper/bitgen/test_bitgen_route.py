@@ -3,12 +3,15 @@
 (task E0-MAP3 increment 4a).
 
 Validates the Option-B router and SURFACES a key Phase-0 architectural finding:
-on the v1 fabric (east-only inject + disjoint track-locked SB) c432 — as placed
-by VPR — is NOT routable, for two independent structural reasons (see
-``test_c432_routing_infeasibility_finding``). The router itself is proven sound
-on a feasible subset (``test_c432_feasible_subset_routable`` proves
-route_exists reachability on the real fabric for every net that IS routable)
-and on a synthetic 1x2 case.
+c432 — as placed by VPR — is NOT routable on the v1 fabric, because the disjoint
+track-locked SB over-subscribes tracks 7 (7 nets) and 2 (6 nets) (see
+``test_c432_routing_infeasibility_finding``). Bidirectional inject (the
+2026-07-26 Option-B RTL change) FIXED the original Cause 1 (east-edge driver
+stranding: 0 unreachable nets now, was 3), but Cause 2 (track-locking) REMAINS
+— each net is locked to track t=driver_j for its entire route (disjoint SB
+preserves track index, no track-change mux), so 7 nets sharing track 7 are
+structurally unresolvable. The router is proven sound on a feasible subset
+(``test_c432_feasible_subset_routable``) and a synthetic 1x2 case.
 
 Per the task brief ("If c432 PathFinder doesn't converge in 30 iters, REPORT
 (don't fake)"), the non-convergence is reported, not faked: the convergence
@@ -83,17 +86,18 @@ def test_route_extract_nets_c432():
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Phase-0 finding (E0-MAP3 incr 4a): c432 is NOT routable on the v1 "
-        "fabric as placed by VPR. Two independent structural causes: (a) east-"
-        "only inject strands the 3 nets driven from the eastmost column "
-        "(c=C-1) — their signal can only reach the driver's own tile; "
-        "(b) disjoint track-locked SB over-subscribes tracks 7 (7 nets) and "
-        "2 (6 nets), which never converge even in isolation (>=14 over-used "
-        "nodes across 200 iters x 5 seeds). Root cause: VPR packs nets to fle "
-        "indices (-> fabric tracks) with no awareness of the fabric's track "
-        "locking. This xfail is STRICT: if a fabric/tooling change makes c432 "
-        "routable, it will XPASS and flag the change for review. See the "
-        "acceptance report and test_c432_routing_infeasibility_finding."))
+        "Phase-0 finding (E0-MAP3 incr 4a, post-bidir-inject 2026-07-26): c432 "
+        "is still NOT routable on the v1 fabric as placed by VPR. Cause 1 "
+        "(east-edge stranding) is FIXED by bidirectional inject (0 unreachable "
+        "nets, was 3). Cause 2 REMAINS: the disjoint track-locked SB over-"
+        "subscribes track 7 (7 nets) and track 2 (6 nets), which never converge "
+        "even in isolation (>=7 over-used nodes across 60 iters). Root cause: "
+        "VPR packs nets to fle indices (-> fabric tracks) with no awareness of "
+        "the v1 fabric's track locking (disjoint SB preserves track index, no "
+        "track-change mux). This xfail is STRICT: if a fabric/tooling change "
+        "makes c432 routable (e.g. a Wilton SB or track-aware packing), it will "
+        "XPASS and flag the change for review. See the acceptance report and "
+        "test_c432_routing_infeasibility_finding."))
 def test_c432_routes_conflict_free():
     """PathFinder would route ALL inter-cluster nets with zero over-used
     resources IF c432 were routable on the v1 fabric. It is not (xfail)."""
@@ -114,8 +118,8 @@ def test_c432_routes_conflict_free():
 
 def test_c432_routing_infeasibility_finding():
     """Asserts the specific structural facts behind c432's non-routability on
-    the v1 fabric. PASSING = the finding is real and stable; if the router were
-    ever 'fixed' to fake convergence, this test would break."""
+    the v1 fabric AFTER bidirectional inject. PASSING = the finding is real and
+    stable; if the router were ever 'fixed' to fake convergence, this test breaks."""
     from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
     rc = route(db, max_iters=30, seed=0)
@@ -126,40 +130,29 @@ def test_c432_routing_infeasibility_finding():
     print(f"\n[finding] full-design: converged={rc.converged}, "
           f"{rc.n_overuse_final} over-used nodes at iter {rc.n_iters}")
 
-    # ---- (b) east-edge-stranded nets (east-only inject) --------------------
-    # A net driven from column c=C-1 whose sinks lie outside the driver tile is
-    # structurally unreachable: inject emits ONLY east (out_e[j]) and there is
-    # no east neighbor, so the signal cannot leave the driver tile.
-    min_x, min_y, max_x, max_y = db_grid_bounds(db)
-    C = max_x - min_x + 1
-    nets = extract_nets(db, min_x, min_y)
-    inter = [n for n in nets if n.kind == "inter"]
-    east_edge_stranded = []
-    for n in inter:
-        d = n.driver_node
-        assert d is not None
-        drv_r, drv_c = d[0], d[1]
-        if drv_c == C - 1:                                   # eastmost column
-            outside = [s for s in n.sink_nodes
-                       if not (s[0] == drv_r and s[1] == drv_c)]
-            if outside:
-                east_edge_stranded.append(n.name)
-    assert len(east_edge_stranded) == 3, (
-        f"expected exactly 3 east-edge-stranded nets, got {east_edge_stranded}")
+    # ---- (b) Cause 1 (east-edge stranding) is FIXED by bidirectional inject ----
+    # ALL inter nets are now reachable (0 unreachable). A driver on the eastmost
+    # column can now exit N/S/W instead of being stranded by east-only inject.
     unreachable_names = {name for name, _reason in rc.unrouted
                          if "unreachable" in _reason}
-    assert set(east_edge_stranded).issubset(unreachable_names)
-    print(f"[finding] east-edge-stranded (east-only inject): {east_edge_stranded}")
+    assert len(unreachable_names) == 0, (
+        f"expected 0 unreachable nets (Cause 1 fixed by bidir inject); "
+        f"got {unreachable_names}")
+    print(f"[finding] unreachable nets (Cause 1, east-edge): "
+          f"{len(unreachable_names)} (FIXED by bidir inject)")
 
-    # ---- (c) over-subscribed tracks (track-locked disjoint SB) -------------
+    # ---- (c) Cause 2 REMAINS: over-subscribed tracks (track-locked disjoint SB) ----
     # Tracks 7 (7 nets) and 2 (6 nets) never converge even in isolation.
+    min_x, min_y, max_x, max_y = db_grid_bounds(db)
+    R, C = max_y - min_y + 1, max_x - min_x + 1
+    nets = extract_nets(db, min_x, min_y)
+    inter = [n for n in nets if n.kind == "inter"]
     j_counts = Counter(n.driver_node[3] for n in inter)
     over_subs = [j for j, c in j_counts.items() if c >= 5]
     print(f"[finding] per-track driver counts: {dict(j_counts)}; "
           f"over-subscribed (>=5 nets): {over_subs}")
     assert set(C432_INFEASIBLE_TRACKS).issubset(set(over_subs))
     # prove tracks 7 and 2 are individually infeasible on the real topology
-    R = max_y - min_y + 1
     sink_clb_in = set()
     for n in inter:
         sink_clb_in.update(n.sink_nodes)
@@ -185,7 +178,9 @@ def test_c432_feasible_subset_routable():
     — the Option-B realizability proof, on the subset the v1 fabric can carry.
 
     Cross-track nets never share wires (track-j wires are disjoint from
-    track-j' wires), so routing each feasible track independently is exact."""
+    track-j' wires), so routing each feasible track independently is exact.
+    Bidirectional inject means NO net is excluded for east-edge stranding
+    (Cause 1 is fixed); only tracks 2 & 7 (Cause 2) are excluded."""
     from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
     min_x, min_y, max_x, max_y = db_grid_bounds(db)
@@ -194,15 +189,7 @@ def test_c432_feasible_subset_routable():
 
     nets = extract_nets(db, min_x, min_y)
     inter = [n for n in nets if n.kind == "inter"]
-    feasible = []
-    for n in inter:
-        d = n.driver_node
-        assert d is not None
-        if d[3] in C432_INFEASIBLE_TRACKS:
-            continue
-        if d[1] == C - 1:                          # east-edge driver (stranded)
-            continue
-        feasible.append(n)
+    feasible = [n for n in inter if n.driver_node[3] not in C432_INFEASIBLE_TRACKS]
     assert len(feasible) > 0
 
     sink_clb_in = set()
@@ -230,9 +217,9 @@ def test_c432_feasible_subset_routable():
 
     # structural no-multi-drive on the feasible subset
     for (r, c), tr in rc.tiles.items():
-        for j in tr.inject_en:
-            assert tr.sb_sel.get(("e", j), 0) == 0, (
-                f"tile ({r},{c}): out_e[{j}] multi-driven")
+        for j, d in tr.inject.items():
+            assert tr.sb_sel.get((d, j), 0) == 0, (
+                f"tile ({r},{c}): out_{d}[{j}] multi-driven (inject + disjoint sel)")
 
 
 # =============================================================================
@@ -241,7 +228,7 @@ def test_c432_feasible_subset_routable():
 
 def test_synthetic_1x2_single_net():
     """A 1x2 fabric: route clb_out[0]@(0,0) -> clb_in[0]@(0,1). Must produce
-    inject_en{0}@(0,0), a valid SB path, cb_sel[0]@(0,1), and route_exists True."""
+    inject{0}@(0,0), a valid SB path, cb_sel[0]@(0,1), and route_exists True."""
     from bitgen_db import FabricConfigDB, TileLogic
     t0 = TileLogic(cluster_inputs={i: None for i in range(EXT_IN)},
                    cluster_outputs={j: None for j in range(N)})
@@ -259,7 +246,7 @@ def test_synthetic_1x2_single_net():
     assert rc.converged, f"synthetic net didn't converge: {rc.unrouted}"
     assert rc.n_nets == 1 and rc.n_routed == 1
     assert (0, 0) in rc.tiles and (0, 1) in rc.tiles
-    assert 0 in rc.tiles[(0, 0)].inject_en, "driver tile must inject clb_out[0]"
+    assert 0 in rc.tiles[(0, 0)].inject, "driver tile must inject clb_out[0]"
     assert 0 in rc.tiles[(0, 1)].cb_sel, "sink tile must select clb_in[0]"
     track = rc.tiles[(0, 1)].cb_sel[0]
     assert 0 <= track < 4 * 12

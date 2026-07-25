@@ -10,10 +10,14 @@
 //              For output dir d, the source dir of a given sel (1..3) is:
 //                src = (sel-1 < d) ? (sel-1) : sel
 //              Covers: for every direction, every sel 0..3, every track 0..11;
-//              plus routable-CB injection (inject_en[j], clb_out[j] -> out_e[j]).
+//              plus bidirectional inject (inject_en[j]+inject_dir[j],
+//              clb_out[j] -> out_D[j] where D = inj_dir[j]).
+//              Inject (addr 4W+j): cfg_data[0]=inj_en, [2:1]=inj_dir (0=N,1=S,2=E,3=W).
 //              Run with: iverilog -g2012 -o /tmp/tb_switch_box tb_switch_box.sv ../../rtl/interconnect/switch_box.sv && vvp /tmp/tb_switch_box
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
+// Modified:    2026-07-26 - bidirectional inject (Option B): cfg_data 3-bit;
+//                            test inject in E/W/N directions + clear/override.
 // Tags:        TESTBENCH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3
 // Notes:       Self-checking: maintains `errors`, prints TEST PASSED / TEST FAILED.
@@ -24,7 +28,7 @@ module tb_switch_box;
     logic             clk;
     logic             cfg_we;
     logic [5:0]       cfg_addr;     // $clog2(4*W+N_INJ) = 6 for W=12,N_INJ=8
-    logic [1:0]       cfg_data;
+    logic [2:0]       cfg_data;     // sel:[1:0]; inject: [0]=en, [2:1]=dir
     logic [W-1:0]     in_n, in_s, in_e, in_w;
     logic [N_INJ-1:0] clb_out;      // local CLB outputs -> inject onto out_e[0..N_INJ-1]
     logic [W-1:0]     out_n, out_s, out_e, out_w;
@@ -56,19 +60,19 @@ module tb_switch_box;
     initial begin
         cfg_we   = 1'b0;
         cfg_addr = 6'b0;
-        cfg_data = 2'b0;
+        cfg_data = 3'b0;
         in_n = '0;  in_s = '0;  in_e = '0;  in_w = '0;
         clb_out = '0;
     end
 
     // ---- config write: pulse cfg_we_i=1 for one clock ----
-    //   a in 0..4W-1          -> sel (d in 0..3)
-    //   a in 4W..4W+N_INJ-1   -> inject_en[a-4W] (d[0])
+    //   a in 0..4W-1          -> sel (data[1:0])
+    //   a in 4W..4W+N_INJ-1   -> inject: data[0]=en, data[2:1]=dir
     task cfg_write(input int a, input int d);
         begin
             @(negedge clk);
             cfg_addr = a;            // truncates to [5:0], a in 0..4W+N_INJ-1
-            cfg_data = d;            // truncates to [1:0]
+            cfg_data = d;            // truncates to [2:0]
             cfg_we   = 1'b1;
             @(negedge clk);
             cfg_we   = 1'b0;
@@ -127,7 +131,8 @@ module tb_switch_box;
         end
 
         // =========================================================
-        // routable-CB injection: clb_out[j] -> out_e[j] (j < N_INJ)
+        // bidirectional inject: clb_out[j] -> out_D[j] (D = inj_dir[j])
+        //   addr = 4W + j ; data[0] = en ; data[2:1] = dir (0=N,1=S,2=E,3=W)
         // =========================================================
         // reset all config to a clean state (all disconnect, no inject)
         for (int a = 0; a < 4*W + N_INJ; a = a + 1) begin
@@ -136,28 +141,58 @@ module tb_switch_box;
         in_n = '0; in_s = '0; in_e = '0; in_w = '0;
         clb_out = '0;
 
-        // (1) inject_en[5]=1, clb_out[5]=1, channels=0 -> out_e = bit5 only
-        cfg_write(4*W + 5, 1);            // addr 53 -> inject_en[5] = 1
+        // (1) EAST inject: en[5]=1, dir[5]=2(E); data = 1|(2<<1) = 5
+        //     clb_out[5]=1 -> out_e = bit5 only; n/s/w stay 0
+        cfg_write(4*W + 5, 5);
         clb_out[5] = 1'b1;
         #1;
         if (out_e !== 12'h020) begin       // only bit 5 set
             errors = errors + 1;
-            $display("FAIL: inject_en[5]=1 clb_out[5]=1 -> out_e exp=0x020 got=%h", out_e);
+            $display("FAIL: E-inject en[5]=1 dir=E clb_out[5]=1 -> out_e exp=0x020 got=%h", out_e);
         end
         if (out_n !== '0 || out_s !== '0 || out_w !== '0) begin
             errors = errors + 1;
-            $display("FAIL: injection leaked n/s/w out_n=%h out_s=%h out_w=%h", out_n, out_s, out_w);
+            $display("FAIL: E-inject leaked n/s/w out_n=%h out_s=%h out_w=%h", out_n, out_s, out_w);
         end
 
-        // (2) clear inject_en[5] -> out_e[5] follows disjoint sel (0 -> drive 0)
+        // (2) WEST inject: en[3]=1, dir[3]=3(W); data = 1|(3<<1) = 7
+        //     clb_out[3]=1 -> out_w = bit3 only; out_e bit5 from (1) still active
+        cfg_write(4*W + 3, 7);
+        clb_out[3] = 1'b1;
+        #1;
+        if (out_w !== 12'h008) begin       // only bit 3 set
+            errors = errors + 1;
+            $display("FAIL: W-inject en[3]=1 dir=W clb_out[3]=1 -> out_w exp=0x008 got=%h", out_w);
+        end
+        if (out_e !== 12'h020) begin       // E-inject still drives bit5
+            errors = errors + 1;
+            $display("FAIL: E-inject coexists with W-inject -> out_e exp=0x020 got=%h", out_e);
+        end
+
+        // (3) NORTH inject: en[1]=1, dir[1]=0(N); data = 1|(0<<1) = 1
+        //     clb_out[1]=1 -> out_n = bit1 only
+        cfg_write(4*W + 1, 1);
+        clb_out[1] = 1'b1;
+        #1;
+        if (out_n !== 12'h002) begin       // only bit 1 set
+            errors = errors + 1;
+            $display("FAIL: N-inject en[1]=1 dir=N clb_out[1]=1 -> out_n exp=0x002 got=%h", out_n);
+        end
+
+        // (4) clear E-inject[5]: data=0 -> out_e[5] follows disjoint sel (0->0)
         cfg_write(4*W + 5, 0);
         #1;
         if (out_e[5] !== 1'b0) begin
             errors = errors + 1;
-            $display("FAIL: inject_en[5]=0 disjoint sel=0 -> out_e[5] exp=0 got=%b", out_e[5]);
+            $display("FAIL: clear en[5] disjoint sel=0 -> out_e[5] exp=0 got=%b", out_e[5]);
+        end
+        // W-inject and N-inject still active
+        if (out_w[3] !== 1'b1 || out_n[1] !== 1'b1) begin
+            errors = errors + 1;
+            $display("FAIL: W/N-inject survived clear of en[5] out_w[3]=%b out_n[1]=%b", out_w[3], out_n[1]);
         end
 
-        // (3) disjoint sel out_e[5]<-in_n[5] (sel 1), inject off, in_n[5]=1 -> 1
+        // (5) disjoint sel out_e[5]<-in_n[5] (sel 1), E-inject off, in_n[5]=1 -> 1
         cfg_write(2*W + 5, 1);            // out_e sel 1 = in_n
         in_n = 1 << 5;
         #1;
@@ -166,13 +201,13 @@ module tb_switch_box;
             $display("FAIL: disjoint out_e[5]<-in_n[5] (inject off) exp=1 got=%b", out_e[5]);
         end
 
-        // (4) re-enable inject_en[5] with clb_out[5]=0, in_n[5]=1 -> inject wins -> 0
+        // (6) re-enable E-inject[5] with clb_out[5]=0, in_n[5]=1 -> inject wins -> 0
         clb_out[5] = 1'b0;
-        cfg_write(4*W + 5, 1);
+        cfg_write(4*W + 5, 5);            // re-enable E-inject (dir=E)
         #1;
         if (out_e[5] !== 1'b0) begin
             errors = errors + 1;
-            $display("FAIL: inject overrides disjoint (in_n[5]=1,clb_out[5]=0) exp=0 got=%b", out_e[5]);
+            $display("FAIL: E-inject overrides disjoint (in_n[5]=1,clb_out[5]=0) exp=0 got=%b", out_e[5]);
         end
 
         // cleanup

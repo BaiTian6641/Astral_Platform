@@ -69,11 +69,13 @@ def test_configure_masks_addr_and_data():
     assert sb.sel[(0, 0)] == 1
     sb.configure(1, 0b110)           # -> sel 0b10 = 2
     assert sb.sel[(0, 1)] == 2
-    # inject_en path: addr in [NSEL, NSEL+NINJ), data & 1
-    sb.configure(sb.NSEL, 0b101)     # addr 48 -> inject_en[0] = 1 (data & 1)
+    # inject path: addr in [NSEL, NSEL+NINJ), data[0]=en, data[2:1]=dir
+    sb.configure(sb.NSEL, 0b101)     # addr 48 -> en[0]=1, dir[0]=2 (E)
     assert 0 in sb.inject_en
-    sb.configure(sb.NSEL, 0b100)     # addr 48 -> inject_en[0] = 0
+    assert sb.inject_dir[0] == 2
+    sb.configure(sb.NSEL, 0b100)     # addr 48 -> en[0]=0
     assert 0 not in sb.inject_en
+    assert 0 not in sb.inject_dir
 
 
 def test_route_matches_configure():
@@ -281,11 +283,11 @@ def test_edges_node_shape():
     assert src_node[0] == "in" and dst_node[0] == "out"
 
 
-# ---- 8. routable-CB injection (clb_out -> out_e[0..N_INJ-1]) ----------------
+# ---- 8. bidirectional inject (clb_out[j] -> out_D[j], D configurable) -------
 
 def test_inject_en_routes_clb_out_to_out_e():
     sb = SwitchBox(W=12)                   # N_INJ=8 default
-    sb.inject(3, True)                     # inject_en[3] = 1
+    sb.inject(3, True)                     # inject_en[3] = 1, default dir "e"
     oe = sb.outputs(0, 0, 0, 0, clb_out=1 << 3)[2]
     assert ((oe >> 3) & 1) == 1            # clb_out[3] -> out_e[3]
     assert (oe & ~(1 << 3)) == 0           # only bit 3
@@ -315,12 +317,58 @@ def test_inject_overrides_disjoint_sel():
 
 def test_inject_via_configure_addr():
     sb = SwitchBox(W=12)
-    sb.configure(sb.NSEL + 5, 1)           # addr 53 -> inject_en[5] = 1
-    assert sb.inject_of(5) is True
+    # addr 53 -> inject_en[5]=1, inject_dir[5]=2 (E); data = 1 | (2<<1) = 5
+    sb.configure(sb.NSEL + 5, 5)
+    en, d = sb.inject_of(5)
+    assert en is True and d == "e"
     oe = sb.outputs(0, 0, 0, 0, clb_out=1 << 5)[2]
     assert ((oe >> 5) & 1) == 1
-    sb.configure(sb.NSEL + 5, 0)           # clear
-    assert sb.inject_of(5) is False
+    sb.configure(sb.NSEL + 5, 0)           # clear (en=0)
+    en2, d2 = sb.inject_of(5)
+    assert en2 is False and d2 is None
+
+
+def test_inject_dir_cfg_encoding():
+    # data = en | (dir_idx << 1) for each direction
+    for d_idx, d_name in enumerate(DIRS):
+        sb = SwitchBox(W=12)
+        sb.configure(sb.NSEL + 1, 1 | (d_idx << 1))
+        en, rd = sb.inject_of(1)
+        assert en is True and rd == d_name
+
+
+@pytest.mark.parametrize("d", DIRS)
+def test_inject_bidirectional_outputs(d):
+    # inject clb_out[3] toward each direction; only out_d[3] carries it
+    sb = SwitchBox(W=12)
+    sb.inject(3, True, d)
+    en, rd = sb.inject_of(3)
+    assert en is True and rd == d
+    outs = dict(zip(DIRS, sb.outputs(0, 0, 0, 0, clb_out=1 << 3)))
+    assert ((outs[d] >> 3) & 1) == 1           # clb_out[3] -> out_d[3]
+    for d2 in DIRS:
+        if d2 != d:
+            assert ((outs[d2] >> 3) & 1) == 0  # no leak into other dirs
+
+
+@pytest.mark.parametrize("d", DIRS)
+def test_inject_bidirectional_edges(d):
+    sb = SwitchBox(W=12)
+    sb.inject(2, True, d)
+    edges = sb.dependency_edges()
+    assert (("clb_out", 2), ("out", d, 2)) in edges
+
+
+@pytest.mark.parametrize("d", DIRS)
+def test_inject_bidirectional_suppresses_disjoint(d):
+    # inject overrides the disjoint sel ONLY for the injected direction.
+    sb = SwitchBox(W=12)
+    sb.route(d, 4, 1)                     # disjoint sel for out_d[4] (sel 1)
+    sb.inject(4, True, d)                 # override out_d[4]
+    edges = sb.dependency_edges()
+    src = _SOURCES[d][0]                  # sel 1 source dir
+    assert (("in", src, 4), ("out", d, 4)) not in edges  # disjoint suppressed
+    assert (("clb_out", 4), ("out", d, 4)) in edges       # inject edge appears
 
 
 def test_inject_edges_in_dependency_graph():

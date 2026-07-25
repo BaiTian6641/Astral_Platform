@@ -13,9 +13,9 @@ Frame organization (C03 §1):
 
 Per-tile bitfields (frozen v1, match the RTL + spec notes):
   * CLB-T : N eLUT4 x 20 bits  +  N*K IIB-mux x SELW bits    (8*20 + 32*5 = 320)
-  * SB    : 4 dirs x W x 2-bit sel  +  N_INJ inject_en x1   (4*12*2 + 8 = 104)
+  * SB    : 4 dirs x W x 2-bit sel  +  N_INJ inj_en x1 + N_INJ inj_dir x2  (4*12*2 + 8 + 16 = 120)
   * CB    : N_CB clb_in mux x $clog2(4*W)-bit sel           (18*6 = 108)
-  * tile  = CLB + SB + CB                                     (532 bits)
+  * tile  = CLB + SB + CB                                     (548 bits)
 
 This module is pure Python (no simulator) -> unit-testable locally with pytest.
 Run:  make test-model   (root) once the find covers ethereal-tools.
@@ -73,9 +73,11 @@ def clb_tile_type(N: int = 8, K: int = 4, sel_w: int = 5) -> TileType:
 def sb_tile_type(W: int = 12, N_INJ: int = 8) -> TileType:
     dirs = ("n", "s", "e", "w")
     mux = tuple(ConfigPoint(f"mux_{d}_{t}", 2) for d in dirs for t in range(W))
-    # routable CB (Step 1): inject_en[j] drives out_e[j] <- clb_out[j] (1 bit each)
-    inj = tuple(ConfigPoint(f"inj_en_{j}", 1) for j in range(N_INJ))
-    return TileType("switch_box", mux + inj)
+    # bidirectional inject (Option B): inj_en[j] (1 bit) + inj_dir[j] (2 bits,
+    # 0=N/1=S/2=E/3=W) per j -> out_D[j] <- clb_out[j] (D = inj_dir[j]).
+    inj_en = tuple(ConfigPoint(f"inj_en_{j}", 1) for j in range(N_INJ))
+    inj_dir = tuple(ConfigPoint(f"inj_dir_{j}", 2) for j in range(N_INJ))
+    return TileType("switch_box", mux + inj_en + inj_dir)
 
 
 def cb_tile_type(W: int = 12, N_CB: int = 18) -> TileType:
