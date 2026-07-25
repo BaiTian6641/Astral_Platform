@@ -127,6 +127,24 @@ def elut_cfg_word(ec: ElutConfig) -> int:
     return word & 0xFFFFF
 
 
+def elut_from_word(word: int) -> ElutConfig:
+    """Inverse of :func:`elut_cfg_word` — unpack a 20-bit cfg word to ElutConfig.
+
+    Bit layout (matches the RTL, see :func:`elut_cfg_word`):
+    ``[19:4]=tt, [3]=ff_en, [2]=ff_rst_en, [1]=ff_rst_val, [0]=out_inv``.
+    Added in E0-MAP3 increment 3 so the LEVEL-2 frame packer can rebuild the
+    semantic DB from unpacked frames.
+    """
+    w = word & 0xFFFFF
+    return ElutConfig(
+        tt=(w >> 4) & 0xFFFF,
+        ff_en=bool((w >> 3) & 1),
+        ff_rst_en=bool((w >> 2) & 1),
+        ff_rst_val=bool((w >> 1) & 1),
+        out_inv=bool(w & 1),
+    )
+
+
 def iib_sel_for(gi: int, gk: int, source: tuple[str, int]) -> int:
     """Map a crossbar source spec to its IIB pool select.
 
