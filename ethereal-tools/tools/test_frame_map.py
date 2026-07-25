@@ -11,7 +11,7 @@ import random
 
 import pytest
 
-from frame_map import FrameMap, crc16, clb_tile_type, sb_tile_type
+from frame_map import FrameMap, crc16, clb_tile_type, sb_tile_type, cb_tile_type
 
 V1 = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18)
 
@@ -20,12 +20,13 @@ V1 = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18)
 
 def test_bitfield_widths():
     assert clb_tile_type().width == 8 * 20 + 32 * 5 == 320
-    assert sb_tile_type().width == 4 * 12 * 2 == 96
+    assert sb_tile_type().width == 4 * 12 * 2 + 8 == 104      # mux + N_INJ inject_en
+    assert cb_tile_type().width == 18 * 6 == 108            # N_CB sel x $clog2(4W)=6
     fm = FrameMap(**V1)
-    assert fm.tile_width == 416
-    assert fm.column_bits == 4 * 416 == 1664
-    assert fm.data_words_per_frame == (1664 + 31) // 32 == 52
-    assert fm.words_per_frame == 53              # +1 CRC tail word
+    assert fm.tile_width == 532                             # CLB 320 + SB 104 + CB 108
+    assert fm.column_bits == 4 * 532 == 2128
+    assert fm.data_words_per_frame == (2128 + 31) // 32 == 67
+    assert fm.words_per_frame == 68             # +1 CRC tail word
 
 
 def test_frame_addr_format():
@@ -117,10 +118,10 @@ def test_to_json_structure():
     j = fm.to_json()
     assert j["version"] == "0.1"
     assert j["params"]["R"] == 4 and j["params"]["C"] == 4
-    assert j["data_words_per_frame"] == 52
-    assert j["words_per_frame"] == 53
+    assert j["data_words_per_frame"] == 67
+    assert j["words_per_frame"] == 68
     assert j["crc"]["tail_word"] is True
-    assert len(j["tile_points"]) == 8 * 20 // 20 + 32 + 48  # 8 elut + 32 iib + 48 sb = 88 points
+    assert len(j["tile_points"]) == 8 + 32 + 48 + 8 + 18  # 8 elut + 32 iib + 48 sb-mux + 8 inj + 18 cb = 114
     # round-trip serializable
     import json
     json.loads(fm.to_json_str())

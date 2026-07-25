@@ -12,9 +12,10 @@ Frame organization (C03 §1):
     IO-T oe=0) — NOT "no config"; a deliberate electrical-quiescent pattern.
 
 Per-tile bitfields (frozen v1, match the RTL + spec notes):
-  * CLB-T: N eLUT4 x 20 bits  +  N*K IIB-mux x SELW bits   (8*20 + 32*5 = 320)
-  * SB   : 4 dirs x W tracks x 2-bit select                (4*12*2 = 96)
-  * tile = CLB + SB                                          (416 bits)
+  * CLB-T : N eLUT4 x 20 bits  +  N*K IIB-mux x SELW bits    (8*20 + 32*5 = 320)
+  * SB    : 4 dirs x W x 2-bit sel  +  N_INJ inject_en x1   (4*12*2 + 8 = 104)
+  * CB    : N_CB clb_in mux x $clog2(4*W)-bit sel           (18*6 = 108)
+  * tile  = CLB + SB + CB                                     (532 bits)
 
 This module is pure Python (no simulator) -> unit-testable locally with pytest.
 Run:  make test-model   (root) once the find covers ethereal-tools.
@@ -69,10 +70,20 @@ def clb_tile_type(N: int = 8, K: int = 4, sel_w: int = 5) -> TileType:
     return TileType("clb_t", pts)
 
 
-def sb_tile_type(W: int = 12) -> TileType:
+def sb_tile_type(W: int = 12, N_INJ: int = 8) -> TileType:
     dirs = ("n", "s", "e", "w")
-    pts = tuple(ConfigPoint(f"mux_{d}_{t}", 2) for d in dirs for t in range(W))
-    return TileType("switch_box", pts)
+    mux = tuple(ConfigPoint(f"mux_{d}_{t}", 2) for d in dirs for t in range(W))
+    # routable CB (Step 1): inject_en[j] drives out_e[j] <- clb_out[j] (1 bit each)
+    inj = tuple(ConfigPoint(f"inj_en_{j}", 1) for j in range(N_INJ))
+    return TileType("switch_box", mux + inj)
+
+
+def cb_tile_type(W: int = 12, N_CB: int = 18) -> TileType:
+    """Input connection_block (routable CB Step 2): each clb_in[i] mux-selects
+    one of the 4*W local SB output tracks. sel width = $clog2(4*W) (=6 for W=12)."""
+    sel_w = max(1, (4 * W - 1).bit_length())   # $clog2(4*W): 6 for W=12
+    pts = tuple(ConfigPoint(f"cb_sel_{i}", sel_w) for i in range(N_CB))
+    return TileType("connection_block", pts)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +91,7 @@ def sb_tile_type(W: int = 12) -> TileType:
 # ---------------------------------------------------------------------------
 @dataclass
 class FrameMap:
-    """Logical frame layout for an R x C fabric (v1: every tile = CLB + SB)."""
+    """Logical frame layout for an R x C fabric (v1: every tile = CLB + SB + CB)."""
 
     R: int = 4
     C: int = 4
@@ -92,15 +103,17 @@ class FrameMap:
     n_regions: int = 1
     clb: TileType = field(init=False)
     sb: TileType = field(init=False)
+    cblock: TileType = field(init=False)   # input connection_block (routable CB)
 
     def __post_init__(self) -> None:
         self.clb = clb_tile_type(self.N, self.K, self.sel_w)
-        self.sb = sb_tile_type(self.W)
+        self.sb = sb_tile_type(self.W, self.N)            # N_INJ = N (clb_out count)
+        self.cblock = cb_tile_type(self.W, self.EXT_IN)   # N_CB = EXT_IN
 
     # -- geometry -----------------------------------------------------------
     @property
     def tile_width(self) -> int:
-        return self.clb.width + self.sb.width
+        return self.clb.width + self.sb.width + self.cblock.width
 
     @property
     def column_bits(self) -> int:
@@ -118,7 +131,7 @@ class FrameMap:
         return ((region & 0xF) << 8) | (col & 0xFF)
 
     def _tile_points(self) -> list[ConfigPoint]:
-        return list(self.clb.points) + list(self.sb.points)
+        return list(self.clb.points) + list(self.sb.points) + list(self.cblock.points)
 
     # -- pack / unpack ------------------------------------------------------
     def pack(self, col_config: list[dict]) -> list[int]:

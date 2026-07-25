@@ -98,7 +98,7 @@ class FabricGen:
 
     @property
     def tile_config_bits(self) -> int:
-        return self.fm.tile_width  # CLB + SB
+        return self.fm.tile_width  # CLB + SB + CB
 
     @property
     def total_config_bits(self) -> int:
