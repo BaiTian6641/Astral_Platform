@@ -1,0 +1,210 @@
+<?xml version="1.0"?>
+<!--
+  SPDX-License-Identifier: MIT
+  arch_ethereal.xml — VPR architecture description for the Ethereal fabric
+  =======================================================================
+  Task:        E0-MAP2 (VPR 架构文件, eLUT4 cluster + W=12)
+  Plan-Ref:    ethereal-plan/components/C-soft-工具与固件组件.md §2 (bitgen 两级)
+               ethereal-plan/components/C01-fabric-核心单元.md §3 (CLB-T / SB / CB)
+  Maintainer:  BaiTian6641
+  Created:     2026-07-25
+
+  === What this models ===
+  A VPR island-style architecture that mirrors the IMPLEMENTED Ethereal fabric
+  (ethereal-fabric/rtl/) so VPR can pack/place/route a netlist (from synth_ethereal,
+  E0-MAP1) onto it. The routing solution (rr_graph) is later translated by bitgen
+  (E0-MAP3) into fabric config frames via frame_map.json.
+
+    Logic block "clb"      <-> clb_t   : N=8 eLUT4 (BLE = LUT4 + FF + out-mux),
+                                                flat full-input crossbar I=EXT_IN=18
+                                                (18 ext inputs + 8 local feedback = 26).
+                                                [equivalent="full" on I makes VPR's
+                                                 packer treat the 18 inputs as a pool,
+                                                 matching clb_t's full crossbar.]
+    BLE (fle/ble4)         <-> eLUT4   : LUT4 (class lut, .names) + FF (class flipflop,
+                                                .latch) + 2:1 output mux (LUT|FF).
+                                                eLUT4's output-invert folds into the TT.
+    Routing channel        <-> W=12    : supplied as route_chan_width=12 on the CLI.
+    Switch block           <-> switch_box (disjoint unidir). VPR token "subset"
+                                                (= classical disjoint, track i->i): <switch_block type="subset" fs="3"/>.
+    Connection block       <-> connection_block (input CB = full mux of 4*W tracks;
+                                                output = clb_out -> out_e inject).
+    Segment                : length-1 unidir (per-tile SB hop), R/Cmetal ~0 (sim arch).
+
+  === ASSUMPTIONs (G6, TBD 2026-07-25) ===
+  A. fc in/out = 0.25/0.25 is a ROUTABILITY approximation, NOT an exact match to
+     the implemented CB connectivity (input CB is a full 4*W mux → in_val=1.0 is
+     the faithful value; output injects onto out_e only). Exact rr_graph -> mux
+     mapping is performed by bitgen (E0-MAP3) using the SB-topology table from
+     fabric_gen; this arch only needs to be routable for E0-MAP2's acceptance
+     ("VPR pack/place/route on c432, timing report readable").
+  B. Timing values are inherited verbatim from VTR's k4_N4_90nm.xml (90nm PTM) so
+     the timing report is readable; they are NOT the real Ethereal-fabric delays
+     (no silicon/timing-characterization yet — Phase 1+).
+  C. switch_block type="subset" (VPR's token for the classical DISJOINT
+     topology, track i->i) matches the implemented disjoint-unidir switch_box;
+     Wilton/custom are VPR-refinement knobs (C01 §3.3).
+  D. Channel width W=12 is supplied on the CLI; the arch sets no hard chan cap.
+
+  Adapted from vtr_flow/arch/timing/k4_N4_90nm.xml (VTR v8.0.0), which is the
+  canonical v8.0.0-verified homogeneous LUT4+FF cluster reference.
+-->
+<architecture>
+
+  <!-- ODIN II: native .names (LUT) / .input / .output / .latch (FF) — no custom models -->
+  <models>
+  </models>
+
+  <!-- Physical layout: io on the perimeter, clb filling the core -->
+  <layout>
+    <auto_layout aspect_ratio="1.000000">
+      <perimeter type="io" priority="100"/>
+      <corners type="EMPTY" priority="101"/>
+      <fill type="clb" priority="10"/>
+    </auto_layout>
+  </layout>
+
+  <device>
+    <sizing R_minW_nmos="4220.930176" R_minW_pmos="11207.599609"/>
+    <area grid_logic_tile_area="2229.320068"/>
+    <chan_width_distr>
+      <x distr="uniform" peak="1.000000"/>
+      <y distr="uniform" peak="1.000000"/>
+    </chan_width_distr>
+    <switch_block type="subset" fs="3"/>
+    <connection_block input_switch_name="ipin_cblock"/>
+  </device>
+
+  <switchlist>
+    <switch type="mux" name="0" R="0.000000" Cin="0.000000e+00" Cout="0.000000e+00"
+            Tdel="6.244000e-11" mux_trans_size="1.835460" buf_size="10.498600"/>
+    <switch type="mux" name="ipin_cblock" R="1055.232544" Cout="0." Cin="0.000000e+00"
+            Tdel="8.045000e-11" mux_trans_size="0.983352" buf_size="auto"/>
+  </switchlist>
+
+  <segmentlist>
+    <segment freq="1.000000" length="1" type="unidir" Rmetal="0.000000" Cmetal="0.000000e+00">
+      <mux name="0"/>
+      <sb type="pattern">1 1</sb>
+      <cb type="pattern">1</cb>
+    </segment>
+  </segmentlist>
+
+  <complexblocklist>
+
+    <!-- ================= I/O pads (perimeter) ================= -->
+    <pb_type name="io" capacity="3">
+      <input  name="outpad" num_pins="1"/>
+      <output name="inpad"  num_pins="1"/>
+      <clock  name="clock"  num_pins="1"/>
+
+      <mode name="inpad">
+        <pb_type name="inpad" blif_model=".input" num_pb="1">
+          <output name="inpad" num_pins="1"/>
+        </pb_type>
+        <interconnect>
+          <direct name="inpad" input="inpad.inpad" output="io.inpad">
+            <delay_constant max="9.492000e-11" in_port="inpad.inpad" out_port="io.inpad"/>
+          </direct>
+        </interconnect>
+      </mode>
+      <mode name="outpad">
+        <pb_type name="outpad" blif_model=".output" num_pb="1">
+          <input name="outpad" num_pins="1"/>
+        </pb_type>
+        <interconnect>
+          <direct name="outpad" input="io.outpad" output="outpad.outpad">
+            <delay_constant max="2.675000e-11" in_port="io.outpad" out_port="outpad.outpad"/>
+          </direct>
+        </interconnect>
+      </mode>
+
+      <fc in_type="frac" in_val="1.0" out_type="frac" out_val="0.25"/>
+      <pinlocations pattern="custom">
+        <loc side="left">io.outpad io.inpad io.clock</loc>
+        <loc side="top">io.outpad io.inpad io.clock</loc>
+        <loc side="right">io.outpad io.inpad io.clock</loc>
+        <loc side="bottom">io.outpad io.inpad io.clock</loc>
+      </pinlocations>
+      <power method="ignore"/>
+    </pb_type>
+
+    <!-- ================= Ethereal CLB (clb_t: N=8 eLUT4) ================= -->
+    <pb_type name="clb">
+      <!-- I=EXT_IN=18 (full pool — clb_t's flat crossbar); O=N=8 -->
+      <input  name="I"   num_pins="18" equivalent="full"/>
+      <output name="O"   num_pins="8"  equivalent="instance"/>
+      <clock  name="clk" num_pins="1"/>
+
+      <!-- 8 BLEs (fle/ble4 = LUT4 + FF + out-mux) -->
+      <pb_type name="fle" num_pb="8">
+        <input  name="in"  num_pins="4"/>
+        <output name="out" num_pins="1"/>
+        <clock  name="clk" num_pins="1"/>
+
+        <mode name="n1_lut4">
+          <pb_type name="ble4" num_pb="1">
+            <input  name="in"  num_pins="4"/>
+            <output name="out" num_pins="1"/>
+            <clock  name="clk" num_pins="1"/>
+
+            <!-- LUT4 -->
+            <pb_type name="lut4" blif_model=".names" num_pb="1" class="lut">
+              <input  name="in"  num_pins="4" port_class="lut_in"/>
+              <output name="out" num_pins="1" port_class="lut_out"/>
+              <delay_matrix type="max" in_port="lut4.in" out_port="lut4.out">
+                2.253000e-10
+                2.253000e-10
+                2.253000e-10
+                2.253000e-10
+              </delay_matrix>
+            </pb_type>
+
+            <!-- FF -->
+            <pb_type name="ff" blif_model=".latch" num_pb="1" class="flipflop">
+              <input  name="D"   num_pins="1" port_class="D"/>
+              <output name="Q"   num_pins="1" port_class="Q"/>
+              <clock  name="clk" num_pins="1" port_class="clock"/>
+              <T_setup value="2.160000e-10" port="ff.D" clock="clk"/>
+              <T_clock_to_Q max="1.426000e-10" port="ff.Q" clock="clk"/>
+            </pb_type>
+
+            <interconnect>
+              <direct name="direct1" input="ble4.in"     output="lut4[0:0].in"/>
+              <direct name="direct2" input="lut4.out"    output="ff.D">
+                <pack_pattern name="ble4" in_port="lut4.out" out_port="ff.D"/>
+              </direct>
+              <direct name="direct3" input="ble4.clk"    output="ff.clk"/>
+              <mux name="mux1" input="ff.Q lut4.out" output="ble4.out"/>
+            </interconnect>
+          </pb_type>
+
+          <interconnect>
+            <direct name="direct1" input="fle.in"   output="ble4.in"/>
+            <direct name="direct2" input="ble4.out" output="fle.out[0:0]"/>
+            <direct name="direct3" input="fle.clk"  output="ble4.clk"/>
+          </interconnect>
+        </mode>
+      </pb_type>
+
+      <!-- flat full-input crossbar: clb.I + all fle.out -> every fle.in
+           (mirrors clb_t IIB: 18 ext + 8 feedback = 26 sources) -->
+      <interconnect>
+        <complete name="crossbar" input="clb.I fle[7:0].out" output="fle[7:0].in">
+          <delay_constant max="5.735000e-11" in_port="clb.I"      out_port="fle[7:0].in"/>
+          <delay_constant max="5.428000e-11" in_port="fle[7:0].out" out_port="fle[7:0].in"/>
+        </complete>
+        <complete name="clks" input="clb.clk" output="fle[7:0].clk"/>
+        <direct  name="clbouts1" input="fle[7:0].out" output="clb.O"/>
+      </interconnect>
+
+      <!-- fc in_val=1.0 = FAITHFUL to the implemented connection_block: each
+           clb_in is a full mux over all 4*W local tracks (any input reads any
+           track). out_val=0.25 approximates clb_out injecting onto out_e only
+           (1 of 4 dirs). Exact rr_graph->mux mapping is bitgen's job (E0-MAP3). -->
+      <fc in_type="frac" in_val="1.0" out_type="frac" out_val="0.25"/>
+      <pinlocations pattern="spread"/>
+    </pb_type>
+
+  </complexblocklist>
+</architecture>
