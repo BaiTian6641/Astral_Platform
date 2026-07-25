@@ -1,0 +1,20 @@
+// SPDX-License-Identifier: MIT
+// synth_ethereal.ys — documented Yosys flow for the eLUT4 netlist (E0-MAP1).
+// The Python runner (synth_ethereal.py) is the canonical entry point; this .ys
+// documents the identical flow for transparency / manual use:
+//
+//   yosys -s synth_ethereal.ys
+//
+// (Substitute <design> / <out_prefix>; the runner does this programmatically.)
+//
+// Each `$lut` cell (WIDTH=4) in the output IS one eLUT4: its truth table maps to
+// the eLUT4 `tt` field. `$dff` cells map to the eLUT4's integrated FF at bitgen.
+
+// read_verilog <design>
+// synth -auto-top
+// abc -lut 4          // 4-input LUT mapping via ABC
+// opt -full
+// clean
+// stat                // area report (eLUT4 count)
+// write_json <out_prefix>.json
+// write_blif <out_prefix>.blif
