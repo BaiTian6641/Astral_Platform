@@ -1,0 +1,10 @@
+# Ethereal fabric descriptor (reference example) — fabric-gen v0 (E0-FAB6).
+# Default fabric (matches fabric_top defaults). Schema: fabric_gen.py.
+R: 4
+C: 4
+W: 12
+N: 8
+K: 4
+EXT_IN: 18
+sel_w: 5
+n_regions: 1

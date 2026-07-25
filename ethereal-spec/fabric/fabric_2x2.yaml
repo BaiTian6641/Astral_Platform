@@ -1,0 +1,10 @@
+# Ethereal fabric descriptor (reference example) — fabric-gen v0 (E0-FAB6).
+# Schema: see ethereal-tools/tools/fabric_gen.py. All keys optional (v1 defaults).
+R: 2
+C: 2
+W: 12
+N: 8
+K: 4
+EXT_IN: 18
+sel_w: 5
+n_regions: 1
