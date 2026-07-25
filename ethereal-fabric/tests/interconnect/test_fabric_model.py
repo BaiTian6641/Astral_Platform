@@ -93,3 +93,37 @@ def test_ring_breaks_when_one_mux_disconnects():
     assert g.has_comb_loop() is True
     g.configure_sb(1, 0, 0 * W + 0, 0)   # break the ring (disconnect)
     assert g.has_comb_loop() is False
+
+
+# ---- 5. routable-CB injection (clb_out source -> out_e) ---------------------
+
+def test_injection_keeps_default_fabric_acyclic():
+    """Injection edges are clb_out -> out_e source edges (no incoming edge on
+    clb_out) -> cannot form a cycle. Default fabric stays acyclic."""
+    g = FabricGrid(4, 4, W)
+    g.configure_sb(1, 1, 4 * W + 0, 1)   # inject_en[0] on tile (1,1)
+    g.set_clb_out(1, 1, 1)               # clb_out[0] = 1
+    assert g.has_comb_loop() is False
+    # the injection edge must appear, localized to tile (1,1)
+    assert ((1, 1, "clb_out", 0), (1, 1, "out", "e", 0)) in g.graph_edges()
+
+
+def test_injection_breaks_ring_via_source():
+    """Routing a ring segment through the injection path (a source) breaks the
+    combinational cycle: clb_out has no incoming edge, so the chain dead-ends."""
+    g = FabricGrid(2, 2, W)
+    g.set_clb_out(0, 0, 1)               # tile (0,0) clb_out[0] = 1
+    g.configure_sb(0, 0, 4 * W + 0, 1)   # (0,0) out_e[0] <- clb_out[0] (inject)
+    g.configure_sb(0, 1, 1 * W + 0, 3)   # (0,1) out_s <- in_w
+    g.configure_sb(1, 1, 3 * W + 0, 1)   # (1,1) out_w <- in_n
+    g.configure_sb(1, 0, 0 * W + 0, 2)   # (1,0) out_n <- in_e
+    assert g.has_comb_loop() is False
+
+
+def test_injection_tile_outputs_passes_clb_out():
+    """tile_outputs() feeds the stored clb_out vector to the tile's SB."""
+    g = FabricGrid(2, 2, W)
+    g.configure_sb(0, 0, 4 * W + 2, 1)   # inject_en[2]
+    g.set_clb_out(0, 0, 1 << 2)          # clb_out[2] = 1
+    _on, _os, oe, _ow = g.tile_outputs(0, 0, 0, 0, 0, 0)
+    assert ((oe >> 2) & 1) == 1

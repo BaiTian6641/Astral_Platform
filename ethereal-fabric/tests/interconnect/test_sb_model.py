@@ -24,8 +24,9 @@ MASK = (1 << W) - 1
 
 def test_params_v1():
     sb = SwitchBox(W=12)
-    assert sb.AW == 6               # $clog2(4*12) = $clog2(48) = 6
+    assert sb.AW == 6               # $clog2(4*12+8) = $clog2(56) = 6
     assert sb.NSEL == 48
+    assert sb.NINJ == 8             # default routable-CB injectable count
 
 
 def test_no_reset_default_disconnect():
@@ -59,14 +60,20 @@ def test_config_roundtrip(a):
 
 def test_configure_masks_addr_and_data():
     sb = SwitchBox(W=12)
-    # addr beyond NSEL is ignored (masked to AW bits then range-checked)
-    sb.configure(sb.NSEL, 1)         # NSEL = 48 -> addr 48 is out of range
+    # addr beyond SB_END (NSEL+NINJ = 56) is ignored (AW-bit mask then range)
+    sb.configure(sb.NSEL + sb.NINJ, 1)   # addr 56 -> out of range
     assert sb.sel == {}
-    # data masked to low 2 bits
+    assert sb.inject_en == set()
+    # data masked to low 2 bits (sel path)
     sb.configure(0, 0b101)           # -> sel 0b01 = 1
     assert sb.sel[(0, 0)] == 1
     sb.configure(1, 0b110)           # -> sel 0b10 = 2
     assert sb.sel[(0, 1)] == 2
+    # inject_en path: addr in [NSEL, NSEL+NINJ), data & 1
+    sb.configure(sb.NSEL, 0b101)     # addr 48 -> inject_en[0] = 1 (data & 1)
+    assert 0 in sb.inject_en
+    sb.configure(sb.NSEL, 0b100)     # addr 48 -> inject_en[0] = 0
+    assert 0 not in sb.inject_en
 
 
 def test_route_matches_configure():
@@ -272,3 +279,73 @@ def test_edges_node_shape():
     assert src_node == ("in", "e", 4)
     assert dst_node == ("out", "n", 4)
     assert src_node[0] == "in" and dst_node[0] == "out"
+
+
+# ---- 8. routable-CB injection (clb_out -> out_e[0..N_INJ-1]) ----------------
+
+def test_inject_en_routes_clb_out_to_out_e():
+    sb = SwitchBox(W=12)                   # N_INJ=8 default
+    sb.inject(3, True)                     # inject_en[3] = 1
+    oe = sb.outputs(0, 0, 0, 0, clb_out=1 << 3)[2]
+    assert ((oe >> 3) & 1) == 1            # clb_out[3] -> out_e[3]
+    assert (oe & ~(1 << 3)) == 0           # only bit 3
+
+
+def test_inject_cleared_falls_back_to_disjoint():
+    sb = SwitchBox(W=12)
+    sb.route("e", 3, 1)                    # disjoint: out_e[3] <- in_n[3]
+    sb.inject(3, False)                    # inject disabled
+    # clb_out[3]=1 but inject off -> out_e[3] follows disjoint sel (in_n[3])
+    oe = sb.outputs(1 << 3, 0, 0, 0, clb_out=1 << 3)[2]
+    assert ((oe >> 3) & 1) == 1
+    # in_n[3]=0, clb_out[3]=1, inject off -> out_e[3] = 0 (clb_out ignored)
+    oe2 = sb.outputs(0, 0, 0, 0, clb_out=1 << 3)[2]
+    assert ((oe2 >> 3) & 1) == 0
+
+
+def test_inject_overrides_disjoint_sel():
+    # even when disjoint sel points elsewhere, inject_en wins
+    sb = SwitchBox(W=12)
+    sb.route("e", 3, 1)                    # disjoint: out_e[3] <- in_n[3]
+    sb.inject(3, True)                     # inject overrides
+    # in_n[3]=1, clb_out[3]=0 -> out_e[3] must be 0 (inject wins)
+    oe = sb.outputs(1 << 3, 0, 0, 0, clb_out=0)[2]
+    assert ((oe >> 3) & 1) == 0
+
+
+def test_inject_via_configure_addr():
+    sb = SwitchBox(W=12)
+    sb.configure(sb.NSEL + 5, 1)           # addr 53 -> inject_en[5] = 1
+    assert sb.inject_of(5) is True
+    oe = sb.outputs(0, 0, 0, 0, clb_out=1 << 5)[2]
+    assert ((oe >> 5) & 1) == 1
+    sb.configure(sb.NSEL + 5, 0)           # clear
+    assert sb.inject_of(5) is False
+
+
+def test_inject_edges_in_dependency_graph():
+    sb = SwitchBox(W=12)
+    sb.inject(2, True)
+    sb.inject(7, True)
+    edges = sb.dependency_edges()
+    assert (("clb_out", 2), ("out", "e", 2)) in edges
+    assert (("clb_out", 7), ("out", "e", 7)) in edges
+
+
+def test_inject_suppresses_disjoint_out_e_edge():
+    # inject_en[j]=1 overrides out_e[j] -> its disjoint in->out_e edge must
+    # NOT appear (faithful to the RTL mux); the injection edge appears instead.
+    sb = SwitchBox(W=12)
+    sb.route("e", 4, 1)                    # disjoint: in_n[4] -> out_e[4]
+    sb.route("n", 4, 1)                    # disjoint: in_s[4] -> out_n[4]
+    sb.inject(4, True)                     # override out_e[4]
+    edges = sb.dependency_edges()
+    assert (("in", "n", 4), ("out", "e", 4)) not in edges
+    assert (("clb_out", 4), ("out", "e", 4)) in edges
+    # disjoint edge for the non-injected direction is unaffected
+    assert (("in", "s", 4), ("out", "n", 4)) in edges
+
+
+def test_inject_edges_empty_by_default():
+    # default config (no inject_en) -> no clb_out edges (acyclic baseline)
+    assert SwitchBox(W=12).dependency_edges() == set()

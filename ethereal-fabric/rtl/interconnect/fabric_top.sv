@@ -42,7 +42,7 @@ module fabric_top #(
 );
     localparam int NTILES = R*C;
     localparam int TIW    = $clog2(NTILES);   // tile-index width
-    localparam int AW_SB  = $clog2(4*W);      // switch_box cfg-addr width (=6)
+    localparam int AW_SB  = $clog2(4*W+N);     // switch_box cfg-addr width (sel+inject; =6 for W12,N8)
 
     // cfg_addr_i is 16-bit; only the low (7+TIW) bits are decoded. Sink the
     // reserved upper bits so the lint tool does not flag them unused.
@@ -95,7 +95,7 @@ module fabric_top #(
                 wire sb_cfg_we  = cfg_we_i &&  sel_tile &&  unit_is_sb;
 
                 // ---- switch box ----
-                switch_box #(.W(W)) u_sb (
+                switch_box #(.W(W), .N_INJ(N)) u_sb (
                     .clk_i      (clk_i),
                     .cfg_we_i   (sb_cfg_we),
                     .cfg_addr_i (intra[AW_SB-1:0]),
@@ -104,6 +104,7 @@ module fabric_top #(
                     .in_s       (sb_in_s[r][c]),
                     .in_e       (sb_in_e[r][c]),
                     .in_w       (sb_in_w[r][c]),
+                    .clb_out_i  (clb_out_local),
                     .out_n      (sb_out_n[r][c]),
                     .out_s      (sb_out_s[r][c]),
                     .out_e      (sb_out_e[r][c]),

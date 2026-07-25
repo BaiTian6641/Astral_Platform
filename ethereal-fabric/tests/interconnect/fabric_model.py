@@ -16,10 +16,12 @@ Graph nodes: ``(r, c, side, dir, t)`` where side in {"in","out"}, dir in
 A node with no driving edge reads as 0. Default SB config (all sel=0/disconnect)
 adds no SB-internal edges -> the graph has only out->in channel edges -> acyclic.
 
-NOTE (v1 scope): CLB<->channel injection (a routable CB) is intentionally NOT
-modeled here -- it is a later design step (frame-map S02-P0#1 + OCC E0-FAB4 +
-VPR E0-MAP2). This model validates the SB+channel *interconnect* structure, which
-is what the E0-FAB3 "no comb loop" acceptance is about.
+NOTE (routable CB): each tile's SB can inject its local CLB outputs onto
+out_e[0..N_INJ-1] via inject_en (cfg addr 4W+j). The per-tile ``clb_out`` vector
+(default 0, set via :meth:`set_clb_out`) models the ClbT outputs as an
+externally-set source -- no CLB logic is simulated. ``dependency_edges`` emits
+``clb_out`` -> ``out_e`` source edges (clb_out has no incoming edge -> cannot
+form a cycle by itself); default config (no inject_en) adds no such edges.
 """
 from __future__ import annotations
 
@@ -40,9 +42,13 @@ CHAN_MAP = {
 class FabricGrid:
     """R x C grid of switch boxes connected by unidirectional channels."""
 
-    def __init__(self, R: int = 4, C: int = 4, W: int = 12) -> None:
-        self.R, self.C, self.W = R, C, W
-        self.sb = [[SwitchBox(W) for _ in range(C)] for _ in range(R)]
+    def __init__(self, R: int = 4, C: int = 4, W: int = 12, N_INJ: int = 8) -> None:
+        self.R, self.C, self.W, self.N_INJ = R, C, W, N_INJ
+        self.sb = [[SwitchBox(W, N_INJ) for _ in range(C)] for _ in range(R)]
+        # per-tile CLB-output source vector (N_INJ bits); default 0. Models the
+        # ClbT outputs as an externally-set source (no CLB logic simulated);
+        # set via set_clb_out() and fed to each tile's SB via tile_outputs().
+        self.clb_out: list[list[int]] = [[0 for _ in range(C)] for _ in range(R)]
 
     # -- addressing helpers ------------------------------------------------
     @property
@@ -64,6 +70,14 @@ class FabricGrid:
     def configure_sb(self, r: int, c: int, addr: int, data: int) -> None:
         self.sb[r][c].configure(addr, data)
 
+    def set_clb_out(self, r: int, c: int, value: int) -> None:
+        """Set tile (r,c)'s CLB-output source vector (N_INJ bits)."""
+        self.clb_out[r][c] = value & ((1 << self.N_INJ) - 1)
+
+    def tile_outputs(self, r: int, c: int, in_n, in_s, in_e, in_w):
+        """Evaluate tile (r,c)'s SB outputs, feeding the stored clb_out vector."""
+        return self.sb[r][c].outputs(in_n, in_s, in_e, in_w, self.clb_out[r][c])
+
     # -- graph construction ------------------------------------------------
     def _channel_edges(self) -> list[tuple]:
         edges = []
@@ -81,9 +95,12 @@ class FabricGrid:
         for r in range(self.R):
             for c in range(self.C):
                 for (src, dst) in self.sb[r][c].dependency_edges():
-                    # src/dst are (("in"|"out", dir, t), ...) -> localize to tile
-                    edges.append(((r, c, src[0], src[1], src[2]),
-                                  (r, c, dst[0], dst[1], dst[2])))
+                    # localize to tile. src/dst tuple shapes vary:
+                    #   ("in"/"out", dir, t)  -> 3-tuple
+                    #   ("clb_out", j)        -> 2-tuple (routable-CB source)
+                    # prefixing with (r,c) keeps every node a distinct, hashable
+                    # fabric coordinate (clb_out nodes are 4-tuples, others 5-).
+                    edges.append(((r, c) + src, (r, c) + dst))
         return edges
 
     def graph_edges(self) -> list[tuple]:
