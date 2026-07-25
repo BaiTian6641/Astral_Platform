@@ -40,11 +40,21 @@ def test_graph_nodes_well_formed():
     g = FabricGrid(2, 2, W)
     for a, b in g.graph_edges():
         for node in (a, b):
-            r, c, side, d, t = node
+            r, c = node[0], node[1]
             assert 0 <= r < 2 and 0 <= c < 2
-            assert side in ("in", "out")
-            assert d in ("n", "s", "e", "w")
-            assert 0 <= t < W
+            # node shapes:
+            #   (r, c, "in"/"out", dir, t) -> 5-tuple (channel + SB track)
+            #   (r, c, "clb_out", j)        -> 4-tuple (routable-CB source)
+            #   (r, c, "clb_in", i)         -> 4-tuple (CB sink)
+            if len(node) == 5:
+                _, _, side, d, t = node
+                assert side in ("in", "out")
+                assert d in ("n", "s", "e", "w")
+                assert 0 <= t < W
+            else:
+                assert len(node) == 4
+                assert node[2] in ("clb_in", "clb_out")
+                assert isinstance(node[3], int) and node[3] >= 0
 
 
 # ---- 2. THE acceptance: default config has NO comb loop --------------------
@@ -127,3 +137,98 @@ def test_injection_tile_outputs_passes_clb_out():
     g.set_clb_out(0, 0, 1 << 2)          # clb_out[2] = 1
     _on, _os, oe, _ow = g.tile_outputs(0, 0, 0, 0, 0, 0)
     assert ((oe >> 2) & 1) == 1
+
+
+# ---- 6. connection_block (input-side routable CB, task E0-FAB3b) -------------
+#
+# Each tile now also has a ConnectionBlock (clb_in = mux of 4*W local SB output
+# tracks). The CB's dependency_edges end at "clb_in" sinks -> cannot form a
+# routing cycle. The default config (all sel=0 -> out_n[0]) is HW-accurate post
+# zero-init (sel_r is reset-less; OCC configures before run, C03).
+
+def test_default_acyclic_with_cb():
+    """Default grid is acyclic even though CB edges exist (clb_in is a sink)."""
+    for R, C in [(4, 4), (1, 2)]:
+        g = FabricGrid(R, C, W)
+        assert g.has_comb_loop() is False, f"default {R}x{C} with CB must be acyclic"
+
+
+def test_cb_edges_present():
+    """graph_edges includes CB edges: count == R*C*EXT_IN, each ends at clb_in."""
+    R, C = 4, 4
+    g = FabricGrid(R, C, W)
+    edges = g.graph_edges()
+    cb_edges = [e for e in edges if len(e[1]) == 4 and e[1][2] == "clb_in"]
+    assert len(cb_edges) == R * C * g.EXT_IN
+    for src, dst in cb_edges:
+        assert dst[2] == "clb_in"
+        # src is an "out" track node (same shape as SB/channel out nodes)
+        assert src[2] == "out"
+        assert src[3] in ("n", "s", "e", "w")
+
+
+def test_cb_edges_localize_to_tile():
+    g = FabricGrid(2, 2, W)
+    edges = g.graph_edges()
+    # one CB edge ending at (0,1,"clb_in",0) must exist (default sel=0 -> out_n[0])
+    assert ((0, 1, "out", "n", 0), (0, 1, "clb_in", 0)) in edges
+    assert ((1, 0, "out", "n", 0), (1, 0, "clb_in", 0)) in edges
+
+
+def test_cb_configure_via_unit_cb():
+    """FabricGrid.configure with UNIT_CB writes the CB sel of that tile."""
+    g = FabricGrid(2, 2, W)
+    g.configure(tile_idx=0, unit=FabricGrid.UNIT_CB, intra=3, data=5)
+    r, c = g.tile_rc(0)
+    assert g.cb[r][c].sel_of(3) == 5
+    # the change is reflected in the graph: clb_in[3]@(0,0) now sourced by
+    # track 5 = ("n", 5) (5 < W)
+    assert ((0, 0, "out", "n", 5), (0, 0, "clb_in", 3)) in g.graph_edges()
+
+
+# ---- 7. THE KEY TEST: end-to-end routability -------------------------------
+#
+# Prove a path exists from tile0.clb_out[0] -> tile1.clb_in[0]:
+#   tile0 SB inject_en[0]=1            clb_out[0] -> out_e[0]
+#   channel                           out_e[0]@(0,0) -> in_w[0]@(0,1)
+#   tile1 SB out_n sel=3 (src=w)       in_w[0] -> out_n[0]
+#   tile1 CB clb_in[0] sel=0           out_n[0] -> clb_in[0]
+
+def test_routability_end_to_end():
+    """1x2 grid: tile0.clb_out[0] -> tile1.clb_in[0] is routable."""
+    g = FabricGrid(R=1, C=2, W=W, N_INJ=8, EXT_IN=18)
+
+    # tile0 (idx 0): SB inject_en[0]=1 -> clb_out[0] drives out_e[0]
+    g.configure(tile_idx=0, unit=FabricGrid.UNIT_SB, intra=4 * W + 0, data=1)
+    # tile1 (idx 1): SB route in_w[0] -> out_n[0]. out_n sources=[s,e,w], sel=3=w
+    g.configure(tile_idx=1, unit=FabricGrid.UNIT_SB, intra=0, data=3)
+    # tile1 (idx 1): CB clb_in[0] sel=0 -> out_n[0]
+    g.configure(tile_idx=1, unit=FabricGrid.UNIT_CB, intra=0, data=0)
+
+    assert g.route_exists((0, 0, "clb_out", 0), (0, 1, "clb_in", 0)) is True
+
+    # sanity: the routing stays acyclic (it dead-ends at the clb_in sink)
+    assert g.has_comb_loop() is False
+
+
+def test_routability_negative_control():
+    """With tile0 inject DISABLED, the route must not exist."""
+    g = FabricGrid(R=1, C=2, W=W, N_INJ=8, EXT_IN=18)
+    # tile1 routing is the same, but tile0 inject_en[0] stays 0 (default)
+    g.configure(tile_idx=1, unit=FabricGrid.UNIT_SB, intra=0, data=3)
+    g.configure(tile_idx=1, unit=FabricGrid.UNIT_CB, intra=0, data=0)
+    assert g.route_exists((0, 0, "clb_out", 0), (0, 1, "clb_in", 0)) is False
+
+
+def test_routability_route_exists_trivial_self():
+    """A node is trivially reachable from itself (zero-length path)."""
+    g = FabricGrid(2, 2, W)
+    # any node present in the graph reaches itself
+    assert g.route_exists((0, 0, "clb_in", 0), (0, 0, "clb_in", 0)) is True
+
+
+def test_routability_no_path_to_isolated_node():
+    """A clb_out source with no injection has no outgoing edge -> no path."""
+    g = FabricGrid(1, 2, W)
+    # default config: clb_out[0]@(0,0) has no edge (inject disabled)
+    assert g.route_exists((0, 0, "clb_out", 0), (0, 1, "clb_in", 0)) is False

@@ -26,6 +26,8 @@ form a cycle by itself); default config (no inject_en) adds no such edges.
 from __future__ import annotations
 
 from collections import deque
+
+from cb_model import ConnectionBlock
 from sb_model import SwitchBox
 
 DIRS = ("n", "s", "e", "w")
@@ -40,15 +42,27 @@ CHAN_MAP = {
 
 
 class FabricGrid:
-    """R x C grid of switch boxes connected by unidirectional channels."""
+    """R x C grid of switch boxes + connection blocks wired by channels.
 
-    def __init__(self, R: int = 4, C: int = 4, W: int = 12, N_INJ: int = 8) -> None:
-        self.R, self.C, self.W, self.N_INJ = R, C, W, N_INJ
+    Each tile holds one SwitchBox (track mux + clb_out injection) and one
+    ConnectionBlock (clb_in mux over the 4*W local SB output tracks).
+    ``EXT_IN`` (= N_CB, default 18) is the CLB input count per tile.
+    """
+
+    def __init__(
+        self, R: int = 4, C: int = 4, W: int = 12, N_INJ: int = 8, EXT_IN: int = 18
+    ) -> None:
+        self.R, self.C, self.W, self.N_INJ, self.EXT_IN = R, C, W, N_INJ, EXT_IN
         self.sb = [[SwitchBox(W, N_INJ) for _ in range(C)] for _ in range(R)]
+        # input connection block per tile (clb_in = mux of 4*W local SB tracks)
+        self.cb = [[ConnectionBlock(W, EXT_IN) for _ in range(C)] for _ in range(R)]
         # per-tile CLB-output source vector (N_INJ bits); default 0. Models the
         # ClbT outputs as an externally-set source (no CLB logic simulated);
         # set via set_clb_out() and fed to each tile's SB via tile_outputs().
         self.clb_out: list[list[int]] = [[0 for _ in range(C)] for _ in range(R)]
+
+    # unit codes mirror fabric_top: 0 = CLB, 1 = SB, 2 = CB(connection_block)
+    UNIT_CLB, UNIT_SB, UNIT_CB = 0, 1, 2
 
     # -- addressing helpers ------------------------------------------------
     @property
@@ -58,14 +72,17 @@ class FabricGrid:
     def tile_rc(self, idx: int) -> tuple[int, int]:
         return divmod(idx, self.C)  # row-major: idx = r*C + c
 
-    # unit codes mirror fabric_top: 0 = CLB, 1 = SB
-    UNIT_CLB, UNIT_SB = 0, 1
-
     def configure(self, tile_idx: int, unit: int, intra: int, data: int) -> None:
+        """Dispatch a config write to the per-tile unit (CLB/SB/CB).
+
+        CLB config is handled by the ClbT model elsewhere; not modeled here.
+        SB and CB selects are written into their golden models.
+        """
         r, c = self.tile_rc(tile_idx)
         if unit == self.UNIT_SB:
             self.sb[r][c].configure(intra, data)
-        # CLB config is handled by the ClbT model elsewhere; not modeled here.
+        elif unit == self.UNIT_CB:
+            self.cb[r][c].configure(intra, data)
 
     def configure_sb(self, r: int, c: int, addr: int, data: int) -> None:
         self.sb[r][c].configure(addr, data)
@@ -103,8 +120,22 @@ class FabricGrid:
                     edges.append(((r, c) + src, (r, c) + dst))
         return edges
 
+    def _cb_edges(self) -> list[tuple]:
+        """connection_block edges: out_track@(r,c) -> clb_in_i@(r,c).
+
+        clb_in nodes are 4-tuples ``(r, c, "clb_in", i)``; src out-track nodes
+        are 5-tuples ``(r, c, "out", dir, t)`` (same shape as SB/channel out
+        nodes). clb_in is a sink -> these edges cannot form a cycle.
+        """
+        edges = []
+        for r in range(self.R):
+            for c in range(self.C):
+                for (src, dst) in self.cb[r][c].dependency_edges():
+                    edges.append(((r, c) + src, (r, c) + dst))
+        return edges
+
     def graph_edges(self) -> list[tuple]:
-        return self._channel_edges() + self._sb_edges()
+        return self._channel_edges() + self._sb_edges() + self._cb_edges()
 
     # -- cycle detection (Kahn's topological sort) -------------------------
     def has_comb_loop(self) -> bool:
@@ -143,6 +174,30 @@ class FabricGrid:
                     if inside and not (0 <= nr < self.R and 0 <= nc < self.C):
                         return False
         return True
+
+    # -- routability (reachability over the configured routing graph) ------
+    def route_exists(self, src_node: tuple, dst_node: tuple) -> bool:
+        """True iff ``dst_node`` is reachable from ``src_node`` via graph edges.
+
+        Nodes are the localized tuples produced by :meth:`graph_edges`, e.g.
+        ``(0, 0, "clb_out", 0)`` or ``(0, 1, "clb_in", 0)``. Uses iterative
+        DFS over the current graph (channel + SB + CB edges). A node is
+        trivially reachable from itself (zero-length path).
+        """
+        adj: dict[tuple, set[tuple]] = {}
+        for a, b in self.graph_edges():
+            adj.setdefault(a, set()).add(b)
+        visited: set[tuple] = {src_node}
+        stack = [src_node]
+        while stack:
+            n = stack.pop()
+            if n == dst_node:
+                return True
+            for m in adj.get(n, ()):
+                if m not in visited:
+                    visited.add(m)
+                    stack.append(m)
+        return False
 
     def n_channel_edges(self) -> int:
         return len(self._channel_edges())
