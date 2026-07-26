@@ -98,6 +98,7 @@ else
 	@echo "[test-sv] tb_connection_block"; $(IVERILOG) -g2012 -o /tmp/tb_cb ethereal-fabric/tests/interconnect/tb_connection_block.sv ethereal-fabric/rtl/interconnect/connection_block.sv && vvp /tmp/tb_cb | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_occ";       $(IVERILOG) -g2012 -o /tmp/tb_occ ethereal-fabric/tests/occ/tb_occ.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_occ | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_blank";     $(IVERILOG) -g2012 -o /tmp/tb_blank ethereal-fabric/tests/occ/tb_blank.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_blank | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_hotswap";  $(IVERILOG) -g2012 -o /tmp/tb_hotswap ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/interconnect/tb_hotswap.sv 2>/dev/null && vvp /tmp/tb_hotswap | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
