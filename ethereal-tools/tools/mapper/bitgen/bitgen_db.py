@@ -273,6 +273,36 @@ def permute_tt(logical_tt: int, phys_to_log: list[int] | tuple[int, ...]) -> int
     return phys_tt
 
 
+def _expand_logical_tt(logical_tt: int, n: int,
+                       pin_logpos: list[int | None]) -> int:
+    """Expand an n-input (n<=4) logical TT into the 4-input PHYSICAL TT.
+
+    ``pin_logpos[gk]`` = the logical input position (MSB-first, 0..n-1) carried
+    by physical pin gk, or ``None`` for a DON'T-CARE pin (a pin VPR tied to a net
+    that is NOT a logical input of this LUT). The function is REPLICATED over
+    the don't-care pins (they do not affect the output) — this is the correct
+    sub-4-input expansion (abc emits many <4-input LUTs). Equivalent to
+    :func:`permute_tt` when n==4 and every pin carries a logical input.
+
+    Bug fix 2026-07-26 (caught by c432 bit-true, E0-MAP3 incr 4d): the previous
+    code stored the raw un-expanded ``logical_tt`` for n<4, so VPR's tied
+    don't-care pins perturbed the output.
+    """
+    tt = 0
+    for p in range(16):                                  # physical combo (pin0 LSB)
+        log_bits = [0] * n
+        for gk in range(4):
+            pos = pin_logpos[gk]
+            if pos is not None:
+                log_bits[pos] = (p >> gk) & 1            # DC pins: replicated
+        log_idx = 0
+        for pos in range(n):                             # MSB-first (BLIF conv.)
+            log_idx |= log_bits[pos] << (n - 1 - pos)
+        if (logical_tt >> log_idx) & 1:
+            tt |= 1 << p
+    return tt
+
+
 # =============================================================================
 # .place parsing
 # =============================================================================
@@ -444,8 +474,18 @@ def _build_tile(clb: ET.Element,
                     input_list, rotation_map)
                 phys_tt = permute_tt(logical_tt, phys_to_log)
             else:
-                # not a 4-LUT leaf (constants etc.) — keep logical TT as-is
-                phys_tt = logical_tt
+                # sub-4-input LUT (common after abc): EXPAND the logical TT into
+                # the 4-input physical TT, REPLICATING over the don't-care pins
+                # (VPR ties them to a non-logical net). pin_logpos[gk] = logical
+                # input position carried by physical pin gk, or None (don't-care).
+                pin_logpos: list[int | None] = [None, None, None, None]
+                for gk in range(4):
+                    sel = tile.iib_mux.get((gi, gk), 0)
+                    net = (tile.cluster_inputs.get(sel) if sel < EXT_IN
+                           else tile.cluster_outputs.get(sel - EXT_IN))
+                    if net in input_list:
+                        pin_logpos[gk] = input_list.index(net)
+                phys_tt = _expand_logical_tt(logical_tt, len(input_list), pin_logpos)
 
         tile.eluts[gi] = ElutConfig(tt=phys_tt, ff_en=_fle_ff_used(fl))
     return tile
