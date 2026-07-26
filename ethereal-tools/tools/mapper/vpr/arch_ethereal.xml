@@ -25,8 +25,11 @@
                                                 .latch) + 2:1 output mux (LUT|FF).
                                                 eLUT4's output-invert folds into the TT.
     Routing channel        <-> W=12    : supplied as route_chan_width=12 on the CLI.
-    Switch block           <-> switch_box (disjoint unidir). VPR token "subset"
-                                                (= classical disjoint, track i->i): <switch_block type="subset" fs="3"/>.
+    Switch block           <-> switch_box (Wilton track-permuting Fs=3, v1.1).
+                                                VPR token "wilton": <switch_block type="wilton" fs="3"/>.
+                                                (Our Option-B router on the hand-built
+                                                fabric is authoritative; this arch is
+                                                kept consistent for VPR pack/place parity.)
     Connection block       <-> connection_block (input CB = full mux of 4*W tracks;
                                                 output = clb_out -> out_e inject).
     Segment                : length-1 unidir (per-tile SB hop), R/Cmetal ~0 (sim arch).
@@ -41,9 +44,11 @@
   B. Timing values are inherited verbatim from VTR's k4_N4_90nm.xml (90nm PTM) so
      the timing report is readable; they are NOT the real Ethereal-fabric delays
      (no silicon/timing-characterization yet — Phase 1+).
-  C. switch_block type="subset" (VPR's token for the classical DISJOINT
-     topology, track i->i) matches the implemented disjoint-unidir switch_box;
-     Wilton/custom are VPR-refinement knobs (C01 §3.3).
+  C. switch_block type="wilton" (track-permuting Fs=3) matches the implemented
+     switch_box (v1.1, 2026-07-26): a signal changes track index at each SB hop,
+     breaking the disjoint track-locking that stranded c432 (E0-MAP3 incr 4a
+     Cause 2). The Option-B bitgen router on the hand-built fabric is
+     authoritative; this arch token is kept consistent for VPR pack/place parity.
   D. Channel width W=12 is supplied on the CLI; the arch sets no hard chan cap.
 
   Adapted from vtr_flow/arch/timing/k4_N4_90nm.xml (VTR v8.0.0), which is the
@@ -71,7 +76,7 @@
       <x distr="uniform" peak="1.000000"/>
       <y distr="uniform" peak="1.000000"/>
     </chan_width_distr>
-    <switch_block type="subset" fs="3"/>
+    <switch_block type="wilton" fs="3"/>
     <connection_block input_switch_name="ipin_cblock"/>
   </device>
 

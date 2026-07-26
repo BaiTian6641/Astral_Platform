@@ -83,25 +83,39 @@ def test_acyclic_routing():
 # ---- 4. a deliberately cyclic ring IS detected -----------------------------
 
 def test_cyclic_ring_detected():
-    """Close a 4-tile ring on track 0: (0,0)->(0,1)->(1,1)->(1,0)->(0,0)."""
+    """Close a 4-tile ring under the WILTON track-permuting SB.
+
+    The disjoint SB closed a ring with all muxes on track 0 (same-index). Under
+    Wilton a signal CHANGES track at each hop, so the ring must use the
+    permuted source tracks. With t0=0 the cycle is (verifiable via
+    sb_model._wilton_track):
+      (0,0) out_e[0]<-in_s[10]  (sel2=S, _wilton(e,s,0)=10)
+      chan  out_e[0]@(0,0) -> in_w[0]@(0,1)
+      (0,1) out_s[1]<-in_w[0]   (sel3=W, _wilton(s,w,1)=0)
+      chan  out_s[1]@(0,1) -> in_n[1]@(1,1)
+      (1,1) out_w[11]<-in_n[1]  (sel1=N, _wilton(w,n,11)=1)
+      chan  out_w[11]@(1,1) -> in_e[11]@(1,0)
+      (1,0) out_n[10]<-in_e[11] (sel2=E, _wilton(n,e,10)=11)
+      chan  out_n[10]@(1,0) -> in_s[10]@(0,0)   <- closes the loop
+    """
     g = FabricGrid(2, 2, W)
-    # addr = DIR*W + t ; DIR: 0=N,1=S,2=E,3=W ; sel: out_X selk per sb_model table
-    g.configure_sb(0, 0, 2 * W + 0, 2)   # out_e <- in_s   (out_e sel2 = in_s)
-    g.configure_sb(0, 1, 1 * W + 0, 3)   # out_s <- in_w   (out_s sel3 = in_w)
-    g.configure_sb(1, 1, 3 * W + 0, 1)   # out_w <- in_n   (out_w sel1 = in_n)
-    g.configure_sb(1, 0, 0 * W + 0, 2)   # out_n <- in_e   (out_n sel2 = in_e)
+    # addr = DIR*W + t ; DIR: 0=N,1=S,2=E,3=W ; sel per sb_model source map
+    g.configure_sb(0, 0, 2 * W + 0, 2)    # out_e[0]  sel2 (S)
+    g.configure_sb(0, 1, 1 * W + 1, 3)    # out_s[1]  sel3 (W)
+    g.configure_sb(1, 1, 3 * W + 11, 1)   # out_w[11] sel1 (N)
+    g.configure_sb(1, 0, 0 * W + 10, 2)   # out_n[10] sel2 (E)
     assert g.has_comb_loop() is True
 
 
 def test_ring_breaks_when_one_mux_disconnects():
-    """Disconnecting any one mux of the ring must remove the cycle."""
+    """Disconnecting any one mux of the Wilton ring must remove the cycle."""
     g = FabricGrid(2, 2, W)
     g.configure_sb(0, 0, 2 * W + 0, 2)
-    g.configure_sb(0, 1, 1 * W + 0, 3)
-    g.configure_sb(1, 1, 3 * W + 0, 1)
-    g.configure_sb(1, 0, 0 * W + 0, 2)
+    g.configure_sb(0, 1, 1 * W + 1, 3)
+    g.configure_sb(1, 1, 3 * W + 11, 1)
+    g.configure_sb(1, 0, 0 * W + 10, 2)
     assert g.has_comb_loop() is True
-    g.configure_sb(1, 0, 0 * W + 0, 0)   # break the ring (disconnect)
+    g.configure_sb(1, 0, 0 * W + 10, 0)   # break the ring (disconnect)
     assert g.has_comb_loop() is False
 
 
@@ -120,14 +134,16 @@ def test_injection_keeps_default_fabric_acyclic():
 
 
 def test_injection_breaks_ring_via_source():
-    """Routing a ring segment through the injection path (a source) breaks the
-    combinational cycle: clb_out has no incoming edge, so the chain dead-ends."""
+    """Routing the Wilton ring through the injection path (a source) breaks the
+    combinational cycle: clb_out has no incoming edge, and out_e[0]@(0,0) is
+    inject-driven so its Wilton sel (which would read in_s[10]) is suppressed —
+    the chain dead-ends at in_s[10]@(0,0)."""
     g = FabricGrid(2, 2, W)
     g.set_clb_out(0, 0, 1)               # tile (0,0) clb_out[0] = 1
     g.configure_sb(0, 0, 4 * W + 0, 5)   # (0,0) inject east: out_e[0] <- clb_out[0]
-    g.configure_sb(0, 1, 1 * W + 0, 3)   # (0,1) out_s <- in_w
-    g.configure_sb(1, 1, 3 * W + 0, 1)   # (1,1) out_w <- in_n
-    g.configure_sb(1, 0, 0 * W + 0, 2)   # (1,0) out_n <- in_e
+    g.configure_sb(0, 1, 1 * W + 1, 3)   # (0,1) out_s[1] <- in_w
+    g.configure_sb(1, 1, 3 * W + 11, 1)  # (1,1) out_w[11] <- in_n
+    g.configure_sb(1, 0, 0 * W + 10, 2)  # (1,0) out_n[10] <- in_e
     assert g.has_comb_loop() is False
 
 
@@ -243,13 +259,17 @@ def test_routability_no_path_to_isolated_node():
 @pytest.mark.parametrize(
     "inject_dir, R, C, drv_idx, sink_idx, sink_sb_addr, sink_sb_sel, sink_cb_sel",
     [
-        # east  : drv west of sink;  channel out_e -> in_w;  sink out_n<-in_w sel3
+        # east  : drv west of sink;  chan out_e -> in_w; sink out_n[0]<-in_w[0]
+        #         (out_n sel3=W, _wilton(n,w,0)=0)
         ("e", 1, 2, 0, 1, 0 * W + 0, 3, 0),
-        # west  : drv east of sink;  channel out_w -> in_e;  sink out_n<-in_e sel2
-        ("w", 1, 2, 1, 0, 0 * W + 0, 2, 0),
-        # south : drv north of sink; channel out_s -> in_n;  sink out_e<-in_n sel1
-        ("s", 2, 1, 0, 1, 2 * W + 0, 1, 2 * W),
-        # north : drv south of sink; channel out_n -> in_s;  sink out_n<-in_s sel1
+        # west  : drv east of sink;  chan out_w -> in_e; sink out_w[0]<-in_e[0]
+        #         (out_w sel3=E, _wilton(w,e,0)=0)
+        ("w", 1, 2, 1, 0, 3 * W + 0, 3, 3 * W),
+        # south : drv north of sink; chan out_s -> in_n; sink out_s[0]<-in_n[0]
+        #         (out_s sel1=N, _wilton(s,n,0)=0)
+        ("s", 2, 1, 0, 1, 1 * W + 0, 1, 1 * W),
+        # north : drv south of sink; chan out_n -> in_s; sink out_n[0]<-in_s[0]
+        #         (out_n sel1=S, _wilton(n,s,0)=0)
         ("n", 2, 1, 1, 0, 0 * W + 0, 1, 0),
     ],
 )

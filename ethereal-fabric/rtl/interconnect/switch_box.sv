@@ -29,6 +29,10 @@
 //                            onto a CONFIGURABLE out_D[j] (D=inj_dir[j]), not
 //                            east-only. Fixes east-edge driver stranding found
 //                            by the c432 routing (E0-MAP3 incr 4a). cfg_data->3 bit.
+//              2026-07-26 - WILTON SB (Option A / v1.1): track-permuting Fs=3
+//                            source map (was disjoint same-index). Breaks the
+//                            disjoint track-locking that stranded c432 (E0-MAP3
+//                            incr 4a Cause 2). Config points UNCHANGED (2-bit sel).
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3
 // Notes:       ASSUMPTION (TBD 2026-07-24): v1 topology is DISJOINT
@@ -105,66 +109,73 @@ module switch_box #(
     end
 
     // ---- disjoint unidirectional routing muxes (combinational) ----
-    // For output direction d, sel 1/2/3 select the same-index (t) input track
-    // of the 3 OTHER directions in ascending dir-index order; sel 0 disconnects
-    // (drives 1'b0). Structural comb loops arise only when SBs are chained in
-    // fabric_top (legal virtual routing, C01 §2.4 problem 2 / §3.3) — scoped
+    // WILTON (track-permuting Fs=3, v1.1): sel 1/2/3 select the 3 OTHER dirs'
+    // input tracks at PERMUTED indices (not same-index like disjoint), so a
+    // signal can CHANGE track index at each SB hop — breaks the disjoint
+    // track-locking that stranded c432 (E0-MAP3 incr 4a finding). Permutation
+    // (W=tracks; mapped from S. Wilton PhD thesis / VPR's WILTON formula):
+    //   out_n[t]: S[t], E[(t+1)%W], W[(W-t)%W]
+    //   out_s[t]: N[t], E[(2W-2-t)%W], W[(t+W-1)%W]
+    //   out_e[t]: N[(t+W-1)%W], S[(2W-2-t)%W], W[t]
+    //   out_w[t]: N[(W-t)%W], S[(t+W-1)%W], E[t]
+    // sel0 -> disconnect (1'b0). Structural comb loops arise only when SBs are
+    // chained in fabric_top (legal virtual routing, C01 §2.4 / §3.3) — scoped
     // UNOPTFLAT waiver wraps the mux-output region, mirroring clb_t.sv.
     /* verilator lint_off UNOPTFLAT */
     genvar gt;
     generate
         // Bidirectional inject: for each dir D and track t<N_INJ, if inj_en_r[t]
-        // and inj_dir_r[t]==D, out_D[t] = clb_out_i[t] (overrides disjoint sel).
+        // and inj_dir_r[t]==D, out_D[t] = clb_out_i[t] (overrides the Wilton sel).
         // inj_dir encoding: 0=N(out_n), 1=S(out_s), 2=E(out_e), 3=W(out_w).
-        // out_n[t] (DIR_N): disjoint sources S,E,W; inject when inj_dir==N(0)
+        // out_n[t] (DIR_N): Wilton sources S[t], E[(t+1)%W], W[(W-t)%W]
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_n
             if (gt < N_INJ) begin : gen_n_inj
                 assign out_n[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd0)) ? clb_out_i[gt] :
                                    (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd1) ? in_s[gt] :
-                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[((gt+1) % W)] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[((W-gt) % W)] : 1'b0;
             end else begin : gen_n_disj
                 assign out_n[gt] = (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd1) ? in_s[gt] :
-                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd2) ? in_e[((gt+1) % W)] :
+                                   (sel_r[(DIR_N*W + gt)*DW +: DW] == 2'd3) ? in_w[((W-gt) % W)] : 1'b0;
             end
         end
-        // out_s[t] (DIR_S): disjoint sources N,E,W; inject when inj_dir==S(1)
+        // out_s[t] (DIR_S): Wilton sources N[t], E[(2W-2-t)%W], W[(t+W-1)%W]
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_s
             if (gt < N_INJ) begin : gen_s_inj
                 assign out_s[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd1)) ? clb_out_i[gt] :
                                    (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[((2*W-2-gt) % W)] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[((gt+W-1) % W)] : 1'b0;
             end else begin : gen_s_disj
                 assign out_s[gt] = (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[gt] :
-                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd2) ? in_e[((2*W-2-gt) % W)] :
+                                   (sel_r[(DIR_S*W + gt)*DW +: DW] == 2'd3) ? in_w[((gt+W-1) % W)] : 1'b0;
             end
         end
-        // out_e[t] (DIR_E): disjoint sources N,S,W; inject when inj_dir==E(2)
+        // out_e[t] (DIR_E): Wilton sources N[(t+W-1)%W], S[(2W-2-t)%W], W[t]
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_e
             if (gt < N_INJ) begin : gen_e_inj
                 assign out_e[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd2)) ? clb_out_i[gt] :
-                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[((gt+W-1) % W)] :
+                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[((2*W-2-gt) % W)] :
                                    (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
             end else begin : gen_e_disj
-                assign out_e[gt] = (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                assign out_e[gt] = (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd1) ? in_n[((gt+W-1) % W)] :
+                                   (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd2) ? in_s[((2*W-2-gt) % W)] :
                                    (sel_r[(DIR_E*W + gt)*DW +: DW] == 2'd3) ? in_w[gt] : 1'b0;
             end
         end
-        // out_w[t] (DIR_W): disjoint sources N,S,E; inject when inj_dir==W(3)
+        // out_w[t] (DIR_W): Wilton sources N[(W-t)%W], S[(t+W-1)%W], E[t]
         for (gt = 0; gt < W; gt = gt + 1) begin : gen_w
             if (gt < N_INJ) begin : gen_w_inj
                 assign out_w[gt] = (inj_en_r[gt] && (inj_dir_r[gt*2 +: 2] == 2'd3)) ? clb_out_i[gt] :
-                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[((W-gt) % W)] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[((gt+W-1) % W)] :
                                    (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd3) ? in_e[gt] : 1'b0;
             end else begin : gen_w_disj
-                assign out_w[gt] = (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[gt] :
-                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[gt] :
+                assign out_w[gt] = (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd1) ? in_n[((W-gt) % W)] :
+                                   (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd2) ? in_s[((gt+W-1) % W)] :
                                    (sel_r[(DIR_W*W + gt)*DW +: DW] == 2'd3) ? in_e[gt] : 1'b0;
             end
         end

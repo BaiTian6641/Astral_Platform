@@ -15,7 +15,7 @@ OCC (`E0-FAB4`), VPR arch (`E0-MAP2`), and the RTL.
 | `R`, `C` | 4, 4 | default fabric grid (parameterized) |
 | channel dirs | N, S, E, W | unidirectional (v1; C01 §3.3 problem 2) |
 
-## 2. switch_box (SB) — disjoint unidirectional (PRELIMINARY, VPR-pending)
+## 2. switch_box (SB) — WILTON track-permuting Fs=3 (v1.1, 2026-07-26)
 
 Interface: `in_n/in_s/in_e/in_w`, `out_n/out_s/out_e/out_w` (each `[W-1:0]`);
 config `cfg_we_i`, `cfg_data_i`. **mux selects**: `cfg_addr_i[$clog2(4*W)-1:0]`
@@ -23,26 +23,34 @@ config `cfg_we_i`, `cfg_data_i`. **mux selects**: `cfg_addr_i[$clog2(4*W)-1:0]`
 inject** (Option B, 2026-07-26): `cfg_addr_i = 4*W + j` (j=0..N_INJ-1, N_INJ=N=8),
 `cfg_data_i[0]` = `inj_en[j]`, `cfg_data_i[2:1]` = `inj_dir[j]` (0=N,1=S,2=E,3=W);
 when `inj_en[j]`, `out_D[j] = clb_out[j]` where `D = inj_dir[j]` (ONE configurable
-direction per j) **overriding** the disjoint sel for that (D, j) pair — the SB
+direction per j) **overriding** the SB sel for that (D, j) pair — the SB
 stays the single driver of every track (no multi-drive).
 
-Topology (v1 reference): each output track `t` in direction `D` mux-selects among
-the **same-index** input tracks of the **3 other directions** + disconnect:
+Topology (v1.1, **Wilton**): each output track `t` in direction `D` mux-selects
+one of the 3 OTHER directions' input tracks at a **PERMUTED** index (S. Wilton
+PhD thesis / VPR `WILTON` formula; Fs=3). A signal therefore **changes track
+index at each SB hop**, which breaks the **track-locking** of the prior disjoint
+SB (where every net was stuck on track `t = driver_j` for its whole route and
+≥2 same-`j` crossing nets were structurally unresolvable — E0-MAP3 incr 4a
+Cause 2). The cfg interface (`DIR*W+t`, 2-bit sel) and `frame_map` SB config
+points (48×2-bit sel) are **UNCHANGED** — only the per-mux source-track map
+moved; `bitgen_pack` / `frame_map` are unaffected.
+
+Per-output source map (sel 1/2/3 → the 3 other dirs in ascending index order;
+the **input track index** is the Wilton permutation of `t`):
 
 | output | sel1 | sel2 | sel3 | (sel0 = disconnect/0) |
 |---|---|---|---|---|
-| `out_n[t]` | `in_s[t]` | `in_e[t]` | `in_w[t]` | |
-| `out_s[t]` | `in_n[t]` | `in_e[t]` | `in_w[t]` | |
-| `out_e[t]` | `in_n[t]` | `in_s[t]` | `in_w[t]` | |
-| `out_w[t]` | `in_n[t]` | `in_s[t]` | `in_e[t]` | |
+| `out_n[t]` | `in_s[t]` | `in_e[(t+1)%W]` | `in_w[(W-t)%W]` | |
+| `out_s[t]` | `in_n[t]` | `in_e[(2W-2-t)%W]` | `in_w[(t+W-1)%W]` | |
+| `out_e[t]` | `in_n[(t+W-1)%W]` | `in_s[(2W-2-t)%W]` | `in_w[t]` | |
+| `out_w[t]` | `in_n[(W-t)%W]` | `in_s[(t+W-1)%W]` | `in_e[t]` | |
 
-> **ASSUMPTION (TBD 2026-07-24, G6 / C01 §3.3 problem 1 + §6 #4):** this disjoint
-> topology is the v1 reference. The **final SB topology table must be
-> VPR-routability-validated (S03 / E0-MAP2) before freezing.** The cfg interface
-> (`DIR*W+t`, 2-bit sel) and the model's `dependency_edges()` are
-> topology-agnostic, so swapping to Wilton/custom later only changes the per-mux
-> source map — low rework. v2 target: Landy/Stitt two-source-track ratio up
-> (interconnect area −20%).
+The single source of truth for this permutation is
+`ethereal-fabric/tests/interconnect/sb_model.py::_wilton_track(out_dir, src_dir,
+t, W)`; the RTL (`switch_box.sv`) and the Option-B router
+(`bitgen_route.py`) both consume it. v2 target: Landy/Stitt two-source-track
+ratio up (interconnect area −20%).
 
 ## 3. Channels (unidirectional, single-tile length)
 
@@ -84,7 +92,14 @@ create loops are the mapper's responsibility (S10).
 
 ## 6. Open items (TBD)
 
-- SB topology finalization (VPR, E0-MAP2 — DONE: VPR `subset` switch block; c432 routes @ W=12).
+- SB topology finalization (VPR, E0-MAP2 — DONE). v1 was disjoint `subset`;
+  **v1.1 (2026-07-26) = WILTON track-permuting Fs=3**, chosen because the
+  disjoint SB's track-locking made c432 unroutable (E0-MAP3 incr 4a Cause 2 —
+  ≥2 nets sharing driver index `j` were structurally unresolvable). Wilton
+  breaks the locking (a net changes track at each hop); see §2. The VPR arch
+  token is now `wilton` for parity (the Option-B bitgen router on the hand-built
+  fabric is authoritative).
+- ~~Cause 2 (disjoint track-locking)~~ RESOLVED by the Wilton SB (v1.1).
 - ~~Full CB design (`clb_out → track` injection)~~ DONE — routable CB Step 1+2 (clb_out injection via SB inject_en + input connection_block; single-driver via SB mux override).
 - rr_graph → SB/CB/inject_en mux-config mapping (bitgen routing half, E0-MAP3 incr 4).
 - Long wires (length>1 tracks) for larger fabrics (v3, C01 §3.4).

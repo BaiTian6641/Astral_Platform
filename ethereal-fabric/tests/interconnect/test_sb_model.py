@@ -14,10 +14,15 @@ from __future__ import annotations
 
 import pytest
 
-from sb_model import DIRS, DIR_IDX, SwitchBox, _SOURCES, sources
+from sb_model import DIRS, DIR_IDX, SwitchBox, _SOURCES, _wilton_track, sources
 
 W = 12
 MASK = (1 << W) - 1
+
+
+def _wt(d, src, t):
+    """Shortcut to the Wilton source track for out_d[t] <- in_src."""
+    return _wilton_track(d, src, t, W)
 
 
 # ---- 1. parameter derivation -------------------------------------------------
@@ -118,15 +123,18 @@ def test_each_output_has_three_sources_plus_disconnect():
 @pytest.mark.parametrize("t", range(W))
 @pytest.mark.parametrize("sel", (1, 2, 3))
 def test_source_correctness_positive(d, t, sel):
-    # drive ONLY the expected source dir's track t -> must appear at out[d][t]
+    # drive ONLY the expected source dir's WILTON-PERMUTED track -> must appear
+    # at out[d][t] (under Wilton the source track is _wilton_track(d,src,t,W),
+    # NOT the same-index t as in the disjoint SB).
     sb = SwitchBox(W=12).route(d, t, sel)
     src = _SOURCES[d][sel - 1]
+    st = _wt(d, src, t)
     ins = {dd: 0 for dd in DIRS}
-    ins[src] = 1 << t
+    ins[src] = 1 << st
     outs = dict(zip(DIRS, sb.outputs(ins["n"], ins["s"], ins["e"], ins["w"])))
     # out[d] bit t == 1
     assert ((outs[d] >> t) & 1) == 1
-    # out[d] has no other bit set (same-index only)
+    # out[d] has no other bit set (only out[d][t] reads this source track)
     assert (outs[d] & ~(1 << t)) == 0
     # every other out direction is fully isolated (== 0)
     for dd in DIRS:
@@ -153,13 +161,15 @@ def test_source_correctness_negative(d, t, sel):
 @pytest.mark.parametrize("t", range(W))
 @pytest.mark.parametrize("sel", (1, 2, 3))
 def test_source_is_exactly_one_of_three(d, t, sel):
-    # among the 3 candidate sources, only the selected one's bit propagates
+    # among the 3 candidate sources, only the selected one's PERMUTED track
+    # propagates to out[d][t] (Wilton: each candidate feeds out[d][t] from a
+    # DIFFERENT source track index).
     sb = SwitchBox(W=12).route(d, t, sel)
     srcs = _SOURCES[d]
     expected = srcs[sel - 1]
     ins = {dd: 0 for dd in DIRS}
-    for i, s in enumerate(srcs):
-        ins[s] = 1 << t            # all 3 candidates carry bit t
+    for s in srcs:
+        ins[s] = 1 << _wt(d, s, t)        # each candidate on its Wilton track
     outs = dict(zip(DIRS, sb.outputs(ins["n"], ins["s"], ins["e"], ins["w"])))
     assert ((outs[d] >> t) & 1) == 1
     # flip ONLY the expected source to 0 -> output must drop to 0
@@ -192,9 +202,9 @@ def test_disconnect_full_word_zero(d, t):
 
 def test_independence_adjacent_tracks():
     sb = SwitchBox(W=12)
-    sb.route("n", 0, 1)             # out_n[0] <- in_s[0]
-    sb.route("n", 1, 2)             # out_n[1] <- in_e[1]
-    on, *_ = sb.outputs(0, 1, 2, 0)  # in_s=1 (bit0), in_e=2 (bit1)
+    sb.route("n", 0, 1)             # out_n[0] <- in_s[0]  (S[t]=t)
+    sb.route("n", 1, 2)             # out_n[1] <- in_e[2]  (Wilton: E[(t+1)%W]=2)
+    on, *_ = sb.outputs(0, 1 << 0, 1 << 2, 0)   # in_s bit0, in_e bit2
     assert on == 0b11
 
 
@@ -216,9 +226,9 @@ def test_independence_different_dirs():
 
 def test_last_write_wins():
     sb = SwitchBox(W=12)
-    sb.route("n", 0, 1)
-    sb.route("n", 0, 2)             # overwrite -> now in_e[0]
-    on, *_ = sb.outputs(0, 0, 1, 0)
+    sb.route("n", 0, 1)             # out_n[0] <- in_s[0]
+    sb.route("n", 0, 2)             # overwrite -> out_n[0] <- in_e[1] (Wilton)
+    on, *_ = sb.outputs(0, 0, 1 << 1, 0)   # in_e bit1 = E[(0+1)%W]
     assert on == 1
 
 
@@ -245,7 +255,7 @@ def test_edges_all_active():
     assert len(edges) == 4 * W
     for d in DIRS:
         src = _SOURCES[d][0]
-        assert (("in", src, 0), ("out", d, 0)) in edges
+        assert (("in", src, _wt(d, src, 0)), ("out", d, 0)) in edges
 
 
 def test_edges_all_disconnect_empty():
@@ -270,15 +280,15 @@ def test_edges_one_per_active_mux(d, sel):
     assert len(edges) == W
     src = _SOURCES[d][sel - 1]
     for t in range(W):
-        assert (("in", src, t), ("out", d, t)) in edges
+        assert (("in", src, _wt(d, src, t)), ("out", d, t)) in edges
 
 
 def test_edges_node_shape():
     # node naming convention documented for the fabric cycle detector
-    sb = SwitchBox(W=12).route("n", 4, 2)   # out_n[4] <- in_e[4]
+    sb = SwitchBox(W=12).route("n", 4, 2)   # out_n[4] <- in_e[5] (Wilton: (4+1)%12)
     (edge,) = sb.dependency_edges()
     src_node, dst_node = edge
-    assert src_node == ("in", "e", 4)
+    assert src_node == ("in", "e", 5)
     assert dst_node == ("out", "n", 4)
     assert src_node[0] == "in" and dst_node[0] == "out"
 
@@ -295,23 +305,24 @@ def test_inject_en_routes_clb_out_to_out_e():
 
 def test_inject_cleared_falls_back_to_disjoint():
     sb = SwitchBox(W=12)
-    sb.route("e", 3, 1)                    # disjoint: out_e[3] <- in_n[3]
+    sb.route("e", 3, 1)                    # Wilton: out_e[3] <- in_n[2] ((3+11)%12)
     sb.inject(3, False)                    # inject disabled
-    # clb_out[3]=1 but inject off -> out_e[3] follows disjoint sel (in_n[3])
-    oe = sb.outputs(1 << 3, 0, 0, 0, clb_out=1 << 3)[2]
+    # clb_out[3]=1 but inject off -> out_e[3] follows the Wilton sel (in_n[2])
+    oe = sb.outputs(1 << 2, 0, 0, 0, clb_out=1 << 3)[2]
     assert ((oe >> 3) & 1) == 1
-    # in_n[3]=0, clb_out[3]=1, inject off -> out_e[3] = 0 (clb_out ignored)
+    # in_n[2]=0, clb_out[3]=1, inject off -> out_e[3] = 0 (clb_out ignored)
     oe2 = sb.outputs(0, 0, 0, 0, clb_out=1 << 3)[2]
     assert ((oe2 >> 3) & 1) == 0
 
 
 def test_inject_overrides_disjoint_sel():
-    # even when disjoint sel points elsewhere, inject_en wins
+    # even when the Wilton sel points elsewhere, inject_en wins
     sb = SwitchBox(W=12)
-    sb.route("e", 3, 1)                    # disjoint: out_e[3] <- in_n[3]
+    sb.route("e", 3, 1)                    # Wilton: out_e[3] <- in_n[2]
     sb.inject(3, True)                     # inject overrides
-    # in_n[3]=1, clb_out[3]=0 -> out_e[3] must be 0 (inject wins)
-    oe = sb.outputs(1 << 3, 0, 0, 0, clb_out=0)[2]
+    # in_n[2]=1 (drives out_e[3] under Wilton), clb_out[3]=0 -> out_e[3] must
+    # be 0 (inject wins)
+    oe = sb.outputs(1 << 2, 0, 0, 0, clb_out=0)[2]
     assert ((oe >> 3) & 1) == 0
 
 
@@ -361,14 +372,15 @@ def test_inject_bidirectional_edges(d):
 
 @pytest.mark.parametrize("d", DIRS)
 def test_inject_bidirectional_suppresses_disjoint(d):
-    # inject overrides the disjoint sel ONLY for the injected direction.
+    # inject overrides the Wilton sel ONLY for the injected direction.
     sb = SwitchBox(W=12)
-    sb.route(d, 4, 1)                     # disjoint sel for out_d[4] (sel 1)
+    sb.route(d, 4, 1)                     # Wilton sel for out_d[4] (sel 1)
     sb.inject(4, True, d)                 # override out_d[4]
     edges = sb.dependency_edges()
     src = _SOURCES[d][0]                  # sel 1 source dir
-    assert (("in", src, 4), ("out", d, 4)) not in edges  # disjoint suppressed
-    assert (("clb_out", 4), ("out", d, 4)) in edges       # inject edge appears
+    st = _wt(d, src, 4)                   # Wilton source track for out_d[4]
+    assert (("in", src, st), ("out", d, 4)) not in edges   # Wilton sel suppressed
+    assert (("clb_out", 4), ("out", d, 4)) in edges        # inject edge appears
 
 
 def test_inject_edges_in_dependency_graph():
@@ -381,19 +393,59 @@ def test_inject_edges_in_dependency_graph():
 
 
 def test_inject_suppresses_disjoint_out_e_edge():
-    # inject_en[j]=1 overrides out_e[j] -> its disjoint in->out_e edge must
+    # inject_en[j]=1 overrides out_e[j] -> its Wilton in->out_e edge must
     # NOT appear (faithful to the RTL mux); the injection edge appears instead.
     sb = SwitchBox(W=12)
-    sb.route("e", 4, 1)                    # disjoint: in_n[4] -> out_e[4]
-    sb.route("n", 4, 1)                    # disjoint: in_s[4] -> out_n[4]
+    sb.route("e", 4, 1)                    # Wilton: in_n[3] -> out_e[4] ((4+11)%12)
+    sb.route("n", 4, 1)                    # Wilton: in_s[4] -> out_n[4] (S[t]=t)
     sb.inject(4, True)                     # override out_e[4]
     edges = sb.dependency_edges()
-    assert (("in", "n", 4), ("out", "e", 4)) not in edges
+    assert (("in", "n", 3), ("out", "e", 4)) not in edges
     assert (("clb_out", 4), ("out", "e", 4)) in edges
-    # disjoint edge for the non-injected direction is unaffected
+    # Wilton edge for the non-injected direction is unaffected
     assert (("in", "s", 4), ("out", "n", 4)) in edges
 
 
 def test_inject_edges_empty_by_default():
     # default config (no inject_en) -> no clb_out edges (acyclic baseline)
     assert SwitchBox(W=12).dependency_edges() == set()
+
+
+# ---- 9. WILTON permutation table (single source of truth: _wilton_track) ----
+#
+# Locks the Fs=3 source-track permutation (S. Wilton thesis / VPR WILTON).
+# All 12 (out, src) pairs x a few tracks must match the frozen table. A signal
+# CHANGES track index at each SB hop — the fix for the disjoint track-locking
+# that stranded c432 (E0-MAP3 incr 4a Cause 2).
+
+# Expected table for W=12: out_{OUT}[t] <- in_{SRC}[EXPECTED[(OUT,SRC)]]
+# where the value is a function of t. We encode it as (coeff_a*t + const) % W.
+@pytest.mark.parametrize("out_d, src, kind", [
+    # out_n[t]: S[t], E[(t+1)%W], W[(W-t)%W]
+    ("n", "s", "id"), ("n", "e", "tp1"), ("n", "w", "Wmt"),
+    # out_s[t]: N[t], E[(2W-2-t)%W], W[(t+W-1)%W]
+    ("s", "n", "id"), ("s", "e", "2Wm2mt"), ("s", "w", "tpWm1"),
+    # out_e[t]: N[(t+W-1)%W], S[(2W-2-t)%W], W[t]
+    ("e", "n", "tpWm1"), ("e", "s", "2Wm2mt"), ("e", "w", "id"),
+    # out_w[t]: N[(W-t)%W], S[(t+W-1)%W], E[t]
+    ("w", "n", "Wmt"), ("w", "s", "tpWm1"), ("w", "e", "id"),
+])
+@pytest.mark.parametrize("t", [0, 1, 5, 7, 11])
+def test_wilton_permutation_table(out_d, src, kind, t):
+    expected = {
+        "id":       t,
+        "tp1":      (t + 1) % W,
+        "Wmt":      (W - t) % W,
+        "2Wm2mt":   (2 * W - 2 - t) % W,
+        "tpWm1":    (t + W - 1) % W,
+    }[kind]
+    assert _wilton_track(out_d, src, t, W) == expected
+
+
+def test_wilton_breaks_track_locking():
+    # The disjoint SB fed out_n[t] from in_e[t] (same index). Under Wilton,
+    # out_n[t] reads in_e[(t+1)%W] != t for t < W-1 -> a signal on track t
+    # exits on track (t+1)%W: track-locking is BROKEN.
+    for t in range(W - 1):
+        assert _wilton_track("n", "e", t, W) == (t + 1) % W
+        assert _wilton_track("n", "e", t, W) != t

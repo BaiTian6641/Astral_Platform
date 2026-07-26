@@ -30,21 +30,25 @@ Node tuples (identical to ``fabric_model.graph_edges`` localization):
 Possibility-graph edges (every available mux option is an open edge — the
 PathFinder picks ONE per contended wire):
   * fixed channel:   ``(r,c,"out",D,t) -> (nb,"in",D',t)``            (CHAN_MAP)
-  * SB mux:          ``(r,c,"in",src,t) -> (r,c,"out",dst,t)``  src≠dst (3 options)
+  * SB mux (Wilton): ``(r,c,"in",src,wt) -> (r,c,"out",dst,t)``  src≠dst,
+                      ``wt = _wilton_track(dst, src, t, W)`` (Fs=3, 3 options
+                      per (dst,t); track-permuting — a signal CHANGES track
+                      index at each SB hop).
   * inject (CB out): ``(r,c,"clb_out",j) -> (r,c,"out",D,j)``  D∈{n,s,e,w}, j<N_INJ
   * CB (CB in):      ``(r,c,"out",D,t) -> (r,c,"clb_in",i)``    all D,t,i
 
-CRITICAL structural fact (from the disjoint SB + bidirectional inject model):
-a net driven by ``clb_out[j]`` is **locked to track ``t = j``** for its entire
-route. Bidirectional inject lets the signal exit in ANY of the 4 directions
-(out_D[j], D chosen by the router per net); the disjoint SB preserves the
-track index (``out_D[t]`` ← ``in_?[t]``, same ``t``); there is no track-changing
-mux. The signal may travel east/north/south/west but always on track j. The CB
-at the sink reads ``out_?[j]`` into ``clb_in[i]``. Consequence: two inter nets
-sharing the same driver index ``j`` whose paths must cross on a track-j wire
-are *structurally* unresolvable on this v1 fabric — PathFinder will not
-converge and the net is reported UNROUTABLE (an honest Phase-0 finding, not a
-bug; a track-flexible fabric or placement-aware packing would be the fix).
+CRITICAL structural fact (Wilton SB + bidirectional inject model):
+a net driven by ``clb_out[j]`` EXITS onto ``out_D[j]`` (track ``j``, ONE exit
+direction D chosen by the router per net) but is then FREE to change track
+index at every SB hop via the Wilton permutation
+(``out_{dst}[t]`` ← ``in_{src}[_wilton_track(dst,src,t,W)]``). Unlike the
+disjoint SB (which locked every net to track ``j`` for its whole route and made
+≥2 same-``j`` crossing nets *structurally* unresolvable — incr 4a Cause 2), the
+Wilton SB breaks that track-locking: a single driver index ``j`` can fan onto
+different tracks at each hop, so a contended track-``j`` wire can be detoured
+onto another track. Routing convergence is then a matter of PathFinder
+negotiation, NOT a structural cap. (The disjoint-SB finding is documented in
+``test_bitgen_route.py`` for history; Wilton supersedes it.)
 
 ==============================================================================
 PATHFINDER (negotiated congestion — McMurchie/Luebben classic)
@@ -92,7 +96,7 @@ from bitgen_db import EXT_IN, N, FabricConfigDB  # noqa: E402
 from bitgen_pack import db_grid_bounds  # noqa: E402
 from cb_model import ConnectionBlock  # noqa: E402
 from fabric_model import CHAN_MAP, FabricGrid  # noqa: E402
-from sb_model import DIRS, sources  # noqa: E402
+from sb_model import DIRS, _wilton_track, sources  # noqa: E402
 
 # ---- frozen fabric topology constants (mirror FabricGrid defaults / frame_map)
 FABRIC_W = 12
@@ -249,13 +253,21 @@ def _build_possibility_graph(
                 if 0 <= nr < R and 0 <= nc < C:
                     for t in range(W):
                         add((r, c, "out", od, t), (nr, nc, "in", ind, t), ("chan",))
-            # 2. SB mux possibility edges: in_src[t] -> out_dst[t] (src != dst)
+            # 2. SB mux possibility edges (WILTON Fs=3): the input track on
+            #    ``sd`` that feeds ``out_{dd}[t]`` is PERMUTED by the Wilton
+            #    formula (sb_model._wilton_track) — a signal CHANGES track index
+            #    at each SB hop, so two nets are no longer structurally locked
+            #    to the same track-``j`` wire (fixes incr-4a Cause 2). Config
+            #    points UNCHANGED: meta still maps to sb_sel[(dd,t)] = sel(sd)
+            #    (sel is dir-only, track-independent), so bitgen_pack / frame_map
+            #    are unaffected.
             for dd in DIRS:
                 for sd in DIRS:
                     if sd == dd:
                         continue
                     for t in range(W):
-                        add((r, c, "in", sd, t), (r, c, "out", dd, t),
+                        st = _wilton_track(dd, sd, t, W)
+                        add((r, c, "in", sd, st), (r, c, "out", dd, t),
                             ("sb", dd, t, sd))
             # 3. inject possibility edges: clb_out[j] -> out_D[j] for ALL 4 dirs
             #    (bidirectional inject, Option B): the router picks the ONE exit
@@ -381,7 +393,7 @@ def _route_net(
 
 def route(
     db: FabricConfigDB,
-    max_iters: int = 30,
+    max_iters: int = 100,
     W: int = FABRIC_W,
     N_INJ: int = FABRIC_N_INJ,
     EXT_IN: int = FABRIC_EXT_IN,

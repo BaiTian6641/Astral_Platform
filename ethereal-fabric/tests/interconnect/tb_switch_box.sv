@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: MIT
 // Module:      tb_switch_box
 // Description: Self-checking SystemVerilog testbench for switch_box (W=12).
-// Details:     Exercises the frozen C01 §3.3 disjoint unidirectional topology:
+// Details:     Exercises the C01 §3.3 WILTON track-permuting topology (v1.1):
 //                cfg_addr = DIR*W + t   (DIR: 0=N,1=S,2=E,3=W ; t: 0..W-1)
 //                cfg_data[1:0] = sel:  0=disconnect(drive 0),
-//                                      1/2/3 = same-index input track of the 3
-//                                              OTHER directions (ascending order)
+//                                      1/2/3 = one of the 3 OTHER directions'
+//                                              input tracks at a PERMUTED index
+//                                              (Wilton Fs=3, see src_track()).
 //              For output dir d, the source dir of a given sel (1..3) is:
 //                src = (sel-1 < d) ? (sel-1) : sel
+//              and the source TRACK is src_track(d, src, t) (Wilton permutation).
 //              Covers: for every direction, every sel 0..3, every track 0..11;
 //              plus bidirectional inject (inject_en[j]+inject_dir[j],
 //              clb_out[j] -> out_D[j] where D = inj_dir[j]).
@@ -18,6 +20,8 @@
 // Created:     2026-07-24
 // Modified:    2026-07-26 - bidirectional inject (Option B): cfg_data 3-bit;
 //                            test inject in E/W/N directions + clear/override.
+//              2026-07-26 - WILTON SB (Option A / v1.1): source track is now
+//                            the Wilton-permuted index (was disjoint same-index).
 // Tags:        TESTBENCH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3
 // Notes:       Self-checking: maintains `errors`, prints TEST PASSED / TEST FAILED.
@@ -79,9 +83,44 @@ module tb_switch_box;
         end
     endtask
 
-    int outd, sel, t, sd;
+    int outd, sel, t, sd, st;
     logic got;
     logic exp;
+
+    // ---- Wilton Fs=3 source-track permutation (mirrors sb_model._wilton_track) ----
+    // out_{outd}[t] reads in_{sd}[src_track(outd, sd, t)]. outd/sd: 0=N,1=S,2=E,3=W.
+    //   out_n[t]: S[t], E[(t+1)%W], W[(W-t)%W]
+    //   out_s[t]: N[t], E[(2W-2-t)%W], W[(t+W-1)%W]
+    //   out_e[t]: N[(t+W-1)%W], S[(2W-2-t)%W], W[t]
+    //   out_w[t]: N[(W-t)%W], S[(t+W-1)%W], E[t]
+    function automatic int src_track(input int outd, input int sd, input int t);
+        case (outd)
+            0: case (sd)  // out_n
+                   1: src_track = t;                    // S[t]
+                   2: src_track = (t + 1) % W;          // E[(t+1)%W]
+                   3: src_track = (W - t) % W;          // W[(W-t)%W]
+                   default: src_track = 0;
+               endcase
+            1: case (sd)  // out_s
+                   0: src_track = t;                    // N[t]
+                   2: src_track = (2*W - 2 - t) % W;    // E[(2W-2-t)%W]
+                   3: src_track = (t + W - 1) % W;      // W[(t+W-1)%W]
+                   default: src_track = 0;
+               endcase
+            2: case (sd)  // out_e
+                   0: src_track = (t + W - 1) % W;      // N[(t+W-1)%W]
+                   1: src_track = (2*W - 2 - t) % W;    // S[(2W-2-t)%W]
+                   3: src_track = t;                    // W[t]
+                   default: src_track = 0;
+               endcase
+            default: case (sd)  // out_w
+                   0: src_track = (W - t) % W;          // N[(W-t)%W]
+                   1: src_track = (t + W - 1) % W;      // S[(t+W-1)%W]
+                   2: src_track = t;                    // E[t]
+                   default: src_track = 0;
+               endcase
+        endcase
+    endfunction
 
     initial begin
         // ---- initialize ALL config (sel + inject_en) to 0 ----
@@ -99,15 +138,17 @@ module tb_switch_box;
                     // configure this (out dir, track) select
                     cfg_write(outd*W + t, sel);
 
-                    // drive inputs: zero all, then set the selected source track
+                    // drive inputs: zero all, then set the selected source
+                    // track at the WILTON-PERMUTED index (sb_model._wilton_track)
                     in_n = '0; in_s = '0; in_e = '0; in_w = '0;
                     if (sel != 0) begin
                         sd = ((sel - 1) < outd) ? (sel - 1) : sel;
+                        st = src_track(outd, sd, t);   // Wilton permuted src track
                         case (sd)
-                            0: in_n[t] = 1'b1;
-                            1: in_s[t] = 1'b1;
-                            2: in_e[t] = 1'b1;
-                            3: in_w[t] = 1'b1;
+                            0: in_n[st] = 1'b1;
+                            1: in_s[st] = 1'b1;
+                            2: in_e[st] = 1'b1;
+                            3: in_w[st] = 1'b1;
                         endcase
                     end
                     #1;   // let comb settle
@@ -192,22 +233,25 @@ module tb_switch_box;
             $display("FAIL: W/N-inject survived clear of en[5] out_w[3]=%b out_n[1]=%b", out_w[3], out_n[1]);
         end
 
-        // (5) disjoint sel out_e[5]<-in_n[5] (sel 1), E-inject off, in_n[5]=1 -> 1
-        cfg_write(2*W + 5, 1);            // out_e sel 1 = in_n
-        in_n = 1 << 5;
+        // (5) Wilton sel out_e[5]<-in_n[4] (sel 1 = N; _wilton_track(e,n,5,12)
+        //     = (5+11)%12 = 4), E-inject off, in_n[4]=1 -> out_e[5] = 1
+        cfg_write(2*W + 5, 1);            // out_e sel 1 = in_n (Wilton src track 4)
+        in_n = 1 << 4;
         #1;
         if (out_e[5] !== 1'b1) begin
             errors = errors + 1;
-            $display("FAIL: disjoint out_e[5]<-in_n[5] (inject off) exp=1 got=%b", out_e[5]);
+            $display("FAIL: Wilton out_e[5]<-in_n[4] (inject off) exp=1 got=%b", out_e[5]);
         end
 
-        // (6) re-enable E-inject[5] with clb_out[5]=0, in_n[5]=1 -> inject wins -> 0
+        // (6) re-enable E-inject[5] with clb_out[5]=0, in_n[4]=1 (drives out_e[5]
+        //     via Wilton sel) -> inject wins -> out_e[5] = 0
         clb_out[5] = 1'b0;
+        in_n = 1 << 4;                    // in_n[4] would drive out_e[5] under Wilton
         cfg_write(4*W + 5, 5);            // re-enable E-inject (dir=E)
         #1;
         if (out_e[5] !== 1'b0) begin
             errors = errors + 1;
-            $display("FAIL: E-inject overrides disjoint (in_n[5]=1,clb_out[5]=0) exp=0 got=%b", out_e[5]);
+            $display("FAIL: E-inject overrides Wilton sel (in_n[4]=1,clb_out[5]=0) exp=0 got=%b", out_e[5]);
         end
 
         // cleanup

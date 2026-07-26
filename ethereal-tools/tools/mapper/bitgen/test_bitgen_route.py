@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: MIT
 """pytest for bitgen_route — PathFinder on the real fabric topology
-(task E0-MAP3 increment 4a).
+(task E0-MAP3 increment 4a, refined to the WILTON SB 2026-07-26).
 
-Validates the Option-B router and SURFACES a key Phase-0 architectural finding:
-c432 — as placed by VPR — is NOT routable on the v1 fabric, because the disjoint
-track-locked SB over-subscribes tracks 7 (7 nets) and 2 (6 nets) (see
-``test_c432_routing_infeasibility_finding``). Bidirectional inject (the
-2026-07-26 Option-B RTL change) FIXED the original Cause 1 (east-edge driver
-stranding: 0 unreachable nets now, was 3), but Cause 2 (track-locking) REMAINS
-— each net is locked to track t=driver_j for its entire route (disjoint SB
-preserves track index, no track-change mux), so 7 nets sharing track 7 are
-structurally unresolvable. The router is proven sound on a feasible subset
-(``test_c432_feasible_subset_routable``) and a synthetic 1x2 case.
+Validates the Option-B router. HEADLINE: c432 — as placed by VPR — now ROUTES
+CONFLICT-FREE on the v1.1 fabric after the 2026-07-26 Wilton SB change (Fs=3,
+track-permuting). History: the prior disjoint SB track-LOCKED every net to
+track ``t = driver_j`` for its whole route (no track-change mux), so c432's
+tracks 7 (7 nets) and 2 (6 nets) were structurally over-subscribed and
+PathFinder could not converge (incr 4a Cause 2). Bidirectional inject had
+already fixed Cause 1 (east-edge driver stranding). Wilton breaks the locking:
+a signal changes track index at each SB hop, so contended wires detour — c432
+converges in ~46 iters with all 29 inter-cluster nets routed and zero over-used
+nodes, and every driver->sink pair is ``route_exists`` True on the configured
+real FabricGrid (the Option-B realizability proof).
 
-Per the task brief ("If c432 PathFinder doesn't converge in 30 iters, REPORT
-(don't fake)"), the non-convergence is reported, not faked: the convergence
-test is ``xfail(strict=True)`` documenting the finding, and the specific
-infeasibility facts are asserted by a PASSING test so they cannot be silently
-regressed or faked away.
+``test_c432_routes_conflict_free`` is THE gate (convergence + reachability);
+``test_c432_wilton_resolves_cause2`` is a regression guard proving the formerly
+infeasible tracks 2 & 7 now route even in isolation; the feasible-subset and
+synthetic 1x2 cases cover the router's soundness on smaller inputs.
 """
 from __future__ import annotations
 
@@ -37,7 +37,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", "..", "..", ".."))
 MAPPER = os.path.join(REPO, "generated", "mapper")
 
-C432_INFEASIBLE_TRACKS = (2, 7)      # over-subscribed (see finding test)
+# Tracks that were STRUCTURALLY infeasible under the prior disjoint SB (Cause 2:
+# over-subscribed — j=2 had 6 nets, j=7 had 7 nets). Under the Wilton SB these
+# now route conflict-free even in isolation (see test_c432_wilton_resolves_cause2).
+C432_INFEASIBLE_TRACKS = (2, 7)
 
 
 def _require_c432() -> None:
@@ -80,29 +83,22 @@ def test_route_extract_nets_c432():
 
 
 # =============================================================================
-# 2. THE KEY TEST: c432 routes conflict-free  (xfail — see finding below)
+# 2. THE GATE: c432 routes conflict-free on the v1.1 (Wilton) fabric
 # =============================================================================
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Phase-0 finding (E0-MAP3 incr 4a, post-bidir-inject 2026-07-26): c432 "
-        "is still NOT routable on the v1 fabric as placed by VPR. Cause 1 "
-        "(east-edge stranding) is FIXED by bidirectional inject (0 unreachable "
-        "nets, was 3). Cause 2 REMAINS: the disjoint track-locked SB over-"
-        "subscribes track 7 (7 nets) and track 2 (6 nets), which never converge "
-        "even in isolation (>=7 over-used nodes across 60 iters). Root cause: "
-        "VPR packs nets to fle indices (-> fabric tracks) with no awareness of "
-        "the v1 fabric's track locking (disjoint SB preserves track index, no "
-        "track-change mux). This xfail is STRICT: if a fabric/tooling change "
-        "makes c432 routable (e.g. a Wilton SB or track-aware packing), it will "
-        "XPASS and flag the change for review. See the acceptance report and "
-        "test_c432_routing_infeasibility_finding."))
 def test_c432_routes_conflict_free():
-    """PathFinder would route ALL inter-cluster nets with zero over-used
-    resources IF c432 were routable on the v1 fabric. It is not (xfail)."""
+    """HEADLINE: c432 routes conflict-free on the v1.1 (Wilton) fabric.
+
+    All 29 inter-cluster nets route with zero over-used nodes, and every
+    driver->sink pair is ``route_exists`` True on the configured real
+    FabricGrid (the Option-B realizability proof). Under the prior disjoint SB
+    this test was ``xfail`` (Cause 2 track-locking); the 2026-07-26 Wilton SB
+    (Fs=3, track-permuting) resolves it. Convergence at seed=0 is ~46 iters
+    (deterministic); ``max_iters`` carries margin.
+    """
+    from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
-    rc = route(db)
+    rc = route(db, max_iters=100, seed=0)
     print(f"\n[c432 route] n_nets={rc.n_nets} n_routed={rc.n_routed} "
           f"n_iters={rc.n_iters} n_overuse_final={rc.n_overuse_final} "
           f"converged={rc.converged} unrouted_count={len(rc.unrouted)}")
@@ -111,76 +107,84 @@ def test_c432_routes_conflict_free():
     assert rc.n_overuse_final == 0
     assert rc.unrouted == []
 
+    # realizability proof: every driver->sink route_exists on the real grid
+    min_x, min_y, max_x, max_y = db_grid_bounds(db)
+    R, C = max_y - min_y + 1, max_x - min_x + 1
+    grid = FabricGrid(R=R, C=C, W=12, N_INJ=8, EXT_IN=18)
+    apply_route_to_grid(grid, rc)
+    nets = extract_nets(db, min_x, min_y)
+    inter = [n for n in nets if n.kind == "inter"]
+    checked = 0
+    for n in inter:
+        for sink in n.sink_nodes:
+            assert grid.route_exists(n.driver_node, sink), (
+                f"net {n.name}: route_exists failed {n.driver_node} -> {sink}")
+            checked += 1
+    print(f"[c432 route] {checked} driver->sink pairs all route_exists True")
+
+    # structural no-multi-drive: an injected out_D[j] never also carries an SB sel
+    for (r, c), tr in rc.tiles.items():
+        for j, d in tr.inject.items():
+            assert tr.sb_sel.get((d, j), 0) == 0, (
+                f"tile ({r},{c}): out_{d}[{j}] multi-driven (inject + SB sel)")
+
 
 # =============================================================================
-# 3. THE FINDING (executable, PASSING) — documents the infeasibility precisely
+# 3. REGRESSION GUARD: Wilton resolves Cause 2 (formerly-infeasible tracks)
 # =============================================================================
 
-def test_c432_routing_infeasibility_finding():
-    """Asserts the specific structural facts behind c432's non-routability on
-    the v1 fabric AFTER bidirectional inject. PASSING = the finding is real and
-    stable; if the router were ever 'fixed' to fake convergence, this test breaks."""
+def test_c432_wilton_resolves_cause2():
+    """Regression guard for the Wilton fix.
+
+    The tracks that were STRUCTURALLY infeasible under the disjoint SB (Cause 2:
+    tracks 2 & 7, over-subscribed with 6/7 nets) still carry many nets under the
+    same VPR placement — yet each now converges conflict-free EVEN IN ISOLATION
+    under the Wilton SB. PASSING = the Wilton fix is real and stable; this
+    breaks loudly if the SB topology ever regresses to disjoint track-locking.
+    """
     from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
-    rc = route(db, max_iters=30, seed=0)
-
-    # ---- (a) non-convergence on the full design ----------------------------
-    assert not rc.converged, "expected non-convergence (the finding)"
-    assert rc.n_overuse_final > 0
-    print(f"\n[finding] full-design: converged={rc.converged}, "
-          f"{rc.n_overuse_final} over-used nodes at iter {rc.n_iters}")
-
-    # ---- (b) Cause 1 (east-edge stranding) is FIXED by bidirectional inject ----
-    # ALL inter nets are now reachable (0 unreachable). A driver on the eastmost
-    # column can now exit N/S/W instead of being stranded by east-only inject.
-    unreachable_names = {name for name, _reason in rc.unrouted
-                         if "unreachable" in _reason}
-    assert len(unreachable_names) == 0, (
-        f"expected 0 unreachable nets (Cause 1 fixed by bidir inject); "
-        f"got {unreachable_names}")
-    print(f"[finding] unreachable nets (Cause 1, east-edge): "
-          f"{len(unreachable_names)} (FIXED by bidir inject)")
-
-    # ---- (c) Cause 2 REMAINS: over-subscribed tracks (track-locked disjoint SB) ----
-    # Tracks 7 (7 nets) and 2 (6 nets) never converge even in isolation.
     min_x, min_y, max_x, max_y = db_grid_bounds(db)
     R, C = max_y - min_y + 1, max_x - min_x + 1
     nets = extract_nets(db, min_x, min_y)
     inter = [n for n in nets if n.kind == "inter"]
     j_counts = Counter(n.driver_node[3] for n in inter)
-    over_subs = [j for j, c in j_counts.items() if c >= 5]
-    print(f"[finding] per-track driver counts: {dict(j_counts)}; "
-          f"over-subscribed (>=5 nets): {over_subs}")
-    assert set(C432_INFEASIBLE_TRACKS).issubset(set(over_subs))
-    # prove tracks 7 and 2 are individually infeasible on the real topology
+    print(f"\n[cause2] per-track driver counts: {dict(sorted(j_counts.items()))}")
+    # the formerly over-subscribed tracks still carry many nets...
+    for j_bad in C432_INFEASIBLE_TRACKS:
+        assert j_counts[j_bad] >= 5, (
+            f"track j={j_bad} no longer over-subscribed; re-examine the guard")
     sink_clb_in = set()
     for n in inter:
         sink_clb_in.update(n.sink_nodes)
     adj = bitgen_route._build_possibility_graph(R, C, 12, 8, 18, sink_clb_in)
+    # ...yet each now converges in isolation (was impossible under disjoint)
     for j_bad in C432_INFEASIBLE_TRACKS:
         sub = [n for n in inter if n.driver_node[3] == j_bad]
-        conv, _it, ou, _edges = bitgen_route._run_pathfinder(
+        conv, n_iters, ou, _edges = bitgen_route._run_pathfinder(
             sub, adj, max_iters=60, seed=0, verbose=False)
-        print(f"[finding] track j={j_bad} alone ({len(sub)} nets): "
-              f"converged={conv}, over-used={ou}")
-        assert not conv, (
-            f"track j={j_bad} unexpectedly routed — re-examine the finding")
+        print(f"[cause2] track j={j_bad} alone ({len(sub)} nets): "
+              f"converged={conv}, iters={n_iters}, over-used={ou}")
+        assert conv, (
+            f"track j={j_bad} did NOT converge under Wilton — Cause 2 regressed?")
+        assert ou == 0
 
 
 # =============================================================================
-# 4. POSITIVE: the routable subset IS realizable on the real fabric
+# 4. POSITIVE: a subset is realizable on the real fabric (router soundness)
 # =============================================================================
 
 def test_c432_feasible_subset_routable():
-    """Route the FEASIBLE subset of c432 (exclude the over-subscribed tracks 2
-    & 7 and the east-edge-stranded nets). It MUST converge, and every routed
-    net's driver->sink must be ``route_exists`` True on the real ``FabricGrid``
-    — the Option-B realizability proof, on the subset the v1 fabric can carry.
+    """Route a SUBSET of c432 (exclude the formerly-infeasible tracks 2 & 7).
+    It MUST converge, and every routed net's driver->sink must be
+    ``route_exists`` True on the real ``FabricGrid`` — the Option-B realizability
+    proof, on a smaller input. (Under the Wilton SB the FULL design now routes —
+    see ``test_c432_routes_conflict_free`` — so this is a redundant-but-valid
+    soundness check on the subset; it predates the Wilton fix as the only
+    positive c432 routability evidence under the disjoint SB.)
 
-    Cross-track nets never share wires (track-j wires are disjoint from
-    track-j' wires), so routing each feasible track independently is exact.
-    Bidirectional inject means NO net is excluded for east-edge stranding
-    (Cause 1 is fixed); only tracks 2 & 7 (Cause 2) are excluded."""
+    Cross-track nets never share wires on the disjoint portion of the path, so
+    routing each track independently is exact."""
     from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
     min_x, min_y, max_x, max_y = db_grid_bounds(db)
@@ -219,7 +223,7 @@ def test_c432_feasible_subset_routable():
     for (r, c), tr in rc.tiles.items():
         for j, d in tr.inject.items():
             assert tr.sb_sel.get((d, j), 0) == 0, (
-                f"tile ({r},{c}): out_{d}[{j}] multi-driven (inject + disjoint sel)")
+                f"tile ({r},{c}): out_{d}[{j}] multi-driven (inject + SB sel)")
 
 
 # =============================================================================

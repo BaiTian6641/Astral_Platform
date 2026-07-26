@@ -49,6 +49,21 @@ def sources(direction: str) -> tuple[str, str, str]:
     return _SOURCES[direction]
 
 
+# Wilton (v1.1) track permutation: the input track on ``src_dir`` that feeds
+# ``out_{out_dir}[t]``. Mapped from S. Wilton PhD thesis / VPR's WILTON formula
+# (N=TOP, S=BOTTOM, E=RIGHT, W=LEFT). A signal CHANGES track index at each SB
+# hop -> breaks the disjoint track-locking (E0-MAP3 incr 4a Cause 2).
+def _wilton_track(out_dir: str, src_dir: str, t: int, W: int) -> int:
+    if out_dir == "n":
+        return t if src_dir == "s" else (t + 1) % W if src_dir == "e" else (W - t) % W
+    if out_dir == "s":
+        return t if src_dir == "n" else (2 * W - 2 - t) % W if src_dir == "e" else (t + W - 1) % W
+    if out_dir == "e":
+        return (t + W - 1) % W if src_dir == "n" else (2 * W - 2 - t) % W if src_dir == "s" else t
+    # out_dir == "w"
+    return (W - t) % W if src_dir == "n" else (t + W - 1) % W if src_dir == "s" else t
+
+
 class SwitchBox:
     """Cycle-accurate switch-box reference model (v3: disjoint unidir + bidir inject).
 
@@ -190,7 +205,8 @@ class SwitchBox:
                     and self.inject_dir[t] == d_idx):
                 continue
             src = _SOURCES[d][sel - 1]          # sel 1..3 -> sources index 0..2
-            if (ins[src] >> t) & 1:
+            src_t = _wilton_track(d, src, t, self.W)   # Wilton: permuted src track
+            if (ins[src] >> src_t) & 1:
                 out[d] |= 1 << t
         # bidirectional inject: out_D[j] = clb_out[j] for each enabled j
         clb = self._to_int(clb_out, self.NINJ)
@@ -226,7 +242,8 @@ class SwitchBox:
                     and self.inject_dir[t] == d_idx):
                 continue                        # inject overrides disjoint sel
             src = _SOURCES[d][sel - 1]
-            edges.add((("in", src, t), ("out", d, t)))
+            src_t = _wilton_track(d, src, t, self.W)   # Wilton: permuted src track
+            edges.add((("in", src, src_t), ("out", d, t)))
         for j in self.inject_en:
             d = DIRS[self.inject_dir[j]]
             edges.add((("clb_out", j), ("out", d, j)))

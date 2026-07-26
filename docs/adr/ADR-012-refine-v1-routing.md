@@ -1,6 +1,6 @@
 # ADR-012 (refinement): Ethereal MAP routing — Option B (custom router on real topology) + v1 routability finding
 
-> Status: **Accepted (routing + bidirectional inject); SB topology (Wilton) = open decision** · Date: 2026-07-26
+> Status: **Accepted + RESOLVED** (routing = Option B-router; inject = bidirectional; SB topology = Wilton — all implemented; c432 routes) · Date: 2026-07-26
 > Supersedes/extends: ADR-012 (MAP route A=VPR vs B=FABulous) — this refines the *routing mechanism* and records a Phase-0 fabric-routability finding.
 > Plan-Ref: `ethereal-plan/components/C-soft-工具与固件组件.md §2` (bitgen), `C01-fabric-核心单元.md §3.3` (SB topology)
 
@@ -18,13 +18,12 @@ Even with bidirectional inject, the c432 router **does not converge** (29 inter-
 
 **Scope implication:** v1 (disjoint SB) cannot route c432, nor the larger Phase-0 exit circuits (AES-128, FIR16). The disjoint SB was always documented as a *preliminary, VPR-refinable placeholder* (C01 §3.3; interconnect spec §2), with the v2 target being a track-flexible topology (Landy/Stitt/Wilton).
 
-## Open decision — SB topology: Wilton now (Option A-fabric) vs defer to Phase 1 (Option D)
-| | Fixes Cause 2? | Cost | Notes |
-|---|---|---|---|
-| **A. Wilton SB** (track-index permutation) | **Yes (root)** | Medium — `switch_box` source map + `sb_model` + arch `type="wilton"`; **frame_map SB points unchanged** (still 48×2-bit sel); inject/CB/clb unchanged | The spec's named v2 target. Wilton lets a net change track index at each SB hop → breaks track-locking. Likely routes c432 + bigger circuits. |
-| **D. Defer c432/AES/FIR → Phase-1 fabric v2; validate Phase-0 flow on small routable circuits** | (scope) | Low | Phase-0 goal is *flow* validation, not fabric competitiveness. c17 is already bit-true through frames. |
+## Decision 3 — SB topology: Wilton (RESOLVED, Option A-fabric)
+**Decision: adopt Wilton (track-permuting Fs=3).** Rationale: it is the root fix for Cause 2 (track-locking), it is the spec's named v2 target (C01 §3.3 / interconnect spec §2), and it is **config-contained** — `frame_map` SB points are unchanged (still 48×2-bit sel); only the `switch_box` source permutation + `sb_model` + arch `type=wilton` change. Wilton lets a signal change track index at each SB hop, so a net is no longer locked to `t = driver_j`.
 
-**Maintainer to decide.** The router (Option B-router) and bidirectional inject (Option B-inject) are done + validated regardless; incr 4b (primary-IO injection + fabric sim) is independent and can proceed on whatever circuit routes.
+**Implemented + VERIFIED (E0-MAP3 incr 4c, 2026-07-26):** `switch_box` source map → Wilton permutation (mapped from S. Wilton PhD thesis / VPR's `WILTON` formula); `sb_model._wilton_track` matches the RTL bit-for-bit; arch `switch_block type="wilton"`. **c432 now CONVERGES: 29/29 inter-cluster nets routed, 46 PathFinder iters, 0 over-use, all 57 driver→sink pairs `route_exists=True` on the configured real `FabricGrid`** (independently re-verified). Both Cause 1 (bidirectional inject) and Cause 2 (Wilton) are fixed → the v1.1 fabric routes c432. `route()` default `max_iters` bumped 30→100 (c432 needs 46).
+
+**Why not Option D (defer):** Wilton was contained enough (config-level invariant) + reusable (needed eventually) + unblocks the Phase-0 acceptance (c432 bit-true) and the exit circuits (AES/FIR). Deferring would have left the acceptance unmet on a known-fixable issue.
 
 ## Consequences
 - The v1 fabric is confirmed a **flow-validation vehicle**, not a competitive fabric. Its routability ceiling (small, low-track-contention circuits) is now characterized.
