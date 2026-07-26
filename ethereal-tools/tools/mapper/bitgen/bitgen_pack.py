@@ -11,13 +11,15 @@ grid (x, y). LEVEL 2 maps that DB into the physical **config frames** defined by
 :mod:`frame_map` (the SoT), and back. A frame = one COLUMN of tiles' config
 bits packed into 32-bit words + a CRC16 tail word (see frame_map.FrameMap).
 
-Scope of THIS increment (incr 3): CLB-Tile points only.
-  * Per-tile CLB config points: ``elut0..elut7`` (20-bit each) +
-    ``iib_mux0..iib_mux31`` (5-bit each, ``m = gi*K + gk``).
-  * SB (mux_{n,s,e,w}_*, inj_en_*) and CB (cb_sel_*) are left BLANK (default 0)
-    — routable-CB / switch-box config bits land in increment 4 (routing). The
-    frame_map *reserves* their bits (so the frame width is unchanged); they
-    simply read back as 0 here, which is the deliberate quiescent/safe pattern.
+Scope:
+  * incr 3 (CLB-only): ``tile_to_config_points`` / ``db_to_frames`` /
+    ``frames_to_db`` pack per-tile CLB points (``elut0..elut7`` 20-bit +
+    ``iib_mux0..iib_mux31`` 5-bit, ``m = gi*K + gk``). SB/CB/inject BLANK.
+  * incr 4e (FULL frames): ``tile_to_full_points`` / ``full_to_frames`` /
+    ``frames_to_route`` ALSO pack the routing (SB ``mux_{dir}_{t}`` sel +
+    ``inj_en_{j}``/``inj_dir_{j}`` + CB ``cb_sel_{i}``) from a RouteConfig, so
+    the bitgen emits OCC-loadable COMPLETE frames. CLB-only paths stay for
+    backward compat / logic-only validation.
 
 ==============================================================================
 NET-NAME RE-ATTACHMENT (by design — DO NOT pack net names into frames)
@@ -52,6 +54,12 @@ if _TOOLS_DIR not in sys.path:
 from bitgen_db import (EXT_IN, K, N, FabricConfigDB, TileLogic,  # noqa: E402
                        elut_cfg_word, elut_from_word)
 from frame_map import FrameMap  # noqa: E402
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    # deferred: bitgen_route imports bitgen_pack (db_grid_bounds), so import these
+    # only under TYPE_CHECKING to avoid a runtime cycle (ruff/mypy see the names).
+    from bitgen_route import RouteConfig, TileRoute
 
 
 # =============================================================================
@@ -169,3 +177,93 @@ def frames_to_db(frames: list[list[int]], fm: FrameMap,
         for r, cfg in enumerate(col_config):
             db.tiles[(c + min_x, r + min_y)] = config_points_to_tile(cfg, fm.N, fm.K)
     return db
+
+
+# =============================================================================
+# incr 4e: FULL frames (CLB + routing)  — bitgen_route interop
+# =============================================================================
+# inject_dir encoding (matches sb_model.DIR_IDX): 0=N, 1=S, 2=E, 3=W.
+_DIR_IDX = {"n": 0, "s": 1, "e": 2, "w": 3}
+_DIR_CHARS = ("n", "s", "e", "w")
+
+
+def tile_to_full_points(tile: TileLogic, rt: "TileRoute | None" = None,
+                        n: int = N, k: int = K) -> dict[str, int]:
+    """Full per-tile config points: CLB (tile) + SB/CB/inject (rt).
+
+    CLB points come from :func:`tile_to_config_points`; routing points from the
+    tile's ``TileRoute`` (sb_sel -> ``mux_{dir}_{t}``; inject{j:dir} ->
+    ``inj_en_{j}`` + ``inj_dir_{j}``; cb_sel -> ``cb_sel_{i}``). ``rt=None`` ->
+    CLB-only (routing blank). ``rt`` is duck-typed (no import needed here).
+    """
+    cfg = tile_to_config_points(tile, n, k)
+    if rt is not None:
+        for (d, t), sel in rt.sb_sel.items():
+            cfg[f"mux_{d}_{t}"] = sel
+        for j, d in rt.inject.items():
+            cfg[f"inj_en_{j}"] = 1
+            cfg[f"inj_dir_{j}"] = _DIR_IDX[d]
+        for i, track in rt.cb_sel.items():
+            cfg[f"cb_sel_{i}"] = track
+    return cfg
+
+
+def full_to_frames(db: FabricConfigDB,
+                   rc: "RouteConfig") -> tuple[list[list[int]], FrameMap]:
+    """Pack CLB (db) + routing (rc) into per-column FULL config frames.
+
+    Inverse of :func:`frames_to_db` (CLB) + :func:`frames_to_route` (routing).
+    db tiles keyed by VPR (x, y) = (col+min_x, row+min_y); ``rc.tiles`` keyed by
+    fabric (row, col). A tile present in only one of {db, rc} packs whichever
+    side exists (the other blank).
+    """
+    min_x, min_y, max_x, max_y = db_grid_bounds(db)
+    rows = max_y - min_y + 1
+    cols = max_x - min_x + 1
+    fm = FrameMap(R=rows, C=cols, W=12, N=N, K=K, EXT_IN=EXT_IN)
+    frames: list[list[int]] = []
+    for c in range(cols):
+        col_config: list[dict[str, int]] = []
+        for r in range(rows):
+            tile = db.tiles.get((c + min_x, r + min_y))
+            rt = rc.tiles.get((r, c))
+            if tile is not None:
+                col_config.append(tile_to_full_points(tile, rt))
+            elif rt is not None:
+                col_config.append(tile_to_full_points(TileLogic(), rt))
+            else:
+                col_config.append({})
+        frames.append(fm.pack(col_config))
+    return frames, fm
+
+
+def frames_to_route(frames: list[list[int]], fm: FrameMap) -> "RouteConfig":
+    """Inverse of the routing half of :func:`full_to_frames`.
+
+    Unpacks each frame (CRC-verified) and reconstructs a ``RouteConfig``
+    (sb_sel / inject / cb_sel per fabric tile (row, col)). CLB points are
+    ignored here (use :func:`frames_to_db`). ``bitgen_route`` is imported
+    lazily to avoid the bitgen_pack <-> bitgen_route import cycle.
+    """
+    from bitgen_route import RouteConfig, TileRoute  # deferred: avoid import cycle
+    if len(frames) != fm.C:
+        raise ValueError(f"expected {fm.C} frames (one per column), got {len(frames)}")
+    rc = RouteConfig()
+    for c, frame in enumerate(frames):
+        col_config = fm.unpack(frame)
+        for r, cfg in enumerate(col_config):
+            tr = TileRoute()
+            for d in _DIR_CHARS:
+                for t in range(fm.W):
+                    sel = int(cfg.get(f"mux_{d}_{t}", 0))
+                    if sel != 0:
+                        tr.sb_sel[(d, t)] = sel
+            for j in range(fm.N):
+                if int(cfg.get(f"inj_en_{j}", 0)):
+                    tr.inject[j] = _DIR_CHARS[int(cfg[f"inj_dir_{j}"])]
+            for i in range(fm.EXT_IN):
+                track = int(cfg.get(f"cb_sel_{i}", 0))
+                if track != 0:
+                    tr.cb_sel[i] = track
+            rc.tiles[(r, c)] = tr
+    return rc

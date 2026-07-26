@@ -8,7 +8,7 @@ import shutil
 
 import pytest
 
-from synth_ethereal import synth_ethereal, _yosys
+from synth_ethereal import synth_ethereal
 
 YOSYS_AVAILABLE = bool(shutil.which("yosys")) or bool(os.environ.get("YOSYS"))
 pytestmark = pytest.mark.skipif(not YOSYS_AVAILABLE, reason="yosys not on PATH")

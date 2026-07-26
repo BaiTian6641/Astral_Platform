@@ -39,7 +39,8 @@ import pytest
 # fabric_model / sb_model / cb_model (see its module-level sys.path setup).
 import fabric_sim  # noqa: F401
 from bitgen_db import EXT_IN, ElutConfig, TileLogic, build_db
-from bitgen_pack import db_grid_bounds
+from bitgen_pack import (db_grid_bounds, frames_to_db, frames_to_route,  # noqa: F401
+                          full_to_frames)
 from bitgen_route import route
 from fabric_sim import FabricSim, clb_eval_bits, simulate_fabric
 
@@ -283,3 +284,64 @@ def test_simulate_fabric_wrapper_matches_class(c432_setup):
     a = simulate_fabric(db, rc, pi, min_x, min_y, max_iters=128)
     b = simulate_fabric(db, rc, pi, min_x, min_y, max_iters=128)
     assert a == b, "simulate_fabric must be deterministic"
+
+
+# =============================================================================
+# 4. FULL frame path (incr 4e): frames -> unpack (CLB + routing) -> FabricSim
+# =============================================================================
+
+def test_full_frame_roundtrip_c432(c432_setup):
+    """full_to_frames packs CLB + SB/CB/inject; unpack reconstructs BOTH lossless."""
+    db, rc, _sim, min_x, min_y = c432_setup
+    frames, fm = full_to_frames(db, rc)
+    assert len(frames) == fm.C
+    db2 = frames_to_db(frames, fm, min_x, min_y)
+    rc2 = frames_to_route(frames, fm)
+    # CLB round-trip: every original eLUT TT + iib_mux sel preserved
+    for (x, y), tile in db.tiles.items():
+        t2 = db2.tiles[(x, y)]
+        for gi, ec in tile.eluts.items():
+            assert t2.eluts[gi].tt == ec.tt, f"TT mismatch tile {(x,y)} eLUT{gi}"
+        for key, sel in tile.iib_mux.items():
+            assert t2.iib_mux.get(key, 0) == sel, f"iib_mux mismatch tile {(x,y)} {key}"
+    # routing round-trip: sb_sel + inject + cb_sel preserved
+    assert rc.tiles, "c432 RouteConfig has no tiles"
+    for (r, c), tr in rc.tiles.items():
+        tr2 = rc2.tiles[(r, c)]
+        assert tr2.sb_sel == tr.sb_sel, f"sb_sel mismatch tile {(r,c)}"
+        assert tr2.inject == tr.inject, f"inject mismatch tile {(r,c)}"
+        # cb_sel: absent ≡ 0 (track 0 = out_n[0] is a VALID value, not unused;
+        # frames_to_route omits track-0 entries == ConnectionBlock default sel=0).
+        for i in set(tr.cb_sel) | set(tr2.cb_sel):
+            assert tr2.cb_sel.get(i, 0) == tr.cb_sel.get(i, 0), \
+                f"cb_sel mismatch tile {(r,c)} i={i}"
+
+
+def test_c432_bittrue_via_full_frames(c432_setup):
+    """The COMPLETE frame path: full_to_frames -> unpack -> FabricSim -> bit-true.
+
+    Proves the bitgen's OCC-loadable FULL frames (CLB + routing), when unpacked
+    and loaded into the fabric simulator, compute c432 bit-true vs the iverilog
+    golden. Closes the frame-packing loop end-to-end."""
+    db, rc, _sim, min_x, min_y = c432_setup
+    frames, fm = full_to_frames(db, rc)
+    db2 = frames_to_db(frames, fm, min_x, min_y)
+    rc2 = frames_to_route(frames, fm)
+    # re-attach netlist context (frames carry no net names — see bitgen_pack docstring)
+    for (x, y), tile in db.tiles.items():
+        t2 = db2.tiles[(x, y)]
+        t2.cluster_inputs = dict(tile.cluster_inputs)
+        t2.cluster_outputs = dict(tile.cluster_outputs)
+    db2.primary_inputs = list(db.primary_inputs)
+    db2.primary_outputs = list(db.primary_outputs)
+    sim2 = FabricSim(db2, rc2, min_x, min_y)
+
+    inputs, outputs = _parse_c432_ports(C432_V)
+    golden = _run_iverilog_golden(inputs, outputs, 32)   # 32 vectors (slower path)
+    mismatches = 0
+    for pi_dict, po_golden in golden:
+        po = sim2.evaluate(pi_dict, max_iters=128)
+        if any(po.get(n) != po_golden[n] for n in outputs):
+            mismatches += 1
+    print(f"\n[c432 via full frames] {len(golden) - mismatches}/{len(golden)} bit-true")
+    assert mismatches == 0, f"full-frame path: {mismatches}/{len(golden)} mismatches"
