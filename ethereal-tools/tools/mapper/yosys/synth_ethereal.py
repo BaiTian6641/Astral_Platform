@@ -35,23 +35,60 @@ def _yosys() -> str:
     raise RuntimeError("yosys not found on PATH (set YOSYS or add OSS-CAD's bin)")
 
 
-def synth_ethereal(design: str, out_prefix: str, top: str | None = None) -> dict:
-    """Synthesize `design` to a 4-LUT (eLUT4) netlist. Returns a result dict."""
+def synth_ethereal(design: str, out_prefix: str, top: str | None = None,
+                   heterogeneous: bool = False) -> dict:
+    """Synthesize `design` to a 4-LUT (eLUT4) netlist. Returns a result dict.
+
+    ``heterogeneous=True`` (Phase-1, Stage 5): keep ``$mem_v2`` (block RAM ->
+    mem_t) and ``$macc_v2`` (multiply-accumulate -> dsp_t) as hard cells instead
+    of blowing them up into LUTs. Flow: ``proc`` -> ``memory`` (collect RAM
+    arrays -> $mem_v2) -> ``alumacc`` (multiply -> $macc_v2) -> ``simplemap``
+    (map generic logic to gates, WITHOUT maccmap — techmap's maccmap extmapper
+    would decompose $macc_v2) -> ``abc -lut 4`` (LUT logic only). The BLIF/JSON
+    then carry $lut (eLUT4) + $mem_v2 (mem_t) + $macc_v2 (dsp_t), which the
+    heterogeneous bitgen/VPR arch maps onto the tiles.
+    """
     if not os.path.exists(design):
         raise FileNotFoundError(design)
     out_dir = os.path.dirname(out_prefix) or "."
     os.makedirs(out_dir, exist_ok=True)
     top_opt = f"-top {top}" if top else "-auto-top"
-    script = (
-        f"read_verilog {design}\n"
-        f"synth {top_opt}\n"
-        "abc -lut 4\n"
-        "opt -full\n"
-        "clean\n"
-        "stat\n"
-        f"write_json {out_prefix}.json\n"
-        f"write_blif {out_prefix}.blif\n"
-    )
+    if heterogeneous:
+        # Heterogeneous flow (VALIDATED 2026-07-28, Stage 5a): proc (RTLIL) ->
+        # memory (collect RAM arrays -> $mem_v2 -> mem_t) -> alumacc (multiply ->
+        # $macc_v2 -> dsp_t) -> simplemap (map remaining generic logic to gates,
+        # WITHOUT maccmap — techmap's maccmap extmapper would decompose $macc_v2)
+        # -> abc -lut 4 (LUT logic only). Verified: RAM -> 1 $mem_v2 (+few LUT);
+        # multiply -> 1 $macc_v2; c432 -> 63 $lut + 0 hard; mixed -> logic LUT +
+        # 1 $mem_v2. ($mem_v2/$macc_v2 survive abc; the heterogeneous bitgen/VPR
+        # arch maps them onto mem_t/dsp_t.)
+        script = (
+            f"read_verilog {design}\n"
+            "proc\n"
+            "opt\n"
+            "memory -nomap\n"
+            "opt\n"
+            "alumacc\n"
+            "opt\n"
+            "simplemap\n"
+            "abc -lut 4\n"
+            "opt -full\n"
+            "clean\n"
+            "stat\n"
+            f"write_json {out_prefix}.json\n"
+            f"write_blif {out_prefix}.blif\n"
+        )
+    else:
+        script = (
+            f"read_verilog {design}\n"
+            f"synth {top_opt}\n"
+            "abc -lut 4\n"
+            "opt -full\n"
+            "clean\n"
+            "stat\n"
+            f"write_json {out_prefix}.json\n"
+            f"write_blif {out_prefix}.blif\n"
+        )
     y = _yosys()
     res = subprocess.run([y, "-p", script], capture_output=True, text=True)
     if res.returncode != 0:
@@ -63,10 +100,17 @@ def synth_ethereal(design: str, out_prefix: str, top: str | None = None) -> dict
     # capture $dff count too (registers -> eLUT4 FFs)
     dff_matches = re.findall(r"(\d+)\s+\$dff\b", log)
     dff_count = int(dff_matches[-1]) if dff_matches else 0
+    # heterogeneous hard cells: $mem_v2 (-> mem_t) + $macc_v2 (-> dsp_t)
+    mem_matches = re.findall(r"(\d+)\s+\$mem_v2\b", log)
+    mem_count = int(mem_matches[-1]) if mem_matches else 0
+    macc_matches = re.findall(r"(\d+)\s+\$macc_v2\b", log)
+    macc_count = int(macc_matches[-1]) if macc_matches else 0
     return {
         "design": design,
         "lut4_count": lut_count,
         "dff_count": dff_count,
+        "mem_count": mem_count,     # $mem_v2 -> mem_t (heterogeneous)
+        "macc_count": macc_count,   # $macc_v2 -> dsp_t (heterogeneous)
         "json": f"{out_prefix}.json",
         "blif": f"{out_prefix}.blif",
         "log": log,

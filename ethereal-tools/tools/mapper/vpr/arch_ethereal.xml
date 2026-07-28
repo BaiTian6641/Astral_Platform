@@ -51,21 +51,101 @@
      authoritative; this arch token is kept consistent for VPR pack/place parity.
   D. Channel width W=12 is supplied on the CLI; the arch sets no hard chan cap.
 
+  === Heterogeneous extension (Phase-1, Stage 5a, 2026-07-28) ===
+  Two new tile pb_types join clb/io so VPR can place the hard cells emitted by
+  synth_ethereal's heterogeneous=True flow (memory-> $mem_v2, alumacc-> $macc_v2):
+
+    mult_27x18 (dsp_t)  : 27x18 -> 48-bit multiplier/MAC. Yosys emits it as
+                          `.subckt $macc_v2` with ports A[26:0], B[17:0], Y[47:0].
+                          blif_model=".subckt $macc_v2"; the matching <model name="$macc_v2">
+                          declares those ports (combinational A/B -> Y).
+    mem_2Kx32 (mem_t)   : 2K x 32-bit synchronous RAM. Yosys emits it as
+                          `.subckt $mem_v2` (NOT VPR's built-in single_port_ram).
+                          Real Yosys $mem_v2 is dual-port (RD_*/WR_*), which does
+                          NOT match single_port_ram's single-addr model, so the
+                          blif_model is `.subckt $mem_v2` + a matching custom
+                          <model name="$mem_v2">. class="memory" lets VPR pack it.
+  Both are added to <models> (VPR throws "Failed to find matching architecture
+  model" for any .subckt name it does not have built-in or declared).
+
+  ASSUMPTIONs for the new tiles (G6, TBD 2026-07-28):
+  E. fc in/out = 1.0/1.0 on mult_27x18 & mem_2Kx32. VTR's own wide tiles use
+     0.15/0.10, but that left most mult/mem pins with NO rr_graph fanin/fanout
+     (VPR check_rr_graph warnings) at our tiny W=12: too few channels brush the
+     tall hard columns, so a fractional fc starves the wide pins. fc=1.0 connects
+     every hard-tile pin to the channel. Routability approximation only; exact
+     rr_graph -> fabric-mux mapping is bitgen's job (E0-MAP3 heterogeneous,
+     not yet built).
+  F. Column pattern (mult every 4th col from x=4, memory every 5th from x=5)
+     is a PLACEHOLDER heterogeneous layout, chosen to give a few hard-tile
+     columns without disturbing the clb fill / io perimeter. Real mem_t/dsp_t
+     floorplan comes from fabric.yaml in a later phase.
+  G. $mem_v2 is modelled as a single-clock synchronous RAM: RD_CLK/WR_CLK both
+     connect to the tile's `clk`; RD_EN/WR_EN are synchronous write/read enables
+     (clock="clk"); RD_ARST/RD_SRST are bundled into the sync `ctrl` port
+     (tie-off in Phase-1 probes — async reset inference is a heterogeneous-
+     bitgen concern, deferred). See note in the mem_2Kx32 pb_type.
+
   Adapted from vtr_flow/arch/timing/k4_N4_90nm.xml (VTR v8.0.0), which is the
-  canonical v8.0.0-verified homogeneous LUT4+FF cluster reference.
+  canonical v8.0.0-verified homogeneous LUT4+FF cluster reference. mult/memory
+  tile structure follows vtr_flow/arch/timing/EArch.xml + k6_N10_mem32K_40nm.xml.
 -->
 <architecture>
 
-  <!-- ODIN II: native .names (LUT) / .input / .output / .latch (FF) — no custom models -->
+  <!-- Built-in: .names (LUT) / .input / .output / .latch (FF).
+       Custom: $macc_v2 (dsp_t) + $mem_v2 (mem_t) from the heterogeneous synth.
+       (VPR has multiply/single_port_ram/dual_port_ram/adder built-in, but Yosys
+        emits neither — it emits $macc_v2/$mem_v2, so those are declared here.) -->
   <models>
+    <!-- dsp_t: 27x18 -> 48 multiplier/MAC. Pure combinational A/B -> Y
+         (the pipelining FFs live in surrounding clbs). -->
+    <model name="$macc_v2">
+      <input_ports>
+        <port name="A" combinational_sink_ports="Y"/>
+        <port name="B" combinational_sink_ports="Y"/>
+      </input_ports>
+      <output_ports>
+        <port name="Y"/>
+      </output_ports>
+    </model>
+
+    <!-- mem_t: 2Kx32 synchronous RAM. Yosys $mem_v2 dual-port form.
+         Write side (WR_CLK/WR_EN/WR_ADDR/WR_DATA) + read side
+         (RD_CLK/RD_EN/RD_ADDR -> RD_DATA) are all clocked (synchronous). -->
+    <model name="$mem_v2">
+      <input_ports>
+        <port name="WR_CLK"  is_clock="1"/>
+        <port name="WR_EN"   clock="WR_CLK"/>
+        <port name="WR_ADDR" clock="WR_CLK"/>
+        <port name="WR_DATA" clock="WR_CLK"/>
+        <port name="RD_CLK"  is_clock="1"/>
+        <port name="RD_EN"   clock="RD_CLK"/>
+        <port name="RD_ADDR" clock="RD_CLK"/>
+        <port name="RD_ARST" clock="RD_CLK"/>
+        <port name="RD_SRST" clock="RD_CLK"/>
+      </input_ports>
+      <output_ports>
+        <port name="RD_DATA" clock="RD_CLK"/>
+      </output_ports>
+    </model>
   </models>
 
-  <!-- Physical layout: io on the perimeter, clb filling the core -->
+  <!-- Physical layout: io on the perimeter, clb filling the core, with
+       hard-tile columns interleaved (mult every 4th col, memory every 5th).
+       Each hard column gets an EMPTY filler col (priority one lower) so VPR
+       leaves EMPTY wherever a height-1 tile does not fit the perimeter offset.
+       Pattern follows VTR's EArch.xml multi-tile <auto_layout>. -->
   <layout>
     <auto_layout aspect_ratio="1.000000">
       <perimeter type="io" priority="100"/>
       <corners type="EMPTY" priority="101"/>
       <fill type="clb" priority="10"/>
+      <!-- dsp_t columns (mult every 4th column, offset 1 for the io perimeter) -->
+      <col type="mult_27x18" startx="4" starty="1" repeatx="4" priority="20"/>
+      <col type="EMPTY"      startx="4" starty="1" repeatx="4" priority="19"/>
+      <!-- mem_t columns (memory every 5th column) -->
+      <col type="mem_2Kx32" startx="5" starty="1" repeatx="5" priority="20"/>
+      <col type="EMPTY"     startx="5" starty="1" repeatx="5" priority="19"/>
     </auto_layout>
   </layout>
 
@@ -209,6 +289,108 @@
            (1 of 4 dirs). Exact rr_graph->mux mapping is bitgen's job (E0-MAP3). -->
       <fc in_type="frac" in_val="1.0" out_type="frac" out_val="0.25"/>
       <pinlocations pattern="spread"/>
+    </pb_type>
+
+    <!-- ================= Ethereal DSP-T (mult_27x18: 27x18 -> 48 MAC) ================= -->
+    <pb_type name="mult_27x18" height="1">
+      <input  name="a"   num_pins="27"/>
+      <input  name="b"   num_pins="18"/>
+      <output name="out" num_pins="48"/>
+
+      <!-- leaf: the $macc_v2 hard cell Yosys emits (alumacc). Combinational. -->
+      <pb_type name="mult_27x18_slice" blif_model=".subckt $macc_v2" num_pb="1">
+        <input  name="A" num_pins="27"/>
+        <input  name="B" num_pins="18"/>
+        <output name="Y" num_pins="48"/>
+        <delay_constant max="1.523e-9" in_port="mult_27x18_slice.A" out_port="mult_27x18_slice.Y"/>
+        <delay_constant max="1.523e-9" in_port="mult_27x18_slice.B" out_port="mult_27x18_slice.Y"/>
+      </pb_type>
+
+      <interconnect>
+        <direct name="a2a"     input="mult_27x18.a"        output="mult_27x18_slice.A"/>
+        <direct name="b2b"     input="mult_27x18.b"        output="mult_27x18_slice.B"/>
+        <direct name="out2out" input="mult_27x18_slice.Y"  output="mult_27x18.out"/>
+      </interconnect>
+
+      <!-- fc 1.0/1.0 (ASSUMPTION E, revised): wide tiles need every pin to reach
+           tracks; VTR's 0.15/0.10 (for its own wide tiles) left most of our
+           mult/mem pins with no rr_graph fanin/fanout at W=12 (no routing
+           channels pass the tall hard columns at this tiny channel width), so we
+           connect all pins to the channel. Exact mapping is bitgen's job. -->
+      <fc in_type="frac" in_val="1.0" out_type="frac" out_val="1.0"/>
+      <pinlocations pattern="spread"/>
+      <power method="ignore"/>
+    </pb_type>
+
+    <!-- ================= Ethereal MEM-T (mem_2Kx32: 2K x 32 sync RAM) ================= -->
+    <!-- class="memory" lets VPR pack the $mem_v2 atom. VPR's memory-class
+         machinery (ProcessMemoryClass) derives the data width from the
+         data-class ports (WR_DATA/RD_DATA = 32) and auto-builds the per-bit
+         memory_slice interconnect. We declare the tile ports to match the
+         Yosys $mem_v2 model; the slice-level ports use VPR's canonical
+         port_class tokens (address/data_in/write_en/data_out/clock).
+
+         NOTE (ASSUMPTION G): the real $mem_v2 is dual-port (separate RD_*/WR_*).
+         VPR's memory class is a single-address space abstraction; we expose one
+         unified addr and treat RD_EN/WR_EN as enables. The $mem_v2 model's
+         RD_ARST/RD_SRST (async/sync reset) are folded into the `ctrl` bundle and
+         tied off in Phase-1 probes — full reset inference is deferred to the
+         heterogeneous bitgen (E0-MAP3, not yet built). The tile container holds
+         the class="memory" leaf below; VPR's memory machinery (ProcessMemoryClass)
+         derives the 32-bit width from the data-class ports. -->
+    <pb_type name="mem_2Kx32" height="1">
+      <input  name="addr"    num_pins="11"/>
+      <input  name="data_in" num_pins="32"/>
+      <input  name="we"      num_pins="1"/>
+      <input  name="ctrl"    num_pins="4"/>  <!-- RD_EN + RD_ARST + RD_SRST + spare -->
+      <output name="data_out" num_pins="32"/>
+      <clock  name="clk"     num_pins="1"/>
+
+      <!-- leaf carrying the $mem_v2 blif_model. NOT class="memory": VPR's memory
+           class (ProcessMemoryClass) NILS the leaf's model and rebuilds it as a
+           canonical single-port memory_slice, which cannot represent Yosys's
+           dual-port $mem_v2 (RD_*/WR_*). So we model it as a plain sequential
+           leaf whose ports match the $mem_v2 model one-to-one; the packer places
+           the $mem_v2 atom here directly. -->
+      <pb_type name="mem_2Kx32_slice" blif_model=".subckt $mem_v2" num_pb="1">
+        <input  name="WR_EN"   num_pins="32"/>
+        <input  name="WR_ADDR" num_pins="11"/>
+        <input  name="WR_DATA" num_pins="32"/>
+        <input  name="RD_EN"   num_pins="1"/>
+        <input  name="RD_ADDR" num_pins="11"/>
+        <input  name="RD_ARST" num_pins="1"/>
+        <input  name="RD_SRST" num_pins="1"/>
+        <output name="RD_DATA" num_pins="32"/>
+        <clock  name="WR_CLK"  num_pins="1"/>
+        <clock  name="RD_CLK"  num_pins="1"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.WR_EN" clock="WR_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.WR_ADDR" clock="WR_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.WR_DATA" clock="WR_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.RD_EN" clock="RD_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.RD_ADDR" clock="RD_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.RD_ARST" clock="RD_CLK"/>
+        <T_setup value="509e-12" port="mem_2Kx32_slice.RD_SRST" clock="RD_CLK"/>
+        <T_clock_to_Q max="1.234e-9" port="mem_2Kx32_slice.RD_DATA" clock="RD_CLK"/>
+      </pb_type>
+
+      <interconnect>
+        <!-- single tile clk drives both write & read clocks (ASSUMPTION G) -->
+        <direct name="wr_clk" input="mem_2Kx32.clk" output="mem_2Kx32_slice.WR_CLK"/>
+        <direct name="rd_clk" input="mem_2Kx32.clk" output="mem_2Kx32_slice.RD_CLK"/>
+        <direct name="addr"   input="mem_2Kx32.addr"    output="mem_2Kx32_slice.WR_ADDR"/>
+        <direct name="raddr"  input="mem_2Kx32.addr"    output="mem_2Kx32_slice.RD_ADDR"/>
+        <direct name="wdata"  input="mem_2Kx32.data_in" output="mem_2Kx32_slice.WR_DATA"/>
+        <direct name="we"     input="mem_2Kx32.we"      output="mem_2Kx32_slice.WR_EN[0:0]"/>
+        <direct name="rd_en"   input="mem_2Kx32.ctrl[0:0]" output="mem_2Kx32_slice.RD_EN"/>
+        <direct name="rd_arst" input="mem_2Kx32.ctrl[1:1]" output="mem_2Kx32_slice.RD_ARST"/>
+        <direct name="rd_srst" input="mem_2Kx32.ctrl[2:2]" output="mem_2Kx32_slice.RD_SRST"/>
+        <direct name="rdata"  input="mem_2Kx32_slice.RD_DATA" output="mem_2Kx32.data_out"/>
+      </interconnect>
+
+      <!-- fc 1.0/1.0: see the mult_27x18 fc note (ASSUMPTION E, revised). -->
+      <fc in_type="frac" in_val="1.0" out_type="frac" out_val="1.0"/>
+      <pinlocations pattern="spread"/>
+      <power method="ignore"/>
     </pb_type>
 
   </complexblocklist>
