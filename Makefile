@@ -36,8 +36,11 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
+# Heterogeneous-tile (Phase-1) inference-template deps — mem_t/dsp_t wrappers pull
+# in the eth_inf_* behavioral RAM/DSP (eth_config.svh attribute layer via -I).
+RTL_INF_DEPS := ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv
 RTL_FILES := $(RTL_FABRIC_DEPS)
 # Imported (not-yet-G1-clean) Mailbox RTL — linted separately, never fatal.
 MAILBOX_RTL := $(shell find ethereal-shell/rtl/mailbox ethereal-shell/rtl/interface -type f \( -name '*.sv' -o -name '*.v' \) 2>/dev/null)
@@ -69,7 +72,12 @@ else
 	@echo "[lint] clean modules (strict -Wall): $(RTL_CLEAN)"
 	@for f in $(RTL_CLEAN); do \
 	  m=$$(basename $$f .sv); \
-	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m $$f || exit 1; \
+	  case $$m in \
+	    mem_t|dsp_t) deps="$(RTL_INF_DEPS)" ;; \
+	    *)           deps="" ;; \
+	  esac; \
+	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m \
+	    -Iethereal-fabric/rtl/inf $$deps $$f || exit 1; \
 	done
 	@echo "[lint] fabric modules (-Wall -Wno-UNOPTFLAT; intended loops per C01 sec2.4): clb_t, fabric_top"
 	verilator --lint-only -Wall -Wno-UNOPTFLAT --top-module fabric_top -Mdir obj_dir/lint_fabric $(RTL_FABRIC_DEPS)
@@ -99,6 +107,7 @@ else
 	@echo "[test-sv] tb_occ";       $(IVERILOG) -g2012 -o /tmp/tb_occ ethereal-fabric/tests/occ/tb_occ.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_occ | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_blank";     $(IVERILOG) -g2012 -o /tmp/tb_blank ethereal-fabric/tests/occ/tb_blank.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/rtl/occ/occ_top.sv && vvp /tmp/tb_blank | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_hotswap";  $(IVERILOG) -g2012 -o /tmp/tb_hotswap ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/interconnect/tb_hotswap.sv 2>/dev/null && vvp /tmp/tb_hotswap | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_het_tiles"; $(IVERILOG) -g2012 -o /tmp/tb_het -Iethereal-fabric/rtl/inf ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/tests/tile/tb_het_tiles.sv && vvp /tmp/tb_het | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
