@@ -230,3 +230,59 @@ def test_bench_bittrue(bench: str):
         pytest.fail(f"{bench} FIRST mismatch vec {idx}: PO {net} sim={got} "
                     f"golden={want} ({n_ok}/{len(golden)} vectors clean)")
     assert mismatches == 0
+
+
+# =============================================================================
+# C02 heterogeneous benchmark metrics (Phase-1, Stage 6): AES -> MEM-T, FIR -> DSP-T
+# =============================================================================
+
+def _het_synth(bench_file: str, top: str):
+    """Run the heterogeneous synth (mem/macc inference) on a benchmark."""
+    import sys as _sys
+    if os.path.dirname(SYNTH) not in _sys.path:
+        _sys.path.insert(0, os.path.dirname(SYNTH))
+    from synth_ethereal import synth_ethereal as _se
+    out = os.path.join(MAPPER, f"{bench_file[:-2]}_het")
+    return _se(os.path.join(BENCH_DIR, bench_file), out, top=top, heterogeneous=True)
+
+
+def _hom_synth(bench_file: str, top: str):
+    """Run the homogeneous synth (all-LUT) on a benchmark."""
+    import sys as _sys
+    if os.path.dirname(SYNTH) not in _sys.path:
+        _sys.path.insert(0, os.path.dirname(SYNTH))
+    from synth_ethereal import synth_ethereal as _se
+    out = os.path.join(MAPPER, f"{bench_file[:-2]}_hom")
+    return _se(os.path.join(BENCH_DIR, bench_file), out, top=top, heterogeneous=False)
+
+
+def test_aes_sbox_mem_t_elut_drop():
+    """C02 §1.6 A1: AES S-box on MEM-T drops eLUT >= 5x vs the LUT-S-box version.
+
+    Homogeneous (LUT S-box) blows up to ~4779 eLUT; heterogeneous (MEM S-box)
+    collects the 16 S-box ROMs into $mem_v2 (mem_t) leaving ~290 eLUT glue.
+    """
+    hom = _hom_synth("aes128_round.v", "aes128_round")
+    het = _het_synth("aes128_round.v", "aes128_round")
+    print(f"\n[AES A1] homogeneous={hom['lut4_count']} eLUT, "
+          f"heterogeneous={het['lut4_count']} eLUT + {het['mem_count']} MEM-T "
+          f"-> drop {hom['lut4_count'] / max(het['lut4_count'], 1):.1f}x")
+    assert het["mem_count"] >= 16, f"AES must infer >=16 S-box $mem_v2, got {het['mem_count']}"
+    drop = hom["lut4_count"] / max(het["lut4_count"], 1)
+    assert drop >= 5.0, f"AES eLUT drop {drop:.1f}x < 5x (C02 §1.6 target)"
+
+
+def test_fir16_dsp_t_cascade():
+    """C02 §2.6 A2: FIR16 with real taps infers a 16x $macc_v2 (dsp_t) cascade.
+
+    The real-multiplier FIR16 (general coefficients) must infer a DSP cascade
+    (16x $macc_v2 -> 16 dsp_t) with ~0 eLUT datapath — the physical-DSP MAC
+    chain eliminates the eLUT adder-tree entirely (vs the 124-eLUT shift version).
+    """
+    het = _het_synth("fir16_dsp.v", "fir16_dsp")
+    print(f"\n[FIR A2] fir16_dsp = {het['lut4_count']} eLUT + {het['macc_count']} DSP-T")
+    assert het["macc_count"] >= 16, (
+        f"fir16_dsp must infer a 16x $macc_v2 cascade, got {het['macc_count']}")
+    # the datapath is essentially all DSP (glue eLUT is tiny relative to the cascade)
+    assert het["lut4_count"] <= het["macc_count"], (
+        f"fir16_dsp eLUT ({het['lut4_count']}) should be dominated by the DSP cascade")
