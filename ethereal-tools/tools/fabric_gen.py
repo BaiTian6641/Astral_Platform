@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 # allow `from frame_map import FrameMap` when run from this dir or via make test-model
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from frame_map import FrameMap  # noqa: E402
+from frame_map import FrameMap, TT_CLB, TT_MEM, TT_DSP  # noqa: E402
 
 DEFAULTS = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18, sel_w=5, n_regions=1)
 INT_KEYS = ("R", "C", "W", "N", "K", "EXT_IN", "sel_w", "n_regions")
@@ -54,6 +54,10 @@ class FabricGen:
     EXT_IN: int
     sel_w: int
     n_regions: int
+    MEM_AW: int = 11
+    # tile_types[col][row] -> "clb_t"|"mem_t"|"dsp_t" (heterogeneous, Phase-1).
+    # None = homogeneous all-CLB (v1). Per-column list of per-row type names.
+    tile_types: list[list[str]] | None = None
     fm: FrameMap = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
@@ -64,14 +68,30 @@ class FabricGen:
             setattr(self, k, v)
         if self.sel_w <= 0 or self.sel_w > 8:
             raise ValueError(f"sel_w out of range (1..8): {self.sel_w}")
+        # heterogeneous: tile_types -> TILE_LAYOUT (per-column type codes)
+        layout = None
+        if self.tile_types is not None:
+            name_to_code = {"clb_t": TT_CLB, "mem_t": TT_MEM, "dsp_t": TT_DSP}
+            if len(self.tile_types) != self.C:
+                raise ValueError(f"tile_types must have C={self.C} columns")
+            layout = []
+            for col_types in self.tile_types:
+                if len(col_types) != self.R:
+                    raise ValueError(f"each tile_types column must have R={self.R} rows")
+                layout.append([name_to_code[t] for t in col_types])
         self.fm = FrameMap(R=self.R, C=self.C, W=self.W, N=self.N, K=self.K,
                            EXT_IN=self.EXT_IN, sel_w=self.sel_w,
-                           n_regions=self.n_regions)
+                           n_regions=self.n_regions, MEM_AW=self.MEM_AW,
+                           TILE_LAYOUT=layout)
 
     # -- factories ----------------------------------------------------------
     @classmethod
     def from_descriptor(cls, d: dict) -> "FabricGen":
         kw = {k: int(d.get(k, DEFAULTS[k])) for k in INT_KEYS}
+        if "MEM_AW" in d:
+            kw["MEM_AW"] = int(d["MEM_AW"])
+        if "tile_types" in d:
+            kw["tile_types"] = d["tile_types"]   # [col][row] -> type name
         return cls(**kw)
 
     @classmethod
@@ -122,7 +142,7 @@ class FabricGen:
 
     def manifest(self) -> dict:
         """Fabric instantiation parameters + geometry (for fabric_top + reports)."""
-        return {
+        m = {
             "name": f"fabric_{self.R}x{self.C}_W{self.W}",
             "params": {k: int(getattr(self, k)) for k in INT_KEYS},
             "geometry": {
@@ -142,6 +162,24 @@ class FabricGen:
                 "note": "fabric_top is parameterized; pass these params (no bespoke RTL gen needed in v0).",
             },
         }
+        if self.tile_types is not None:
+            # TILE_TYPE flattened: idx = col*R + row? No — fabric_top uses idx=r*C+c
+            # (row-major). Emit the fabric_top TILE_TYPE packed value (8-bit entries,
+            # LSB-first, entry r*C+c) + per-column frame words + the type map.
+            code_of = {"clb_t": TT_CLB, "mem_t": TT_MEM, "dsp_t": TT_DSP}
+            tile_type_packed = 0
+            for r in range(self.R):
+                for c in range(self.C):
+                    tile_type_packed |= code_of[self.tile_types[c][r]] << ((r*self.C + c)*8)
+            m["heterogeneous"] = {
+                "tile_types": self.tile_types,            # [col][row] -> type name
+                "tile_type_packed": tile_type_packed,     # fabric_top TILE_TYPE param
+                "per_column_data_words": [self.fm.column_data_words(c) for c in range(self.C)],
+                "per_column_bits": [self.fm.column_bits_at(c) for c in range(self.C)],
+                "note": "heterogeneous tiles (C02): MEM_T/DSP_T config via cfg unit 2'b11.",
+            }
+            m["instantiation"]["params"]["TILE_TYPE"] = tile_type_packed
+        return m
 
     # -- artifact emission --------------------------------------------------
     def write_outputs(self, out_dir: str) -> dict:

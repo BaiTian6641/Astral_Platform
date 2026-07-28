@@ -103,5 +103,33 @@ def test_manifest_and_outputs(tmp_path):
 def test_invalid_descriptor_rejected():
     with pytest.raises(ValueError):
         FabricGen.from_descriptor({"R": 0})
+
+
+# ---- heterogeneous descriptor (Phase-1, Stage 4) ----------------------------
+
+def test_het_descriptor_tile_type_and_geometry(tmp_path):
+    fg = FabricGen.from_descriptor({
+        "R": 2, "C": 2,
+        "tile_types": [["mem_t", "clb_t"], ["dsp_t", "clb_t"]],
+    })
+    m = fg.manifest()
+    # TILE_TYPE packed: tile0=MEM(1)@idx0, tile1=DSP(2)@idx1, tile2/3=CLB(0)
+    assert m["heterogeneous"]["tile_type_packed"] == 0x201
+    assert m["instantiation"]["params"]["TILE_TYPE"] == 0x201
+    # per-column frame words vary (C03 §1 per-column length)
+    h = m["heterogeneous"]
+    assert h["per_column_data_words"] == [fm_w for fm_w in h["per_column_data_words"]]
+    # frame_map.json carries the heterogeneous layout
+    paths = fg.write_outputs(str(tmp_path))
+    j = json.load(open(paths["frame_map"]))
+    assert "heterogeneous" in j
+    assert j["heterogeneous"]["tile_type_codes"] == {"0": "clb_t", "1": "mem_t", "2": "dsp_t"}
+
+
+def test_het_reference_descriptor_loads():
+    path = os.path.join(HERE, "..", "..", "ethereal-spec", "fabric", "fabric_2x2_het.yaml")
+    fg = FabricGen.from_file(path)
+    m = fg.manifest()
+    assert m["heterogeneous"]["tile_type_packed"] == 0x201
     with pytest.raises(ValueError):
         FabricGen.from_descriptor({"sel_w": 16})

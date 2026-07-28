@@ -1,0 +1,14 @@
+# fabric_2x2_het.yaml — heterogeneous reference descriptor (Phase-1, Stage 4).
+# 2x2 fabric: tile0=MEM_T, tile1=DSP_T, tile2/3=CLB_T (matches tb_het_fabric.sv).
+# tile_types[col][row] -> type name; fabric_top TILE_TYPE idx = r*C+c (row-major).
+R: 2
+C: 2
+W: 12
+N: 8
+K: 4
+EXT_IN: 18
+tile_types:
+  # column 0 (col 0): row0=MEM_T, row1=CLB_T
+  - ["mem_t", "clb_t"]
+  # column 1 (col 1): row0=DSP_T, row1=CLB_T
+  - ["dsp_t", "clb_t"]

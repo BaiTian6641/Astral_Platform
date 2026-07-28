@@ -89,11 +89,55 @@ def cb_tile_type(W: int = 12, N_CB: int = 18) -> TileType:
 
 
 # ---------------------------------------------------------------------------
+# Heterogeneous tile-type logic blocks (Phase-1, Stage 4, C02 §1.3/§2.3).
+# A heterogeneous tile = base(CB + SB) + its logic tile. The LOGIC tile differs
+# by TILE_TYPE; the CB+SB interconnect is identical across all tile types.
+# ---------------------------------------------------------------------------
+def mem_tile_type(AW: int = 11) -> TileType:
+    """MEM_T logic tile config (C02 §1.3 frozen interface): mode word (16 bit)
+    + vbus-ctrl word A (va_i[13:0], ven_i[16], vwe_i[21:18] -> 22 bits)
+    + vd_i[31:0] (32 bits, write data). NOTE: mode_r is reset-less (persists,
+    Stage-2 review). The vd_i write port is also the ROM-init path (OCC rom.hex).
+    """
+    pts = (ConfigPoint("mem_mode", 16),
+           ConfigPoint("mem_vbus_ctrl", 22),
+           ConfigPoint("mem_vd_i", 32))
+    return TileType("mem_t", pts)
+
+
+def dsp_tile_type() -> TileType:
+    """DSP_T logic tile config (C02 §2.3 frozen interface): mode word (24 bit;
+    acc=mode[0], lat_sel=mode[2:1]) + va_i[26:0] (27) + vb_i[17:0] (18)
+    + ven_i (1) + vcasc_i[47:0] (48). (The LAT param of Stage 1+2 became the
+    runtime lat_sel in the review fix; here it is the mode word's [2:1].)
+    """
+    pts = (ConfigPoint("dsp_mode", 24),
+           ConfigPoint("dsp_va", 27),
+           ConfigPoint("dsp_vb", 18),
+           ConfigPoint("dsp_ven", 1),
+           ConfigPoint("dsp_vcasc", 48))
+    return TileType("dsp_t", pts)
+
+
+# TILE_TYPE codes (match fabric_top.sv TILE_TYPE map).
+TT_CLB, TT_MEM, TT_DSP = 0, 1, 2
+TT_NAMES = {TT_CLB: "clb_t", TT_MEM: "mem_t", TT_DSP: "dsp_t"}
+
+
+# ---------------------------------------------------------------------------
 # Frame map
 # ---------------------------------------------------------------------------
 @dataclass
 class FrameMap:
-    """Logical frame layout for an R x C fabric (v1: every tile = CLB + SB + CB)."""
+    """Logical frame layout for an R x C fabric.
+
+    Homogeneous default (v1): every tile = CLB + SB + CB (TILE_LAYOUT all-CLB).
+    Heterogeneous (Phase-1): ``TILE_LAYOUT`` maps each column to a per-row
+    sequence of TILE_TYPE codes; a tile = base(CB + SB) + that type's logic
+    block (CLB / MEM / DSP). Frame geometry is then PER-COLUMN (C03 §1: the
+    frame header carries a length field — the OCC's frame-write engine uses
+    :meth:`column_data_words` per column).
+    """
 
     R: int = 4
     C: int = 4
@@ -103,16 +147,49 @@ class FrameMap:
     EXT_IN: int = 18
     sel_w: int = 5
     n_regions: int = 1
+    MEM_AW: int = 11
+    # TILE_LAYOUT[col][row] -> TILE_TYPE code. None = all-CLB (homogeneous v1).
+    TILE_LAYOUT: list[list[int]] | None = None
     clb: TileType = field(init=False)
     sb: TileType = field(init=False)
     cblock: TileType = field(init=False)   # input connection_block (routable CB)
+    mem: TileType = field(init=False)      # mem_t logic tile (heterogeneous)
+    dsp: TileType = field(init=False)      # dsp_t logic tile (heterogeneous)
 
     def __post_init__(self) -> None:
         self.clb = clb_tile_type(self.N, self.K, self.sel_w)
         self.sb = sb_tile_type(self.W, self.N)            # N_INJ = N (clb_out count)
         self.cblock = cb_tile_type(self.W, self.EXT_IN)   # N_CB = EXT_IN
+        self.mem = mem_tile_type(self.MEM_AW)
+        self.dsp = dsp_tile_type()
+        if self.TILE_LAYOUT is not None:
+            if len(self.TILE_LAYOUT) != self.C or any(
+                    len(col) != self.R for col in self.TILE_LAYOUT):
+                raise ValueError(
+                    f"TILE_LAYOUT must be C x R = {self.C} x {self.R} columns")
 
-    # -- geometry -----------------------------------------------------------
+    # -- heterogeneous geometry --------------------------------------------
+    def tile_type_at(self, col: int, row: int) -> int:
+        """TILE_TYPE code for tile (col, row); all-CLB when TILE_LAYOUT is None."""
+        if self.TILE_LAYOUT is None:
+            return TT_CLB
+        return self.TILE_LAYOUT[col][row]
+
+    def tile_points_at(self, col: int, row: int) -> list[ConfigPoint]:
+        """Config points for tile (col, row): base(CB+SB) + its logic block."""
+        tt = self.tile_type_at(col, row)
+        logic = {TT_CLB: self.clb, TT_MEM: self.mem, TT_DSP: self.dsp}[tt]
+        return list(self.cblock.points) + list(self.sb.points) + list(logic.points)
+
+    def column_bits_at(self, col: int) -> int:
+        """Config bits for column ``col`` (sum over its rows)."""
+        return sum(p.width for row in range(self.R) for p in self.tile_points_at(col, row))
+
+    def column_data_words(self, col: int) -> int:
+        """32-bit DATA words for column ``col`` (C03 §1 per-column frame length)."""
+        return (self.column_bits_at(col) + WORD_W - 1) // WORD_W
+
+    # -- legacy homogeneous properties (kept for backward compat) ------------
     @property
     def tile_width(self) -> int:
         return self.clb.width + self.sb.width + self.cblock.width
@@ -189,14 +266,70 @@ class FrameMap:
         """Explicit safe config: every point = 0 (tt=0, mux sel=0=disconnect)."""
         return self.pack([{} for _ in range(self.R)])
 
+    # -- heterogeneous pack / unpack (layout-aware; homogeneous pack/unpack above
+    #    remains for the all-CLB default used by bitgen_pack) --------------------
+    def pack_column(self, col: int, col_config: list[dict]) -> list[int]:
+        """Pack column ``col`` (per-tile config by that column's TILE_LAYOUT).
+
+        col_config: list of R tile-configs; each a dict {point_name: value} for
+        the points of :meth:`tile_points_at` for that row's tile type. Returns
+        data words + CRC tail (per-column length = :meth:`column_data_words` + 1).
+        """
+        if len(col_config) != self.R:
+            raise ValueError(f"expected {self.R} tile configs, got {len(col_config)}")
+        bits: list[int] = []
+        for row, tcfg in enumerate(col_config):
+            for p in self.tile_points_at(col, row):
+                v = int(tcfg.get(p.name, 0))
+                if not 0 <= v < (1 << p.width):
+                    raise ValueError(f"{p.name} value {v} exceeds {p.width} bits")
+                for b in range(p.width):
+                    bits.append((v >> b) & 1)
+        while len(bits) % WORD_W:
+            bits.append(0)
+        words = [_pack_bits(bits[i:i + WORD_W]) for i in range(0, len(bits), WORD_W)]
+        words.append(crc16(words) & ((1 << CRC_W) - 1))
+        return words
+
+    def unpack_column(self, col: int, frame_words: list[int]) -> list[dict]:
+        """Inverse of :meth:`pack_column` for column ``col`` (CRC-verified)."""
+        if len(frame_words) != self.column_data_words(col) + 1:
+            raise ValueError(
+                f"column {col} frame must be {self.column_data_words(col)+1} words, "
+                f"got {len(frame_words)}")
+        data, tail = frame_words[:-1], frame_words[-1]
+        expected = crc16(data) & ((1 << CRC_W) - 1)
+        if expected != (tail & ((1 << CRC_W) - 1)):
+            raise ValueError(f"CRC mismatch: stored {tail & 0xFFFF:#06x} != computed {expected:#06x}")
+        bits: list[int] = []
+        for w in data:
+            for b in range(WORD_W):
+                bits.append((w >> b) & 1)
+        col_config: list[dict] = []
+        i = 0
+        for row in range(self.R):
+            tcfg: dict = {}
+            for p in self.tile_points_at(col, row):
+                v = 0
+                for b in range(p.width):
+                    v |= bits[i + b] << b
+                i += p.width
+                tcfg[p.name] = v
+            col_config.append(tcfg)
+        return col_config
+
+    def blank_column(self, col: int) -> list[int]:
+        """Explicit safe config (all-zero) for column ``col``."""
+        return self.pack_column(col, [{} for _ in range(self.R)])
+
     # -- JSON (single source of truth for bitgen + OCC + readback) ----------
     def to_json(self) -> dict:
         pts = self._tile_points()
-        return {
+        j = {
             "version": "0.1",
             "params": {"R": self.R, "C": self.C, "W": self.W, "N": self.N,
                        "K": self.K, "EXT_IN": self.EXT_IN, "sel_w": self.sel_w,
-                       "n_regions": self.n_regions},
+                       "n_regions": self.n_regions, "MEM_AW": self.MEM_AW},
             "tile_width_bits": self.tile_width,
             "column_bits": self.column_bits,
             "data_words_per_frame": self.data_words_per_frame,
@@ -205,6 +338,18 @@ class FrameMap:
             "frame_addr_format": {"region": "[11:8]", "col": "[7:0]"},
             "crc": {"algorithm": "CRC-16/CCITT-FALSE", "tail_word": True, "field": "[15:0]"},
         }
+        if self.TILE_LAYOUT is not None:
+            j["heterogeneous"] = {
+                "tile_type_codes": {str(k): v for k, v in TT_NAMES.items()},
+                "tile_layout": self.TILE_LAYOUT,   # [col][row] -> type code
+                "logic_points": {
+                    "clb_t": [{"name": p.name, "width": p.width} for p in self.clb.points],
+                    "mem_t": [{"name": p.name, "width": p.width} for p in self.mem.points],
+                    "dsp_t": [{"name": p.name, "width": p.width} for p in self.dsp.points],
+                },
+                "per_column_data_words": [self.column_data_words(c) for c in range(self.C)],
+            }
+        return j
 
     def to_json_str(self) -> str:
         return json.dumps(self.to_json(), indent=2)
