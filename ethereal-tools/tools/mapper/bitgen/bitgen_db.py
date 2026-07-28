@@ -101,12 +101,46 @@ class TileLogic:
 
 
 @dataclass
+class MaccCell:
+    """A placed DSP hard cell (``$macc_v2`` -> VPR ``mult_27x18`` tile).
+
+    Stage 5b (heterogeneous bitgen). The net lists are BIT-BLASTED (Yosys
+    expands wide buses into per-bit nets) and order-preserved: ``a_nets[i]`` is
+    operand-A bit ``i``. ``tile`` is the VPR grid (x, y) of the ``mult_27x18``
+    block from ``.place``.
+    """
+
+    a_nets: list[str] = field(default_factory=list)      # 27, bit0 first
+    b_nets: list[str] = field(default_factory=list)      # 18, bit0 first
+    y_nets: list[str] = field(default_factory=list)      # 48, bit0 first (leaf Y)
+    tile: tuple[int, int] = (0, 0)
+
+
+@dataclass
+class MemCell:
+    """A placed MEM hard cell (``$mem_v2`` -> VPR ``mem_2Kx32`` tile).
+
+    Stage 5b. Bit-blasted, order-preserved nets; ``tile`` = VPR (x, y) of the
+    ``mem_2Kx32`` block.
+    """
+
+    addr_nets: list[str] = field(default_factory=list)     # 11, bit0 first
+    data_in_nets: list[str] = field(default_factory=list)  # 32, bit0 first
+    we_net: str = ""                                       # 1 (write enable)
+    data_out_nets: list[str] = field(default_factory=list)  # 32, bit0 first
+    tile: tuple[int, int] = (0, 0)
+
+
+@dataclass
 class FabricConfigDB:
     """The LEVEL-1 fabric config DB: tiles keyed by VPR grid (x, y)."""
 
     tiles: dict[tuple[int, int], TileLogic] = field(default_factory=dict)
     primary_inputs: list[str] = field(default_factory=list)
     primary_outputs: list[str] = field(default_factory=list)
+    # Stage 5b: placed heterogeneous hard cells (DSP / MEM), keyed by tile coord.
+    macc_cells: dict[tuple[int, int], MaccCell] = field(default_factory=dict)
+    mem_cells: dict[tuple[int, int], MemCell] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -491,6 +525,68 @@ def _build_tile(clb: ET.Element,
     return tile
 
 
+# =============================================================================
+# Hard-cell (.net) parsing -> MaccCell / MemCell (Stage 5b, heterogeneous)
+# =============================================================================
+
+_RE_MULT = re.compile(r"mult_27x18\[\d+\]")
+_RE_MEM = re.compile(r"mem_2Kx32\[\d+\]")
+
+
+def _port_nets(block: ET.Element, port: str, direction: str) -> list[str]:
+    """Return the ordered net names of a ``<port name=port>`` in ``direction``.
+
+    ``direction`` is ``"inputs"`` or ``"outputs"``. Order is preserved
+    (``A[0]`` first -> bit 0). ``open`` tokens are dropped (a hard cell's
+    operand ports are always fully driven in the Stage-5b flows).
+    """
+    el = block.find(f"./{direction}/port[@name='{port}']")
+    if el is None or not el.text:
+        return []
+    return [tok for tok in el.text.split() if tok != "open"]
+
+
+def _parse_macc(block: ET.Element, tile: tuple[int, int]) -> MaccCell:
+    """Capture a ``mult_27x18`` block into a MaccCell.
+
+    The operand nets come from the nested ``mult_27x18_slice`` LEAF
+    (``<port name="A/B">`` inputs, ``<port name="Y">`` outputs) — the leaf lists
+    the actual routed nets (``A``/``B`` are the post-crossbar operands; ``Y``
+    lists the output nets ``m[0..47]``). Falls back to the top-level block ports
+    (``a``/``b``/``out``) if the slice is absent.
+    """
+    leaf = block.find(".//block[@instance='mult_27x18_slice[0]']")
+    # Operand nets: the TOP-LEVEL block ports (``a``/``b``) carry the true routed
+    # operand nets (a[0..26]/b[0..17]); the nested slice's ``A``/``B`` are VPR
+    # crossbar-internal names (``mult_27x18.a[0]->a2a``). The OUTPUT nets come
+    # from the slice leaf ``Y`` (the m[0..47] nets); the top-level ``out`` is the
+    # post-crossbar form. Prefer top-level a/b, leaf Y, with mutual fallbacks.
+    a = (_port_nets(block, "a", "inputs")
+         or (_port_nets(leaf, "A", "inputs") if leaf is not None else []))
+    b = (_port_nets(block, "b", "inputs")
+         or (_port_nets(leaf, "B", "inputs") if leaf is not None else []))
+    y = ((_port_nets(leaf, "Y", "outputs") if leaf is not None else [])
+         or _port_nets(block, "out", "outputs"))
+    return MaccCell(a_nets=a, b_nets=b, y_nets=y, tile=tile)
+
+
+def _parse_mem(block: ET.Element, tile: tuple[int, int]) -> MemCell:
+    """Capture a ``mem_2Kx32`` block into a MemCell (leaf slice preferred)."""
+    leaf = block.find(".//block[contains(@instance,'mem_2Kx32') and @instance!='"
+                    + block.get("instance", "") + "']")
+    src = leaf if leaf is not None else block
+    addr = (_port_nets(src, "addr", "inputs") or _port_nets(src, "ADDR", "inputs")
+            or _port_nets(src, "A", "inputs"))
+    din = (_port_nets(src, "data_in", "inputs") or _port_nets(src, "DIN", "inputs")
+           or _port_nets(src, "D", "inputs"))
+    we_l = (_port_nets(src, "we", "inputs") or _port_nets(src, "WE", "inputs")
+            or _port_nets(src, "we_i", "inputs"))
+    dout = (_port_nets(src, "data_out", "outputs")
+            or _port_nets(src, "DOUT", "outputs") or _port_nets(src, "Q", "outputs"))
+    return MemCell(addr_nets=addr, data_in_nets=din,
+                   we_net=(we_l[0] if we_l else ""), data_out_nets=dout, tile=tile)
+
+
 def build_db(net_path: str, place_path: str, blif_path: str) -> FabricConfigDB:
     """Parse (.net, .place, .blif) -> FabricConfigDB (LEVEL 1)."""
     names, primary_in, primary_out = parse_blif(blif_path)
@@ -500,11 +596,18 @@ def build_db(net_path: str, place_path: str, blif_path: str) -> FabricConfigDB:
     root = ET.parse(net_path).getroot()
     for clb in root:
         inst = clb.get("instance", "")
-        if not (inst.startswith("clb[") and clb.get("mode") == "default"):
-            continue
         cname = clb.get("name")
         pos = cluster_pos.get(cname) if cname is not None else None
-        if pos is None:
-            continue
-        db.tiles[pos] = _build_tile(clb, names)
+        if inst.startswith("clb[") and clb.get("mode") == "default":
+            if pos is None:
+                continue
+            db.tiles[pos] = _build_tile(clb, names)
+        elif _RE_MULT.fullmatch(inst):
+            # DSP hard cell ($macc_v2 -> mult_27x18). .place key = block name.
+            if pos is not None:
+                db.macc_cells[pos] = _parse_macc(clb, pos)
+        elif _RE_MEM.fullmatch(inst):
+            # MEM hard cell ($mem_v2 -> mem_2Kx32).
+            if pos is not None:
+                db.mem_cells[pos] = _parse_mem(clb, pos)
     return db
