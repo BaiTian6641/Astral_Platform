@@ -16,9 +16,7 @@
 // Notes:       mode word bitfield (frozen v1): mode_r[0]=acc (1=MAC/accumulate,
 //              0=MULT a*b+c), [2:1]=pipeline LAT (0..3) — passed to the MAC's LAT
 //              param only if regenerated; at runtime LAT is build-time. [23:3] reserved.
-module dsp_t #(
-    parameter int LAT = 3                // pipeline latency (build-time, C02 §2.3)
-) (
+module dsp_t (
     input  logic        clk_i,
     input  logic        rst_ni,         // synchronous reset (MAC: reset-to-0 only)
     input  logic        ven_i,          // virtual enable
@@ -29,31 +27,32 @@ module dsp_t #(
     input  logic        cfg_we_i,       // config write enable (1 cycle)
     input  logic [23:0] cfg_data_i      // mode word
 );
-    // ---- config mode register ----
+    // ---- config mode register (persists across user reset, C01 §1 convention) ----
     logic [23:0] mode_r;
     always_ff @(posedge clk_i) begin
-        if (!rst_ni) begin
-            mode_r <= '0;               // reset to MULT (acc=0), no set
-        end else if (cfg_we_i) begin
+        if (cfg_we_i) begin
             mode_r <= cfg_data_i;
         end
     end
 
     // ---- behavioral MAC (eth_inf_dsp_mac: EDA-inferred DSP) ----
-    eth_inf_dsp_mac #(.AW(27), .BW(18), .LAT(LAT)) u_mac (
-        .clk_i  (clk_i),
-        .rst_ni (rst_ni),
-        .en_i   (ven_i),
-        .a_i    (va_i),
-        .b_i    (vb_i),
-        .c_i    (vcasc_i),
-        .acc_i  (mode_r[0]),
-        .p_o    (vp_o)
+    // acc_i = mode_r[0] (1=MAC/accumulate, 0=MULT); lat_sel_i = mode_r[2:1]
+    // (runtime pipeline latency 0/1/2/3, image-selectable, C02 §2.3).
+    eth_inf_dsp_mac #(.AW(27), .BW(18)) u_mac (
+        .clk_i     (clk_i),
+        .rst_ni    (rst_ni),
+        .en_i      (ven_i),
+        .a_i       (va_i),
+        .b_i       (vb_i),
+        .c_i       (vcasc_i),
+        .acc_i     (mode_r[0]),
+        .lat_sel_i (mode_r[2:1]),
+        .p_o       (vp_o)
     );
 
-    // mode_r[23:1] reserved in v1; sink the unused upper bits.
+    // mode_r[23:3] reserved in v1; sink the unused upper bits.
     logic _unused_ok;
-    assign _unused_ok = ^{mode_r[23:1]};
+    assign _unused_ok = ^{mode_r[23:3]};
 endmodule
 
 `default_nettype wire

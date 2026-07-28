@@ -6,17 +6,21 @@
 //              EDA (GowinSynthesis / Vivado / Yosys) INFERS this as a physical
 //              DSP block (27x18 target). Fully Verilator-simulatable.
 //              Coding red-lines honored (C13 §2.1): SIGNED operands; operand
-//              widths <= 27x18 (single DSP); sufficient pipelining (LAT);
-//              synchronous reset, RESET VALUE ONLY 0 (a set/async reset BLOCKS
-//              DSP inference, UG949); no async reset anywhere.
+//              widths <= 27x18 (single DSP); sufficient pipelining (always 3
+//              stages built — required for DSP inference); synchronous reset,
+//              RESET VALUE ONLY 0 (a set/async reset BLOCKS DSP inference,
+//              UG949); no async reset anywhere.
+//              The full 3-stage pipeline is ALWAYS built (good DSP inference);
+//              `lat_sel_i` taps the OUTPUT at stage 0/1/2/3 (runtime latency,
+//              C02 §2.3 — frequency-vs-latency is image-selectable).
 // Maintainer:  BaiTian6641
 // Created:     2026-07-28
+// Modified:    2026-07-28 - runtime-latency output tap (was build-time LAT param)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C13-跨平台推断策略.md §2.1 · C02 §2
 module eth_inf_dsp_mac #(
-    parameter int AW  = 27,    // operand A width (<=27 for one DSP)
-    parameter int BW  = 18,    // operand B width (<=18 for one DSP)
-    parameter int LAT = 3      // pipeline latency (input-reg -> mult -> out)
+    parameter int AW = 27,     // operand A width (<=27 for one DSP)
+    parameter int BW = 18      // operand B width (<=18 for one DSP)
 ) (
     input  logic              clk_i,
     input  logic              rst_ni,     // synchronous reset (reset value = 0 ONLY)
@@ -25,11 +29,12 @@ module eth_inf_dsp_mac #(
     input  logic signed [BW-1:0] b_i,
     input  logic signed [47:0]   c_i,     // addend / cascade-in
     input  logic                 acc_i,   // 1 = accumulate (p += a*b); 0 = a*b + c
+    input  logic [1:0]           lat_sel_i, // output latency tap: 0/1/2/3 stages
     output logic signed [47:0]   p_o
 );
 `include "eth_config.svh"
     `ETH_DSPSTYLE
-    // Stage 1: input registers (synchronous reset to 0; enable).
+    // Stage 1: input registers (sync reset to 0; enable).
     logic signed [AW-1:0] a_r;
     logic signed [BW-1:0] b_r;
     logic signed [47:0]   c_r;
@@ -42,42 +47,45 @@ module eth_inf_dsp_mac #(
         end
     end
 
-    // Stage 2: multiply (registered). signed * signed -> signed (2x width, fits 48).
-    // Skipped entirely when LAT < 2 (combinational a_r*b_r feeds stage 3).
-    logic signed [47:0] mult_s;          // product into stage 3
-    logic signed [47:0] c_s;             // c into stage 3
-    logic               acc_s;           // acc into stage 3
-    if (LAT >= 2) begin : g_mult_reg
-        logic signed [47:0] mult_r;
-        logic signed [47:0] c_r2;
-        logic               acc_r2;
-        always_ff @(posedge clk_i) begin
-            if (!rst_ni) begin
-                mult_r <= '0; c_r2 <= '0; acc_r2 <= 1'b0;
-            end else if (en_i) begin
-                mult_r <= a_r * b_r;      // DSP multiplier inference point
-                c_r2   <= c_r;
-                acc_r2 <= acc_r;
-            end
+    // Stage 2: multiply (registered). signed*signed -> signed (fits 48). DSP inference point.
+    logic signed [47:0] mult_r;
+    logic signed [47:0] c_r2;
+    logic               acc_r2;
+    always_ff @(posedge clk_i) begin
+        if (!rst_ni) begin
+            mult_r <= '0; c_r2 <= '0; acc_r2 <= 1'b0;
+        end else if (en_i) begin
+            mult_r <= a_r * b_r;
+            c_r2   <= c_r;
+            acc_r2 <= acc_r;
         end
-        assign mult_s = mult_r; assign c_s = c_r2; assign acc_s = acc_r2;
-    end else begin : g_mult_comb
-        assign mult_s = a_r * b_r; assign c_s = c_r; assign acc_s = acc_r;
     end
 
-    // Stage 3: accumulate / add (registered when LAT >= 3; else combinational).
-    if (LAT >= 3) begin : g_out_reg
-        logic signed [47:0] p_r;
-        always_ff @(posedge clk_i) begin
-            if (!rst_ni) begin
-                p_r <= '0;
-            end else if (en_i) begin
-                p_r <= acc_s ? (p_r + mult_s) : (mult_s + c_s);  // DSP accumulator/add
-            end
+    // Stage 3: accumulate / add (registered, reset-to-0 only). DSP accumulator/add.
+    logic signed [47:0] p_r;
+    always_ff @(posedge clk_i) begin
+        if (!rst_ni) begin
+            p_r <= '0;
+        end else if (en_i) begin
+            p_r <= acc_r2 ? (p_r + mult_r) : (mult_r + c_r2);
         end
-        assign p_o = p_r;
-    end else begin : g_out_comb
-        assign p_o = acc_s ? (mult_s + c_s) : (mult_s + c_s);
+    end
+
+    // Output latency tap (runtime, C02 §2.3). Only lat_sel=3 (p_r) accumulates
+    // (p_r is the accumulator register); lat 0/1/2 are non-accumulating views:
+    //   0 -> combinational a*b + c (bypass); 1 -> mult-stage product; 2/3 -> p_r.
+    logic signed [47:0] p0, p1, p2, p3;
+    assign p0 = a_i * b_i + c_i;   // bypass (non-registered)
+    assign p1 = mult_r + c_r2;     // mult-stage (acc ignored)
+    assign p2 = p_r;               // out-stage
+    assign p3 = p_r;               // out-stage (full LAT 3)
+    always_comb begin
+        case (lat_sel_i)
+            2'd0:    p_o = p0;
+            2'd1:    p_o = p1;
+            2'd2:    p_o = p2;
+            default: p_o = p3;
+        endcase
     end
 endmodule
 

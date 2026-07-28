@@ -38,7 +38,7 @@ module tb_het_tiles;
     logic signed [47:0] dsp_vcasc, dsp_vp;
     logic        dsp_cfg_we;
     logic [23:0] dsp_cfg_data;
-    dsp_t #(.LAT(3)) u_dsp (
+    dsp_t u_dsp (
         .clk_i(clk), .rst_ni(rst_ni), .ven_i(dsp_ven),
         .va_i(dsp_va), .vb_i(dsp_vb), .vcasc_i(dsp_vcasc), .vp_o(dsp_vp),
         .cfg_we_i(dsp_cfg_we), .cfg_data_i(dsp_cfg_data)
@@ -115,17 +115,16 @@ module tb_het_tiles;
         if (rd !== 32'hDEADBEAA) begin errors=errors+1; $display("FAIL mem byte-en got %0h (want DEADBEAA)", rd); end
         else $display("  mem_t: write/read/byte-enable OK");
 
-        // ============ dsp_t: MULT at LAT=3 (acc=0) ============
-        dsp_cfg(24'h000000);                // mode: MULT (acc=0)
+        // ============ dsp_t: MULT at lat_sel=2 (mult-stage, acc=0) ============
+        dsp_cfg(24'h000004);                // mode: MULT (acc=0), lat_sel=2 (mult-stage)
         dsp_drive(27'sd7, 18'sd6, 48'sd0);  // 7*6 = 42 (inputs held until next drive)
-        dsp_advance(2);                     // LAT=3: input-reg + mult -> result in 2 cycles
+        dsp_advance(2);                     // input-reg + mult -> mult-stage result in 2 cycles
         if (dsp_vp !== 48'sd42) begin errors=errors+1; $display("FAIL dsp mult got %0d (want 42)", dsp_vp); end
-        else $display("  dsp_t: MULT 7*6=42 OK");
+        else $display("  dsp_t: MULT 7*6=42 (lat_sel=2) OK");
 
-        // ============ dsp_t: MAC accumulate (acc=1): p += a*b, 3 terms ============
-        // Drive acc directly via the u_dsp mode register's MAC input (avoids the
-        // config-write race; eth_inf_dsp_mac's accumulate path is what's tested).
-        force u_dsp.mode_r = 24'h000001;
+        // ============ dsp_t: MAC accumulate (acc=1, lat_sel=3): p += a*b, 3 terms ============
+        dsp_cfg(24'h000007);                // mode: MAC (acc=1), lat_sel=3 (out-stage) — persists across reset
+        // reset MAC accumulator (mode_r survives rst_ni per the fabric convention)
         @(negedge clk); rst_ni = 1'b0; @(negedge clk); rst_ni = 1'b1;
         dsp_drive(27'sd1, 18'sd1, 48'sd0);  // +1*1
         dsp_drive(27'sd2, 18'sd2, 48'sd0);  // +2*2
@@ -133,8 +132,14 @@ module tb_het_tiles;
         dsp_advance(2);                     // flush pipeline so the 3rd term lands
         // 1+4+9 = 14 (accumulated across the 3 drives after the reset)
         if (dsp_vp !== 48'sd14) begin errors=errors+1; $display("FAIL dsp mac got %0d (want 14)", dsp_vp); end
-        else $display("  dsp_t: MAC 1+4+9=14 OK");
-        release u_dsp.mode_r;
+        else $display("  dsp_t: MAC 1+4+9=14 (lat_sel=3, config persists across reset) OK");
+
+        // ============ dsp_t: runtime-latency tap (lat_sel=0 bypass) ============
+        dsp_cfg(24'h000000);                // mode: MULT, lat_sel=0 (combinational bypass)
+        dsp_drive(27'sd5, 18'sd5, 48'sd0);  // 5*5 = 25
+        @(negedge clk);                      // combinational: result available immediately
+        if (dsp_vp !== 48'sd25) begin errors=errors+1; $display("FAIL dsp lat0 got %0d (want 25)", dsp_vp); end
+        else $display("  dsp_t: runtime lat_sel=0 bypass 5*5=25 OK");
 
         // ============ verdict ============
         if (errors == 0) $display("TEST PASSED: mem_t RAM + dsp_t MAC functional");
