@@ -12,11 +12,16 @@
 //              registers are written via cfg unit 2'b11 (intra selects the
 //              register). The wide tile vbus (mem va/vd/vwe, dsp va/vb/vcasc) is
 //              driven by per-tile vbus-control registers (cfg-written); tile
-//              outputs (mem vd_o, dsp vp_o) are observed on vbus_obs_o. v1
-//              vbus: not yet woven into the virtual routing (that is the
-//              mapping-chain stage, Stage 4-5, when Yosys/VPR target the tiles);
-//              the integration here proves the heterogeneous tiles sit + are
-//              OCC-configurable in the real fabric.
+//              outputs (mem vd_o, dsp vp_o) are observed on vbus_obs_o. vbus->routing
+//              (Stage 5b+, 2026-07-29): the hard-block wide datapath is now woven
+//              into the virtual routing via two config-selected muxes — vbus-OUT
+//              (cfg unit 11 intra 6: hard-block output low N bits OR CLB output
+//              drive the SB inject) and vbus-IN (cfg unit 11 intra 7: CB-selected
+//              clb_in_local low N bits OR vbus-ctrl registers drive the operands).
+//              BANDWIDTH LIMIT: at W=12 only N=8 operand/inject bits flow per
+//              direction per cycle; full-width (32-bit mem / 48-bit dsp) needs W>=48
+//              (matches the VPR W=48 routing reality, Stage 5a). The homogeneous
+//              all-CLB path is unchanged (vbus muxes inert on pure-CLB tiles).
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB3)
@@ -24,6 +29,9 @@
 //              2026-07-26 - bidirectional inject + Wilton SB (v1.1)
 //              2026-07-28 - HETEROGENEOUS: TILE_TYPE map + mem_t/dsp_t + cfg
 //                            unit 11 + per-tile vbus control regs (Stage 3, P1).
+//              2026-07-29 - vbus->routing integration (Stage 5b+): vbus-OUT mux
+//                            (hard-block output -> SB inject) + vbus-IN mux (CB
+//                            tracks -> operand inputs) via cfg unit 11 intra 6/7.
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3 §5 ·
 //              ethereal-plan/components/C02-fabric-异构tile.md §0 §5
@@ -40,7 +48,14 @@
 //     DSP_T (TILE_TYPE=2): intra=0 -> dsp mode_r[23:0] (acc/lat_sel);
 //         intra=1 -> va_i[26:0]; intra=2 -> vb_i[17:0]; intra=3 -> ven_i @ [0];
 //         intra=4/5 -> vcasc_i[47:16] / vcasc_i[15:0].
-//   CLB (TILE_TYPE=0): TILE-MODE is a no-op.
+//     MEM_T + DSP_T (vbus->routing, Stage 5b+):
+//         intra=6 -> vbus-out select @ [0] (0=CLB drives SB inject [default],
+//                   1=hard-block output low N bits drive SB inject);
+//         intra=7 -> vbus-in select  @ [0] (0=vbus-ctrl regs drive operands
+//                   [default], 1=CB-selected clb_in_local low N bits drive the
+//                   operand low bits; upper bits stay from the register).
+//         Bandwidth limit: W=12 -> N=8 bits/direction; full-width needs W>=48.
+//   CLB (TILE_TYPE=0): TILE-MODE is a no-op (vbus muxes inert = v1.1 behaviour).
 module fabric_top #(
     parameter int R = 4,
     parameter int C = 4,
@@ -136,6 +151,11 @@ module fabric_top #(
                 // ---- per-tile CLB I/O ----
                 logic [N-1:0]      clb_out_local;
                 logic [EXT_IN-1:0] clb_in_local;
+                // vbus-out mux output -> SB clb_out_i inject source. For pure-CLB
+                // tiles this is just clb_out_local (unchanged v1.1 behaviour); for
+                // MEM/DSP tiles it can select the hard-block output low N bits
+                // (cfg unit 11 intra 6) so the wide datapath reaches the routing.
+                logic [N-1:0]      clb_out_for_sb;
 
                 // ---- heterogeneous tile (by MY_TYPE): vbus control regs + instance ----
                 // Declared only for heterogeneous tiles so pure-CLB tiles carry no
@@ -143,11 +163,18 @@ module fabric_top #(
                 logic [31:0] mem_vd_o_local;
                 logic [47:0] dsp_vp_o_local;
                 if (MY_TYPE == 8'd1) begin : g_mem_t
-                    // ---- MEM_T: vbus control regs (unit 11, intra 1/2) + tile ----
+                    // ---- MEM_T: vbus control regs (unit 11, intra 1/2/6/7) + tile ----
+                    //   intra 6 = vbus-out source select (bit0: 0=CLB, 1=mem vd_o low N
+                    //              bits drive the SB inject; bandwidth-limited, Notes).
+                    //   intra 7 = vbus-in operand select  (bit0: 0=vbus-ctrl regs
+                    //              [current], 1=CB-selected clb_in_local low N bits
+                    //              drive va_i/vd_i low bits; upper bits stay from reg).
                     logic        mem_ven_r;
                     logic [13:0] mem_va_r;
                     logic [31:0] mem_vd_i_r;
                     logic [3:0]  mem_vwe_r;
+                    logic        vbus_out_sel_r;   // 0=CLB inject, 1=mem vd_o inject
+                    logic        vbus_in_sel_r;    // 0=regs, 1=clb_in_local->operands
                     always_ff @(posedge clk_i) begin
                         if (tmode_cfg_we) begin
                             if (intra == 6'd1) begin
@@ -156,27 +183,48 @@ module fabric_top #(
                                 mem_vwe_r <= cfg_data_i[21:18];
                             end else if (intra == 6'd2) begin
                                 mem_vd_i_r <= cfg_data_i;
+                            end else if (intra == 6'd6) begin
+                                vbus_out_sel_r <= cfg_data_i[0];
+                            end else if (intra == 6'd7) begin
+                                vbus_in_sel_r  <= cfg_data_i[0];
                             end
                         end
                     end
+                    // vbus-IN mux: routing (clb_in_local low N bits) vs vbus-ctrl
+                    //   regs. Bandwidth-limited (W=12 -> N=8 operand bits/cycle from
+                    //   routing); va_i[13:8] / vd_i[31:8] stay from the register (host
+                    //   sets upper bits). ven/vwe always from the register (control).
+                    logic [13:0] mem_va_eff;
+                    logic [31:0] mem_vd_eff;
+                    assign mem_va_eff = vbus_in_sel_r ? {mem_va_r[13:8],  clb_in_local[N-1:0]} : mem_va_r;
+                    assign mem_vd_eff = vbus_in_sel_r ? {mem_vd_i_r[31:8], clb_in_local[N-1:0]} : mem_vd_i_r;
                     mem_t #(.AW(MEM_AW)) u_mem_t (
                         .clk_i      (clk_i),
                         .rst_ni     (rst_ni),
                         .ven_i      (mem_ven_r),
-                        .va_i       (mem_va_r),
-                        .vd_i       (mem_vd_i_r),
+                        .va_i       (mem_va_eff),
+                        .vd_i       (mem_vd_eff),
                         .vwe_i      (mem_vwe_r),
                         .vd_o       (mem_vd_o_local),
                         .cfg_we_i   (tmode_cfg_we && (intra == 6'd0)),
                         .cfg_data_i (cfg_data_i[15:0])
                     );
+                    // vbus-OUT mux: hard-block low N bits vs CLB output -> SB inject.
+                    assign clb_out_for_sb = vbus_out_sel_r ? mem_vd_o_local[N-1:0] : clb_out_local;
                     assign dsp_vp_o_local = '0;
                 end else if (MY_TYPE == 8'd2) begin : g_dsp_t
-                    // ---- DSP_T: vbus control regs (unit 11, intra 1..5) + tile ----
+                    // ---- DSP_T: vbus control regs (unit 11, intra 1..5/6/7) + tile ----
+                    //   intra 6 = vbus-out source select (bit0: 0=CLB, 1=dsp vp_o low N
+                    //              bits drive the SB inject; bandwidth-limited, Notes).
+                    //   intra 7 = vbus-in operand select  (bit0: 0=vbus-ctrl regs
+                    //              [current], 1=CB-selected clb_in_local low N bits
+                    //              drive va_i/vb_i low bits; upper bits + vcasc stay).
                     logic        dsp_ven_r;
                     logic signed [26:0] dsp_va_r;
                     logic signed [17:0] dsp_vb_r;
                     logic signed [47:0] dsp_vcasc_r;
+                    logic        vbus_out_sel_r;   // 0=CLB inject, 1=dsp vp_o inject
+                    logic        vbus_in_sel_r;    // 0=regs, 1=clb_in_local->operands
                     always_ff @(posedge clk_i) begin
                         if (tmode_cfg_we) begin
                             if (intra == 6'd1)      dsp_va_r    <= cfg_data_i[26:0];
@@ -184,26 +232,40 @@ module fabric_top #(
                             else if (intra == 6'd3) dsp_ven_r   <= cfg_data_i[0];
                             else if (intra == 6'd4) dsp_vcasc_r[47:16] <= cfg_data_i[31:0];
                             else if (intra == 6'd5) dsp_vcasc_r[15:0]  <= cfg_data_i[15:0];
+                            else if (intra == 6'd6) vbus_out_sel_r <= cfg_data_i[0];
+                            else if (intra == 6'd7) vbus_in_sel_r  <= cfg_data_i[0];
                         end
                     end
+                    // vbus-IN mux: routing (clb_in_local low N bits) vs vbus-ctrl
+                    //   regs. Bandwidth-limited (W=12 -> N=8 operand bits/cycle from
+                    //   routing); va_i[26:8] / vb_i[17:8] stay from the register (host
+                    //   sets upper + sign bits). ven/vcasc always from the register.
+                    logic [26:0] dsp_va_eff;
+                    logic [17:0] dsp_vb_eff;
+                    assign dsp_va_eff = vbus_in_sel_r ? {dsp_va_r[26:8], clb_in_local[N-1:0]} : dsp_va_r;
+                    assign dsp_vb_eff = vbus_in_sel_r ? {dsp_vb_r[17:8], clb_in_local[N-1:0]} : dsp_vb_r;
                     dsp_t u_dsp_t (
                         .clk_i      (clk_i),
                         .rst_ni     (rst_ni),
                         .ven_i      (dsp_ven_r),
-                        .va_i       (dsp_va_r),
-                        .vb_i       (dsp_vb_r),
+                        .va_i       (dsp_va_eff),
+                        .vb_i       (dsp_vb_eff),
                         .vcasc_i    (dsp_vcasc_r),
                         .vp_o       (dsp_vp_o_local),
                         .cfg_we_i   (tmode_cfg_we && (intra == 6'd0)),
                         .cfg_data_i (cfg_data_i[23:0])
                     );
+                    // vbus-OUT mux: hard-block low N bits vs CLB output -> SB inject.
+                    assign clb_out_for_sb = vbus_out_sel_r ? dsp_vp_o_local[N-1:0] : clb_out_local;
                     assign mem_vd_o_local = '0;
                 end else begin : g_no_het
                     // pure-CLB tile: no het instance; tmode (unit 11) writes are a
                     // no-op. Drive the obs outputs from the (unused) tmode decode so
-                    // it is not flagged as an undriven/unused signal.
+                    // it is not flagged as an undriven/unused signal. vbus muxes are
+                    // inert (CLB output drives the SB inject directly = v1.1).
                     assign mem_vd_o_local = {31'b0, tmode_cfg_we & 1'b0};
                     assign dsp_vp_o_local = 48'b0;
+                    assign clb_out_for_sb = clb_out_local;
                 end
 
                 // ---- switch box ----
@@ -216,7 +278,7 @@ module fabric_top #(
                     .in_s       (sb_in_s[r][c]),
                     .in_e       (sb_in_e[r][c]),
                     .in_w       (sb_in_w[r][c]),
-                    .clb_out_i  (clb_out_local),
+                    .clb_out_i  (clb_out_for_sb),
                     .out_n      (sb_out_n[r][c]),
                     .out_s      (sb_out_s[r][c]),
                     .out_e      (sb_out_e[r][c]),

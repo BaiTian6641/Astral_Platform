@@ -58,6 +58,16 @@ module tb_het_fabric;
         rst_ni = 1'b1; cfg_we = 1'b0; cfg_addr = '0; cfg_data = '0;
         @(negedge clk); rst_ni = 1'b0; @(negedge clk); @(negedge clk); rst_ni = 1'b1;
 
+        // ---- vbus->routing mux defaults (cfg unit 11 intra 6/7 = 0): CLB drives
+        //      the SB inject + vbus-ctrl registers drive operands. The vbus select
+        //      regs are reset-free (like SB/CB sel_r; OCC configures before run),
+        //      so this TB — which stands in for the OCC — writes them explicitly.
+        //      tile0=MEM_T, tile1=DSP_T.
+        cw(0, 2'b11, 6, 32'h0);   // MEM vbus_out_sel = 0 (CLB inject)
+        cw(0, 2'b11, 7, 32'h0);   // MEM vbus_in_sel  = 0 (register operands)
+        cw(1, 2'b11, 6, 32'h0);   // DSP vbus_out_sel = 0 (CLB inject)
+        cw(1, 2'b11, 7, 32'h0);   // DSP vbus_in_sel  = 0 (register operands)
+
         // ================================================================
         // MEM_T @ tile0 (unit 11): write RAM @5 = 0xCAFEBABE, then read back
         // vbus-ctrl word A: va_i[13:0] @ [13:0], ven_i @ [16], vwe_i[3:0] @ [21:18]
