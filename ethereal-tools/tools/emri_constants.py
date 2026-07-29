@@ -63,6 +63,17 @@ OCC_S_ERROR = 3
 OCC_S_LOCKED = 4
 OCC_S_NEEDS_BLANK = 5
 
+# ---- OCC_STATUS register bit layout (spec sec 4) ----
+# [2:0] live status, [3] sticky done_flag, [5:4] sticky done_code,
+# [16] sticky crc_error.
+OCC_STATUS_DONE_FLAG = 3  # bit index of the sticky completion flag
+OCC_STATUS_DONE_CODE_LO = 4  # done_code occupies [5:4]
+# done_code values (valid when done_flag=1):
+OCC_DONE_DONE = 0
+OCC_DONE_ERROR = 1
+OCC_DONE_NEEDS_BLANK = 2
+OCC_DONE_LOCKED = 3
+
 # ---- EFP-SPI operation opcodes (spec sec 7) ----
 SPI_OP_RD = 0
 SPI_OP_WR = 1

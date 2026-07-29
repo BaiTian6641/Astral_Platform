@@ -199,21 +199,56 @@ module emri_regfile #(
   end
 
   // ------------------------------------------------------------------
-  // OCC_STATUS read assembly (spec §4)
-  //   {status[6:0], region_id[11:8], crc_error[16], frame_addr[31:16]}
+  // OCC sticky completion (HOST-POLLABLE). occ_top emits S_DONE/S_ERROR/
+  // S_NEEDS_BLANK/S_LOCKED for exactly ONE cycle — unobservable by a host
+  // that polls over SPI (ms-scale). The regfile latches the completion into
+  // sticky bits cleared on the next OCC_CMD.start write, so ethctl can poll.
+  //   occ_done_flag_r : 1 = a completion occurred since the last cmd start
+  //   occ_done_code_r : 0=DONE 1=ERROR 2=NEEDS_BLANK 3=LOCKED (valid when flag=1)
+  // Exposed in OCC_STATUS[3] (flag) and [5:4] (code) — spec §4 reserved bits.
+  // ------------------------------------------------------------------
+  logic        occ_done_flag_r;
+  logic [1:0]  occ_done_code_r;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      occ_done_flag_r <= 1'b0;
+      occ_done_code_r <= 2'd0;
+    end else begin
+      // a new command start clears any prior completion (fresh cycle)
+      if (addr_is_occ_cmd_start && !occ_start_r) begin
+        occ_done_flag_r <= 1'b0;
+        occ_done_code_r <= 2'd0;
+      end else begin
+        unique case (occ_status_i)
+          OCC_S_DONE:        begin occ_done_flag_r <= 1'b1; occ_done_code_r <= 2'd0; end
+          OCC_S_ERROR:       begin occ_done_flag_r <= 1'b1; occ_done_code_r <= 2'd1; end
+          OCC_S_NEEDS_BLANK: begin occ_done_flag_r <= 1'b1; occ_done_code_r <= 2'd2; end
+          OCC_S_LOCKED:      begin occ_done_flag_r <= 1'b1; occ_done_code_r <= 2'd3; end
+          default: ; // IDLE/BUSY: hold
+        endcase
+      end
+    end
+  end
+
+  // ------------------------------------------------------------------
+  // OCC_STATUS read assembly (spec §4):
+  //   [2:0]  live occ_status_i (IDLE/BUSY/DONE-pulse/...)
+  //   [3]    occ_done_flag_r   (sticky completion pending — host polls THIS)
+  //   [5:4]  occ_done_code_r   (0=DONE 1=ERROR 2=NEEDS_BLANK 3=LOCKED)
+  //   [11:8] region_id (v0: 0)
+  //   [16]   occ_crc_error_i (sticky from occ_top)
+  //   [31:17] frame_addr echo
   // ------------------------------------------------------------------
   logic [31:0] occ_status_w;
   always_comb begin
     occ_status_w = 32'h0;
     occ_status_w[2:0]  = occ_status_i;
-    occ_status_w[11:8] = {4'h0};               // region_id not tracked separately in v0
+    occ_status_w[3]    = occ_done_flag_r;
+    occ_status_w[5:4]  = occ_done_code_r;
+    occ_status_w[11:8] = 4'h0;
     occ_status_w[16]   = occ_crc_error_i;
-    occ_status_w[31:16]= occ_frame_addr_r;      // includes crc_error@16 overlap; spec
-                                                // places crc_error@16 — keep status_i
-                                                // low bits authoritative, frame echo high.
+    occ_status_w[31:17]= occ_frame_addr_r[14:0];
   end
-  // (spec §4 has crc_error@16 and frame_addr@31:16 mutually exclusive at bit16;
-  //  v0 prefers crc_error@16 and frame_addr at [31:17]; documented in report.)
 
   // ------------------------------------------------------------------
   // Read mux (combinational, with default)

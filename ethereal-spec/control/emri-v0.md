@@ -113,10 +113,17 @@ The OCC command trigger. **Bit layout:**
 
 | Bits | Field | Meaning |
 |---|---|---|
-| `[6:0]` | `status` | `{status_o[2:0], reserved[6:3]}`. `0=IDLE,1=BUSY,2=DONE,3=ERROR,4=LOCKED,5=NEEDS_BLANK`. |
+| `[2:0]` | `status` | **Live** `status_o` from `occ_top` (`0=IDLE,1=BUSY,2=DONE,3=ERROR,4=LOCKED,5=NEEDS_BLANK`). `DONE`/`ERROR`/etc. pulse for **one cycle** — unobservable by a host polling over SPI; use `[3]`/`[5:4]` instead. |
+| `[3]` | `done_flag` | **Sticky** completion pending (host polls THIS). Latched when `occ_top` reaches any terminal state; cleared on the next `OCC_CMD.start` write. |
+| `[5:4]` | `done_code` | Completion code, valid when `[3]=1`: `0=DONE, 1=ERROR, 2=NEEDS_BLANK, 3=LOCKED`. |
 | `[11:8]` | `region_id` | Current OCC region. |
 | `[16]` | `crc_error` | Sticky; mirrors `occ_top.crc_error_o`. Cleared on next accepted `OCC_CMD`. |
-| `[31:16]` | `frame_addr` | Echo of current `OCC_FRAME_ADDR` (debug). |
+| `[31:17]` | `frame_addr` | Echo of current `OCC_FRAME_ADDR` (debug). |
+
+> **Why sticky `[3]`/`[5:4]`:** `occ_top` completes a frame in microseconds (one
+> `DONE` cycle), but a host over SPI polls in milliseconds. A 1-cycle status
+> pulse is invisible to the poller. The regfile latches the completion into
+> sticky bits so `ethctl` can reliably poll for "done + result".
 
 ---
 

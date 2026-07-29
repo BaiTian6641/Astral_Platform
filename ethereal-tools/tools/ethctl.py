@@ -38,11 +38,18 @@ import ethimg
 from emri_constants import (
     OCC_BLANK,
     OCC_CMD_START,
+    OCC_DONE_DONE,
+    OCC_DONE_ERROR,
+    OCC_DONE_LOCKED,
+    OCC_DONE_NEEDS_BLANK,
     OCC_READBACK,
     OCC_S_BUSY,
     OCC_S_DONE,
+    OCC_S_ERROR,
     OCC_S_IDLE,
     OCC_S_NEEDS_BLANK,
+    OCC_STATUS_DONE_CODE_LO,
+    OCC_STATUS_DONE_FLAG,
     OCC_WRITE,
     R_CAPABILITIES,
     R_HEALTH_STATUS,
@@ -190,7 +197,20 @@ class PythonEmriModel:
         if addr == R_REGION_INFO:
             return self.region_infos.get(self._region_sel, 0)
         if addr == R_OCC_STATUS:
-            return self._occ.status
+            s = self._occ.status
+            val = s & 0x7  # [2:0] live status
+            # sticky done_flag [3] + done_code [5:4] (RTL latches on terminal
+            # state; model's _occ.status holds the terminal value until next
+            # cmd, so the live status IS effectively the sticky result here)
+            if s in (OCC_S_DONE, OCC_S_ERROR, OCC_S_NEEDS_BLANK):
+                val |= 1 << OCC_STATUS_DONE_FLAG
+                code = {
+                    OCC_S_DONE: OCC_DONE_DONE,
+                    OCC_S_ERROR: OCC_DONE_ERROR,
+                    OCC_S_NEEDS_BLANK: OCC_DONE_NEEDS_BLANK,
+                }[s]
+                val |= code << OCC_STATUS_DONE_CODE_LO
+            return val
         if addr == R_OCC_FRAME_ADDR:
             return self._occ_frame_addr
         if addr == R_OCC_WORD_COUNT:
@@ -290,18 +310,24 @@ class Daemon:
         return out
 
     # ---- lifecycle helpers ----
-    def _occ_wait(self, target: int = OCC_S_DONE) -> int:
+    def _occ_wait(self) -> int:
+        """Poll OCC_STATUS sticky done_flag until set; return the done_code.
+
+        done_code: 0=DONE 1=ERROR 2=NEEDS_BLANK 3=LOCKED. Raises on ERROR/LOCKED;
+        NEEDS_BLANK is surfaced to the caller (deploy retries with a blank).
+        """
         for _ in range(self.poll_timeout):
             s = self.transport.read_status()
-            if s == target:
-                return s
-            if s == OCC_S_NEEDS_BLANK:
-                raise DaemonError("region needs BLANK before WRITE (FABulous red line)")
-            if s not in (OCC_S_BUSY, OCC_S_IDLE):
-                raise DaemonError(f"OCC unexpected status {s}")
+            if s & (1 << OCC_STATUS_DONE_FLAG):
+                code = (s >> OCC_STATUS_DONE_CODE_LO) & 0x3
+                if code == OCC_DONE_ERROR:
+                    raise DaemonError("OCC ERROR during command")
+                if code == OCC_DONE_LOCKED:
+                    raise DaemonError("OCC region locked")
+                return code  # DONE or NEEDS_BLANK
             if self.poll_interval_s:
                 time.sleep(self.poll_interval_s)
-        raise DaemonError(f"OCC poll timeout (target status {target})")
+        raise DaemonError("OCC poll timeout (done_flag never set)")
 
     def _blank(self, region: int, frame_addr: int, word_count: int) -> None:
         self.transport.write(R_OCC_FRAME_ADDR, frame_addr)
@@ -311,7 +337,10 @@ class Daemon:
             R_OCC_CMD,
             (1 << OCC_CMD_START) | ((region & 0xF) << 2) | OCC_BLANK,
         )
-        self._occ_wait(OCC_S_DONE)
+        code = self._occ_wait()
+        if code == OCC_DONE_NEEDS_BLANK:
+            # shouldn't happen for BLANK itself, but handle defensively
+            self._blank(region, frame_addr, word_count)
 
     def _write_frames(self, region: int, frame_addr: int, words: list[int]) -> None:
         self.transport.write(R_OCC_FRAME_ADDR, frame_addr)
@@ -322,7 +351,7 @@ class Daemon:
         )
         for w in words:
             self.transport.push(w)
-        self._occ_wait(OCC_S_DONE)
+        return self._occ_wait()  # done_code (DONE or NEEDS_BLANK)
 
     # ---- top-level deploy ----
     def deploy(
@@ -355,15 +384,12 @@ class Daemon:
         needs_blank = False
         if blank_first:
             self._blank(region, frame_addr, len(words))
-        try:
+        code = self._write_frames(region, frame_addr, words)
+        if code == OCC_DONE_NEEDS_BLANK:
+            # FABulous red line: WRITE to a dirty region -> blank then retry
+            needs_blank = True
+            self._blank(region, frame_addr, len(words))
             self._write_frames(region, frame_addr, words)
-        except DaemonError as e:
-            if "needs BLANK" in str(e):
-                needs_blank = True
-                self._blank(region, frame_addr, len(words))
-                self._write_frames(region, frame_addr, words)
-            else:
-                raise
         return DeployResult(
             region=region,
             words_written=len(words),
