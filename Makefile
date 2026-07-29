@@ -36,7 +36,7 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
 # Heterogeneous-tile (Phase-1) inference-template deps — mem_t/dsp_t wrappers pull
 # in the eth_inf_* behavioral RAM/DSP (eth_config.svh attribute layer via -I).
@@ -73,8 +73,9 @@ else
 	@for f in $(RTL_CLEAN); do \
 	  m=$$(basename $$f .sv); \
 	  case $$m in \
-	    mem_t|dsp_t) deps="$(RTL_INF_DEPS)" ;; \
-	    *)           deps="" ;; \
+	    mem_t|dsp_t)         deps="$(RTL_INF_DEPS)" ;; \
+	    emri_regfile)        deps="ethereal-shell/rtl/emri/emri_pkg.sv" ;; \
+	    *)                   deps="" ;; \
 	  esac; \
 	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m \
 	    -Iethereal-fabric/rtl/inf $$deps $$f || exit 1; \
@@ -110,6 +111,7 @@ else
 	@echo "[test-sv] tb_het_tiles"; $(IVERILOG) -g2012 -o /tmp/tb_het -Iethereal-fabric/rtl/inf ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/tests/tile/tb_het_tiles.sv && vvp /tmp/tb_het | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_het_fabric"; $(IVERILOG) -g2012 -o /tmp/tb_hetfab -Iethereal-fabric/rtl/inf ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/interconnect/tb_het_fabric.sv 2>/dev/null && vvp /tmp/tb_hetfab | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_vbus_route"; $(IVERILOG) -g2012 -o /tmp/tb_vbus -Iethereal-fabric/rtl/inf ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/interconnect/tb_vbus_route.sv 2>/dev/null && vvp /tmp/tb_vbus | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_emri_regfile"; $(IVERILOG) -g2012 -o /tmp/tb_emri ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/tests/emri/tb_emri_regfile.sv 2>/dev/null && vvp /tmp/tb_emri | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
