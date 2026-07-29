@@ -36,6 +36,18 @@ registers (Phase-1 E1-IO2), no event-log ring (E1-RUN4), no scheduler regs
    This preserves the FABulous blank-before-write red line (C03 §0): the OCC
    enforces it; EMRI just feeds it.
 
+> **v0 mFSM scope (realized in `emri_regfile.sv` with `HAS_BMC=0`):** the v0
+> mFSM is the EMRI regfile in mFSM mode — **register-based, no CPU, host-driven**
+> (ADR-014 satisfied). The host streams `OCC_WDATA` directly to the OCC through
+> the regfile's passthrough; the host implements the session FSM (it holds the
+> image and issues BLANK/WRITE/poll). The **device-side rx_buf + 5-state FSM**
+> (C05 §4.2 — IDLE/RX/VERIFY_REQ/OCC_GO/DONE streaming from rx_buf) is **v0.1**,
+> deferred until the sim loop is measured: it absorbs SPI round-trip latency
+> (host pushes whole image fast into rx_buf, then `OCC_GO`) and is the
+> BMC-ready structure, but requires OCC-ownership arbitration and is not
+> load-bearing for correctness. The `SESSION_CMD`/`SESSION_STATUS` registers
+> exist in v0 as plain host-visible storage for forward-compat.
+
 ---
 
 ## 2. Register map (v0)
