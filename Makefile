@@ -36,8 +36,12 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
+# Vendored NEORV32 all-Verilog netlist (machine-generated, BSD-3). NOT G1-ours —
+# provided to bmc_core as a dep; its ~536 vendor warnings are documented-waived
+# (see the bmc_core case in the lint loop). Do NOT add it to RTL_CLEAN.
+NEORV32_NETLIST := ethereal-shell/rtl/bmc/neorv32_verilog_wrapper.v
 # Heterogeneous-tile (Phase-1) inference-template deps — mem_t/dsp_t wrappers pull
 # in the eth_inf_* behavioral RAM/DSP (eth_config.svh attribute layer via -I).
 RTL_INF_DEPS := ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv
@@ -72,12 +76,15 @@ else
 	@echo "[lint] clean modules (strict -Wall): $(RTL_CLEAN)"
 	@for f in $(RTL_CLEAN); do \
 	  m=$$(basename $$f .sv); \
+	  deps=""; waiver=""; \
 	  case $$m in \
 	    mem_t|dsp_t)         deps="$(RTL_INF_DEPS)" ;; \
 	    emri_regfile)        deps="ethereal-shell/rtl/emri/emri_pkg.sv" ;; \
+	    bmc_core)            deps="$(NEORV32_NETLIST)"; \
+	                         waiver="-Wno-DECLFILENAME -Wno-PINCONNECTEMPTY -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL -Wno-PINMISSING -Wno-IMPLICIT -Wno-VARHIDDEN -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-UNDRIVEN -Wno-SYNCASYNCNET -Wno-BLKSEQ -Wno-MULTIDRIVEN -Wno-CASEX -Wno-LITENDIAN -Wno-INITIALDLY -Wno-COMBDLY -Wno-ALWCOMBORDER -Wno-EOFNEWLINE" ;; \
 	    *)                   deps="" ;; \
 	  esac; \
-	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m \
+	  verilator --lint-only -Wall $$waiver --top-module $$m -Mdir obj_dir/lint_$$m \
 	    -Iethereal-fabric/rtl/inf $$deps $$f || exit 1; \
 	done
 	@echo "[lint] fabric modules (-Wall -Wno-UNOPTFLAT; intended loops per C01 sec2.4): clb_t, fabric_top"
@@ -119,6 +126,8 @@ else
 	@echo "[test-sv] shell_tb_mgmt_packed"; $(IVERILOG) -g2012 -o /tmp/tb_shellpacked -Iethereal-fabric/rtl/inf ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/emri/shell_tb_mgmt_packed.sv 2>/dev/null && vvp /tmp/tb_shellpacked | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] pack_tb_frames --het (regen het golden frames)"; .venv/bin/python ethereal-tools/tools/pack_tb_frames.py --het --out generated/tb_frames_het >/dev/null && echo "  frames ok"
 	@echo "[test-sv] shell_tb_het_packed"; $(IVERILOG) -g2012 -o /tmp/tb_hetpacked -Iethereal-fabric/rtl/inf ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/emri/shell_tb_het_packed.sv 2>/dev/null && vvp /tmp/tb_hetpacked | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] gen_bmc_hello (regen hello image)"; .venv/bin/python ethereal-tools/tools/gen_bmc_hello.py --out generated/bmc/bmc_hello.hex >/dev/null && echo "  image ok"
+	@echo "[test-sv] tb_bmc_hello"; $(IVERILOG) -g2012 -o /tmp/tb_bmc ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/bmc/neorv32_verilog_wrapper.v ethereal-fabric/tests/bmc/tb_bmc_hello.sv 2>/dev/null && vvp /tmp/tb_bmc | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
