@@ -5,7 +5,13 @@
 > | 仓库 | ethereal-shell（RTL）/ ethereal-spec（规范） |
 > | 许可证 | CERN-OHL-S-2.0（mailbox 派生代码注明移植自 TinyGPU-FPGA） |
 > | 重要度 | ★★★★★（所有子系统的通信底座） |
-> | 关联 | ADR-006、ADR-015；任务 E0-SHL1、E1-IO1、E2-IO1；上游 `TinyGPU-FPGA/ip/mailbox` |
+> | 关联 | ADR-006、ADR-015、**ADR-018（候选，2026-07-30 计划修订，待维护者确认）**；任务 E0-SHL1、E1-IO1、E2-IO1；上游 `TinyGPU-FPGA/ip/mailbox` |
+
+> ⚠️ **计划修订候选（ADR-018，2026-07-30）：** 维护者要求转向**标准 AXI + 自研 NoC**（三线制：
+> AXI4-Lite 控制 / AXI4-Stream 配置流 / AXI4 数据，基于 PULP `axi` 库 SHL-0.51），mailbox NoC
+> 重新定位为 **AXI 前端 NI 适配的 region 数据面**（保留 ADR-007 结构性隔离与已迁移 RTL）。
+> 详见 `docs/adr/ADR-018-axi-noc-riscv-cluster-candidate.md`。**未批准前，本文件 §1-§7 的
+> EBI 三档 profile 仍为当前权威。** 批准后将按 ADR-018 重写本文件。
 
 ## 1. 是什么 / 做什么 / 重要度
 
