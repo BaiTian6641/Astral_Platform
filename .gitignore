@@ -298,3 +298,9 @@ secrets/
 # -----------------------------------------------------------------------------
 logs/
 log/
+
+# SymbiYosys (sby) workdirs + status (regenerable; run `make formal`)
+ethereal-shell/formal/*_prove/
+ethereal-shell/formal/*/status.sqlite
+ethereal-shell/formal/*/status
+ethereal-shell/formal/*/status.path

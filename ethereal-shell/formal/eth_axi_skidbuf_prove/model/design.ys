@@ -1,8 +1,0 @@
-# running in ethereal-shell/formal/eth_axi_skidbuf_prove/src/
-read -formal eth_axi_skidbuf.sv
-prep -top eth_axi_skidbuf
-
-hierarchy -smtcheck
-rename -witness
-write_jny -no-connections ../model/design.json
-write_rtlil ../model/design.il
