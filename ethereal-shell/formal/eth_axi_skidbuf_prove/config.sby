@@ -1,0 +1,16 @@
+# eth_axi_skidbuf formal proof (SymbiYosys).
+# Proves the skidbuf's VALID-stability + reset properties (spec §7 props 1-2).
+# Run:  sby -f eth_axi_skidbuf.sby
+[options]
+mode prove
+depth 20
+
+[engines]
+smtbmc
+
+[script]
+read -formal eth_axi_skidbuf.sv
+prep -top eth_axi_skidbuf
+
+[files]
+ethereal-shell/rtl/axi/eth_axi_skidbuf.sv

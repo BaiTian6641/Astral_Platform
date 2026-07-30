@@ -36,7 +36,7 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
 # Vendored NEORV32 all-Verilog netlist (machine-generated, BSD-3). NOT G1-ours —
 # provided to bmc_core as a dep; its ~536 vendor warnings are documented-waived
@@ -55,7 +55,7 @@ SMOKE_DIR := ethereal-fabric/tests/smoke
 IMAGE    := ethereal-sim
 WORKDIR  := /work
 
-.PHONY: help lint lint-mailbox test test-model test-sv sim docker-build docker-shell clean
+.PHONY: help lint lint-mailbox test test-model test-sv formal sim docker-build docker-shell clean
 
 help: ## Show this help
 	@echo "Ethereal Logic Platform — root Makefile (GNU make)"
@@ -80,6 +80,11 @@ else
 	  case $$m in \
 	    mem_t|dsp_t)         deps="$(RTL_INF_DEPS)" ;; \
 	    emri_regfile)        deps="ethereal-shell/rtl/emri/emri_pkg.sv" ;; \
+	    eth_axi_stream)      deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
+	                         waiver="-Wno-DECLFILENAME" ;; \
+	    eth_axi_lite_slave)  deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv" ;; \
+	    eth_axi_xbar)        deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
+	                         waiver="-Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-MULTIDRIVEN -Wno-UNUSEDSIGNAL" ;; \
 	    bmc_core)            deps="$(NEORV32_NETLIST)"; \
 	                         waiver="-Wno-DECLFILENAME -Wno-PINCONNECTEMPTY -Wno-UNUSEDPARAM -Wno-UNUSEDSIGNAL -Wno-PINMISSING -Wno-IMPLICIT -Wno-VARHIDDEN -Wno-WIDTH -Wno-CASEINCOMPLETE -Wno-UNDRIVEN -Wno-SYNCASYNCNET -Wno-BLKSEQ -Wno-MULTIDRIVEN -Wno-CASEX -Wno-LITENDIAN -Wno-INITIALDLY -Wno-COMBDLY -Wno-ALWCOMBORDER -Wno-EOFNEWLINE" ;; \
 	    *)                   deps="" ;; \
@@ -101,6 +106,18 @@ else ifeq ($(strip $(MAILBOX_RTL)),)
 else
 	@echo "[lint-mailbox] Imported Mailbox RTL is NOT yet G1-clean (cleanup backlog pending). Warnings are EXPECTED; this target never fails CI."
 	-verilator --lint-only -Wall $(MAILBOX_RTL)
+endif
+
+formal: ## Run SymbiYosys formal proofs (sby) over modules with FORMAL properties
+ifeq ($(shell command -v sby 2>/dev/null),)
+	@echo "[formal] ERROR: sby not found. PATH=\$$HOME/oss-cad-suite/bin:\$$PATH make formal"
+	@exit 1
+else
+	@for f in $(shell find ethereal-shell/formal -maxdepth 1 -name '*.sby' 2>/dev/null); do \
+	  echo "[formal] $$f"; \
+	  sby -f $$f > /tmp/sby_out.txt 2>&1 && echo "  PASS" || { echo "  FAIL"; tail -20 /tmp/sby_out.txt; exit 1; }; \
+	done
+	@echo "[formal] OK - all formal proofs passed."
 endif
 
 test-sv: ## Run self-checking SystemVerilog testbenches via iverilog/vvp (local OSS-CAD)
@@ -128,6 +145,9 @@ else
 	@echo "[test-sv] shell_tb_het_packed"; $(IVERILOG) -g2012 -o /tmp/tb_hetpacked -Iethereal-fabric/rtl/inf ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/emri/shell_tb_het_packed.sv 2>/dev/null && vvp /tmp/tb_hetpacked | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] gen_bmc_hello (regen hello image)"; .venv/bin/python ethereal-tools/tools/gen_bmc_hello.py --out generated/bmc/bmc_hello.hex >/dev/null && echo "  image ok"
 	@echo "[test-sv] tb_bmc_hello"; $(IVERILOG) -g2012 -o /tmp/tb_bmc ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/bmc/neorv32_verilog_wrapper.v ethereal-fabric/tests/bmc/tb_bmc_hello.sv 2>/dev/null && vvp /tmp/tb_bmc | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_axi_lite_slave"; $(IVERILOG) -g2012 -o /tmp/tb_axils ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-fabric/tests/axi/tb_axi_lite_slave.sv 2>/dev/null && vvp /tmp/tb_axils | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_axi_stream"; $(IVERILOG) -g2012 -o /tmp/tb_axistream ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-fabric/tests/axi/tb_axi_stream.sv 2>/dev/null && vvp /tmp/tb_axistream | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_axi_xbar"; $(IVERILOG) -g2012 -o /tmp/tb_axbar ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-fabric/tests/axi/tb_axi_xbar.sv 2>/dev/null && vvp /tmp/tb_axbar | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] OK - all SystemVerilog testbenches passed."
 endif
 
