@@ -90,11 +90,70 @@ def build(fm: FrameMap) -> dict[str, list[int]]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Heterogeneous (fabric_2x2_het) frames — separate output dir so the all-CLB
+# path (generated/tb_frames) is untouched.
+#   col0 = [MEM(row0), CLB(row1)]; CLB tile row-major index = r*C+c = 1*2+0 = 2.
+#   col1 = [DSP(row0), CLB(row1)].
+# ---------------------------------------------------------------------------
+# MEM_T config points (unit 11): mem_mode(16, intra0), mem_vbus_ctrl(22, intra1:
+#   va[13:0]@[13:0], ven@[16], vwe[3:0]@[21:18]), mem_vd_i(32, intra2).
+# DSP_T config points (unit 11): dsp_mode(24, intra0: acc=[0], lat_sel=[2:1]),
+#   dsp_va(27, intra1), dsp_vb(18, intra2), dsp_ven(1, intra3), dsp_vcasc(48,
+#   intra4/5 hi[47:16]/lo[15:0]).
+MEM_MODE_BASIC = 0x0001                 # basic-RAM mode (C02 §1.3)
+# mem_vbus_ctrl: va_i=5, ven=1, vwe=0b0000 (read op; a non-trivial demux value)
+MEM_VBUS_CTRL_DEMO = (5 & 0x3FFF) | (1 << 16)
+DSP_MODE_ACC_LAT1 = 0x0001 | (1 << 1)   # acc=1, lat_sel=1
+DSP_VA_DEMO = 0x1ABCDEF & 0x7FFFFFF     # 27-bit operand A
+DSP_VB_DEMO = 0x2AAAA & 0x3FFFF         # 18-bit operand B
+
+
+def build_het(fm: FrameMap) -> dict[str, list[int]]:
+    """Build the het capstone frames (2x2_het). Returns name -> word list."""
+    # col0 = [MEM(row0), CLB(row1)]; the TFF/const1 lives on the CLB tile
+    # (row-major index 2). MEM/DSP points prove the decoder's demux.
+    col0_a = fm.pack_column(0, [
+        # row0 = MEM_T: exercise the MEM demux (mode/vbus_ctrl/vd_i)
+        {"mem_mode": MEM_MODE_BASIC, "mem_vbus_ctrl": MEM_VBUS_CTRL_DEMO,
+         "mem_vd_i": 0xDEADBEEF},
+        # row1 = CLB_T (tile idx 2): TFF on eLUT0 + IIB feedback
+        {"elut0": TFF_WORD,
+         "iib_mux0": 18, "iib_mux1": 18, "iib_mux2": 18, "iib_mux3": 18},
+    ])
+    col0_b = fm.pack_column(0, [
+        {"mem_mode": MEM_MODE_BASIC},   # MEM stays benign
+        {"elut0": CONST1_WORD},          # CLB tile: const1
+    ])
+    col0_blank = fm.blank_column(0)
+
+    # col1 = [DSP(row0), CLB(row1)]: exercise the DSP demux (mode/va/vb/ven/vcasc)
+    col1_dsp = fm.pack_column(1, [
+        {"dsp_mode": DSP_MODE_ACC_LAT1, "dsp_va": DSP_VA_DEMO,
+         "dsp_vb": DSP_VB_DEMO, "dsp_ven": 1, "dsp_vcasc": 0xA5A5A5A5A5A5},
+        {},
+    ])
+    col1_blank = fm.blank_column(1)
+
+    return {
+        "het_col0_img_a": col0_a,
+        "het_col0_img_b": col0_b,
+        "het_col0_blank": col0_blank,
+        "het_col1_dsp": col1_dsp,
+        "het_col1_blank": col1_blank,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="generated/tb_frames",
                     help="output directory for hex files + manifest")
+    ap.add_argument("--het", action="store_true",
+                    help="emit the heterogeneous (fabric_2x2_het) frames instead")
     args = ap.parse_args()
+
+    if args.het:
+        return _main_het(args)
 
     fm = FrameMap(R=R, C=C, W=W, N=N, K=K, EXT_IN=EXT_IN)
     frames = build(fm)
@@ -136,6 +195,51 @@ def main() -> int:
     print(f"[pack_tb_frames] wrote {len(frames)} frames + manifest to {args.out}")
     print(f"[pack_tb_frames] column_data_words={fm.column_data_words(0)} "
           f"words_per_frame={fm.column_data_words(0) + 1}")
+    return 0
+
+
+def _main_het(args: argparse.Namespace) -> int:
+    """Emit the heterogeneous (fabric_2x2_het) frames + manifest."""
+    from frame_map import TT_CLB, TT_DSP, TT_MEM
+
+    # TILE_LAYOUT[col][row]; col0=[MEM,CLB], col1=[DSP,CLB] (fabric_2x2_het.yaml)
+    layout = [[TT_MEM, TT_CLB], [TT_DSP, TT_CLB]]
+    fm = FrameMap(R=R, C=C, W=W, N=N, K=K, EXT_IN=EXT_IN, TILE_LAYOUT=layout)
+    frames = build_het(fm)
+
+    os.makedirs(args.out, exist_ok=True)
+    for name, words in frames.items():
+        _write_hex(os.path.join(args.out, f"{name}.hex"), words)
+
+    manifest = {
+        "params": {"R": R, "C": C, "W": W, "N": N, "K": K, "EXT_IN": EXT_IN,
+                   "tile_layout": [["mem_t", "clb_t"], ["dsp_t", "clb_t"]]},
+        "col0_data_words": fm.column_data_words(0),
+        "col1_data_words": fm.column_data_words(1),
+        "tff_word": TFF_WORD,
+        "const1_word": CONST1_WORD,
+        "mem_mode": MEM_MODE_BASIC,
+        "mem_vbus_ctrl": MEM_VBUS_CTRL_DEMO,
+        "dsp_mode": DSP_MODE_ACC_LAT1,
+        "dsp_va": DSP_VA_DEMO,
+        "dsp_vb": DSP_VB_DEMO,
+        "frames": {name: len(words) for name, words in frames.items()},
+        # expected decode checks for the het decoder TB (col0):
+        #   tile row-major index r*C+c; MEM tile(row0,col0)=idx0, CLB tile(row1,col0)=idx2.
+        "checks": {
+            # MEM demux (tile0, unit 3 = TILE-MODE):
+            "mem_mode": {"tile": 0, "unit": 3, "intra": 0, "data": MEM_MODE_BASIC},
+            "mem_vbus_ctrl": {"tile": 0, "unit": 3, "intra": 1, "data": MEM_VBUS_CTRL_DEMO},
+            "mem_vd_i": {"tile": 0, "unit": 3, "intra": 2, "data": 0xDEADBEEF},
+            # CLB TFF (tile2 = row1,col0, unit 0):
+            "clb_elut0": {"tile": 2, "unit": 0, "intra": 0, "data": TFF_WORD},
+        },
+    }
+    with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"[pack_tb_frames/het] wrote {len(frames)} frames + manifest to {args.out}")
+    print(f"[pack_tb_frames/het] col0={fm.column_data_words(0)}w col1={fm.column_data_words(1)}w")
     return 0
 
 
