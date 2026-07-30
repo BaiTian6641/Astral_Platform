@@ -7,11 +7,12 @@
 > | 重要度 | ★★★★★（平台的常驻大脑） |
 > | 关联 | ADR-013/014/015/016、**ADR-018（候选，2026-07-30 计划修订，待维护者确认）**；任务 E1-BMC1..4、E2-BMC1/2、E1-RUN2/4、E3-SCH1/2、E4-BMC1 |
 
-> ⚠️ **计划修订候选（ADR-018，2026-07-30）：** BMC 将经 **XBUS→AXI4 桥**成为系统 AXI 总线上的
+> ⚠️ **计划修订候选（ADR-018，2026-07-30 rev2）：** BMC 将经 **XBUS→AXI4 桥**成为系统 AXI 总线上的
 > **一等主控**（全系统可达，可经 AXI 直驱 OCC/EMRI/region），其私有 UART/SPI/I2C 保留为管理
-> 控制台。**NEORV32 仍是 BMC（ADR-016 不变）**；新增一个**独立的 VexRiscv-SMP 应用处理器集群**
-> （≤4 核，可 boot Linux，用户可运行自定义固件——类比 Zynq ARM PS），挂在同一 AXI/NoC 上。
-> 详见 `docs/adr/ADR-018-axi-noc-riscv-cluster-candidate.md`。批准前本文件仍为权威。
+> 控制台。**NEORV32 仍是 BMC（ADR-016 不变）**；新增一个**独立的应用处理器子系统（S15）**：
+> **RV64（RVA23 方向）核心集群（≤4 核）**，用户可配置（RV32/RV64、单/多核），挂在**标准 AXI4
+> 插座**后可插拔（类比 Zynq ARM PS）；并配**可配置 DMA 子系统**（多通道 DMA + 2D 图形 DMA）与
+> **封装式 DRAM 组件**。详见 `docs/adr/ADR-018-axi-noc-riscv-cluster-candidate.md`。批准前本文件仍为权威。
 
 ## 1. 是什么 / 做什么 / 重要度
 

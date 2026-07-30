@@ -1,16 +1,20 @@
-# ADR-018 (candidate): standard AXI + custom NoC interconnect + Linux-capable RISC-V application cluster
+# ADR-018 (candidate): standard AXI + custom NoC + RVA23-direction RISC-V app-processor subsystem (configurable core, wrapped DRAM, DMA subsystem)
 
-> Status: **CANDIDATE — pending maintainer ratification** · Date: 2026-07-30
-> Amends: **ADR-006** (EBI 3-profile) · **ADR-016** (BMC swappable core). Adds: a NEW application-processor domain (a new ADR slot).
+> Status: **CANDIDATE — pending maintainer ratification** · Date: 2026-07-30 (rev 2, same day — maintainer refinement)
+> Amends: **ADR-006** (EBI 3-profile) · **ADR-016** (BMC swappable core). Adds: NEW application-processor subsystem (S15) + DMA subsystem + wrapped-DRAM component (new ADR slots).
 > Supersedes: nothing (the BMC/NEORV32 decision in ADR-016 stands; the mailbox NoC investment is retained, not discarded).
-> Plan-Ref: `ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md`, `S05-BMC与EMRI-mFSM.md`; research: `/memories/repo/axi-noc-riscv-cluster-research.md`
+> Plan-Ref: `ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md`, `S05-BMC与EMRI-mFSM.md`; research: `/memories/repo/axi-noc-riscv-cluster-research.md`, `/memories/repo/rva23-cluster-dma-research.md`
 
-> ⚠️ **This is a plan correction requested by the maintainer (2026-07-30):** move the
-> interconnect to **standard AXI + own custom NoC**, and add a **highly-configurable
-> RISC-V application processor (cluster, up to 4-core) capable of booting Linux and
-> giving the end-user full system access** — the RISC-V analog of the ARM PS on a
-> Zynq. The BMC keeps its own UART/SPI/I2C but becomes a first-class citizen on the
-> system bus. **No code is written against this until ratified.**
+> ⚠️ **Plan correction requested by the maintainer (2026-07-30), refined same day:**
+> 1. **Interconnect → standard AXI + own custom NoC** (industry-standard three-plane).
+> 2. **App processor = separate major task** — RV64 following the **RVA23 profile**, up to
+>    4-core, **user-configurable** (RV32/RV64, single/multi-core), behind a **standard
+>    interface** so users can plug in any core. (See §3.1 for the honest RVA23 constraint.)
+> 3. **DRAM = a separate wrapped component** (Zynq-PS / GW5-hard-DDR3 / future own controller).
+> 4. **DMA subsystem** — a configurable multi-channel DMA + a 2D graphics DMA, in the
+>    processor subsystem.
+> The BMC keeps its own UART/SPI/I2C but becomes a first-class citizen on the system bus.
+> **No code is written against this until ratified.**
 
 ---
 
@@ -66,65 +70,168 @@ shipped with NEORV32) so the BMC has full system access (it can drive OCC/EMRI/r
 over AXI). Its private UART/SPI/I2C remain internal per ADR-016 (the BMC's own
 management console), but the BMC is no longer *behind* the host — it is *on* the bus.
 
-## 3. Decision 2 — NEW application-processor domain: VexRiscv-SMP cluster (up to 4-core, Linux-capable)
+## 3. Decision 2 — NEW application-processor subsystem: configurable RV64 (RVA23-direction) core cluster behind a standard AXI socket
 
-Add a **separate SoC domain**: a **VexRiscv-SMP** cluster (RV32IMAC + Sv32 MMU, **MIT**),
-1→4 cores, on the AXI system fabric, with PLIC+CLINT as MMIO slaves and OpenSBI/U-Boot/Linux
-boot. **Rationale:** VexRiscv-SMP is the **only permissively-licensed, FPGA-proven,
-drop-in coherent SMP cluster** that boots SMP Linux (~13-20K LUT for a quad).
-Pre-generated Verilog is available (`pythondata-cpu-vexriscv_smp`) → no SpinalHDL/sbt
-needed for standard configs (same vendored-frozen pattern as NEORV32).
+> Maintainer directive (2026-07-30): the app processor is a **separate major task**;
+> goal is an **RV64 core following the latest RVA23 profile, up to 4-core**, but
+> **user-configurable** (RV32 or RV64, single or multi-core), behind a **standard
+> interface so users can plug in any core they want**.
 
-- This is a **new ADR slot** (the app processor is NOT the BMC). ADR-016's swappable
-  `bmc_core` boundary is unaffected — NEORV32 stays the BMC.
-- **Why not CVA6:** better single core (RV64, higher IPC) but mainline has **no SMP**;
-  a coherent quad needs research-grade Culsans/OpenPiton (TRL-4) — custom work + risk.
-  CVA6 is the documented **Option B** (single strong core) and the **Zynq US+ fallback**
-  for 64-bit/higher-IPC needs.
-- **Why not NEORV32 for the app cluster:** no MMU/S-mode → not Linux-capable (correct
-  for the BMC, wrong for the app processor).
+### 3.1 The RVA23 reality check (research, 2026-07-30 — honest constraint)
 
-### ⚠️ Decision-2 gating dependency (honest): DRAM
-Linux needs tens of MB of DRAM. GW5 BSRAM/SSRAM (~1 MB) is far too small → **DDR3 is
-mandatory for a full Linux cluster on GW5**, but GW5 DDR3 is a **hard PHY+controller IP**
-(the blocks Phase-1 avoids) with **no mature open soft controller** (LiteDRAM has no
-GW5A PHY). **This is the single biggest risk.** Mitigations (choose at ratification):
-- (a) Zynq US+ as the Linux-cluster primary target (it has PS DDR) — GW5 keeps BMC+fabric only;
-- (b) GW5 DDR3 hard-IP wrapper in `hal/gowin/glue/` (per ADR-017, non-inferable block + Verilator stub) — a hardware bring-up task (maintainer);
-- (c) reduced DDR-less Linux app processor (1-core, rootfs on SD/SPI-flash, ~8-16 MB external PSRAM/SRAM) — proves the Linux path without DDR.
+RVA23 (ratified 2024-10-21; the Ubuntu-25.10+/Android RISC-V baseline) mandates
+**Vector (V) + Hypervisor (Sha) + Sv39 + ~a dozen Z\* extensions** (Zicond, Zimop,
+Zcmop, Zcb, Zfa, Zawrs, Supm, Svnapot, Sstc, Sscofpmf, …). Consequences:
 
-### Cluster phasing (effort est.)
-| Phase | Scope | Effort |
+- **No permissively-licensed open RV64 core is fully RVA23-compliant today.** The only
+  open RVA23-complete core (XiangShan Kunminghu) is server-class, Chisel, MulanPSL, and
+  far too large for any target FPGA. (CVA6 cv64a6 has RV64GC + **Hypervisor** + Sv39
+  but **no Vector, no Sv48** → it is *RVA23-aligned*, not RVA23.)
+- **Therefore "RV64-following-RVA23 + ≤4-core + fits GW5AST-138 (~138K LUT)" is mutually
+  exclusive today.** A true RVA23 cluster is a **tapeout / big-FPGA (Zynq US+ PL) target**.
+
+**Resolution (honor the directive's intent within the constraint):** build the subsystem
+around a **core-agnostic standard AXI4 cluster socket** so the *interface* is frozen and
+the *core* is swappable/configurable, then ship a **configurable core generator** that
+today produces an **RVA23-aligned RV64 core** (CVA6) and/or an **RV32 SMP cluster**
+(VexRiscv-SMP), with the socket ready to accept a future **RVA23-complete core** (or
+XiangShan on tapeout) **unchanged**. This satisfies "configurable RV32/RV64, single/multi,
+standard plug-in interface" directly, and tracks RVA23 as cores mature.
+
+### 3.2 The standard cluster socket (the load-bearing interface)
+
+A **fixed AXI4 cluster socket** (built on the Decision-1 PULP `axi` fabric) is the
+*only* contract a core must meet:
+
+- **Master port(s):** AXI4 (+ATOP atomics for SMP) into the system `axi_xbar`.
+- **Interrupts:** PLIC + CLINT as MMIO slaves on the AXI bus (Linux-standard).
+- **Debug:** JTAG/cJTAG DTM pin (swappable, like the BMC).
+- **Config descriptor:** a machine-readable `core.yaml` (XLEN, core count, MMU/H/V,
+  cache sizes, bus width) that drives the generated wrapper + the device tree.
+
+**Core-swappability is structural** (the ADR-016 `bmc_core` pattern, extended to the app
+domain): the SoC glue depends only on the socket, never on the specific core. A user
+drops in CVA6 / VexRiscv-SMP / Rocket / a future RVA23 core by meeting the socket.
+
+### 3.3 The configurable core generator
+
+A generated `app_cluster.sv` wrapper (same `fabric_gen` convention) with build-time
+parameters, so the *user* configures the processor:
+
+| Param | Values | Notes |
 |---|---|---|
-| A0 | 1-core VexRiscv-SMP, vendor pre-generated Verilog, Verilator/iverilog sim, OpenSBI+Linux boot in sim | ~1-2 wk |
-| A1 | Wire cluster to AXI/NoC + EMRI-visible mgmt; fabric/region access | ~1-2 wk |
-| A2 | Scale 1→2→4 cores (config knob), shared L2, coherent DMA | ~1 wk |
-| A3 ⚠️ | **DDR3 path** (hard-IP wrapper / Zynq PS DDR / DDR-less fallback) | HIGH RISK / HW |
-| A4 | Linux distro (Buildroot), user firmware flow, ethctl integration | ongoing |
+| `CORE` | `cva6_cv64a6` / `vexriscv_smp` / `external` | swappable core selection |
+| `XLEN` | `32` / `64` | RV32 (VexRiscv) or RV64 (CVA6) |
+| `CORE_COUNT` | `1` / `2` / `4` | single / dual / quad |
+| `H_EXT` | `0` / `1` | hypervisor (CVA6 v5.1.0+) |
+| `MMU` | `sv32` / `sv39` | per core |
+| `ICACHE/DCACHE` | sizes | per core |
 
-## 4. Consequences
+- **RV64 / RVA23-direction (recommended default):** **CVA6 cv64a6** (SHL, plain SV,
+  `XLEN=64`, `MMUEn`, `CVA6ConfigHExtEn`) — RV64GC + Hypervisor + Sv39, ~47-70K LUT/core,
+  best open 64-bit SV core. Honest label: **"RVA23-aligned, not RVA23"** (no Vector/Sv48).
+- **RV32 / SMP-Linux-now (alternative):** **VexRiscv-SMP** (MIT, pre-generated Verilog) —
+  RV32IMAC + Sv32, coherent 2-8 core, ~13-20K LUT for a quad, boots Linux today.
+- **RVA23-complete (future):** XiangShan on tapeout, or a future permissive RVA23 core,
+  dropped behind the same socket.
+
+### 3.4 Feasibility on GW5AST-138 (honest)
+
+- **1× CVA6 cv64a6 (~47-70K LUT)** or **4× VexRiscv-SMP (~13-20K LUT)** both fit; a
+  **4-core CVA6 cluster does not** (would need coherence IP + ~200K+ LUT) and a true
+  RVA23 core doesn't exist. **On the 138K, the app-cluster is single-core-CVA6 or
+  quad-VexRiscv-SMP.** 4-core RV64 is a Zynq-US+/tapeout target.
+- The DMA subsystem (§5) fits on the 138K.
+
+## 4. Decision 3 — DRAM as a wrapped, swappable component
+
+> Maintainer directive (2026-07-30): treat DRAM as a **separate wrapped component** —
+> the user wraps the Zynq-PS DDR or the GW5 hard-DDR3; leave space for a **future own
+> DDR controller** (the ultimate tapeout goal).
+
+**DRAM is a HAL component, not a fixed choice.** The SoC talks to DRAM only through a
+standard **`eth_dram_ctrl` AXI4 slave interface**; the implementation is per-target:
+
+| Target | Implementation | Status |
+|---|---|---|
+| Zynq US+ | Zynq PS DDR (AXI HP port) | wrapped in `hal/zynq/glue/` |
+| Gowin GW5 | GW5 hard-DDR3 PHY+controller IP | wrapped in `hal/gowin/glue/` (per ADR-017: non-inferable block, ships with a **Verilator stub**) |
+| Tapeout (future) | **own open DDR controller** (e.g. a LiteDRAM-derived or custom PHY+controller) | **reserved socket** — the AXI4 slave interface is the contract |
+
+- This removes the "which DDR" blocking question from the processor path: the
+  app-cluster always sees the same AXI4 memory slave; the target's HAL provides it.
+- The GW5 hard-DDR3 wrapper is a **hardware bring-up task** (maintainer); until it
+  exists, the GW5 app-cluster runs DDR-less (BootROM + on-chip SRAM + optional external
+  SPI-flash/PSRAM rootfs) — proving the Linux path without DDR.
+- **Verilator-verifiability preserved:** every DRAM implementation ships a behavioral
+  AXI4 memory stub (per ADR-017), so the full SoC simulates without the hard IP.
+
+## 5. Decision 4 — configurable DMA subsystem (multi-channel + 2D graphics), in the processor subsystem
+
+> Maintainer directive (2026-07-30): a **system-wide highly-configurable DMA controller** —
+> one **multi-channel DMA** and one **2D-DMA (with graphics-processing ability)** — both
+> part of the processor subsystem.
+
+Two engines, both built on the Decision-1 PULP `axi` fabric, both configurable:
+
+### 5.1 Multi-channel DMA → PULP `iDMA` (SHL-0.51)
+- **Basis: PULP `iDMA`** — AXI4+ATOP-native, **ND-strided (2D/3D)** transfers, multi-channel
+  front/mid/back-end, scatter-gather, silicon-proven (Snitch/MemPool), Verilator-friendly.
+- **Configurability:** channel count, bus width, and per-channel buffer depth are
+  build-time parameters (same generated-wrapper convention). Serves the app-cluster
+  (Linux `dmaengine`), the BMC (<10 ms hot-swap frame DMA), and region data movement.
+
+### 5.2 2D graphics DMA → iDMA ND backend + custom blit/fill/ROP pipeline
+- **What it is:** 2D block/strided/tiled moves **plus** pixel ops — blit (block copy),
+  solid fill, ROP (raster-ops), alpha-blend, color-space convert, rotation. (Reference:
+  Xilinx AXI VDMA HSIZE/VSIZE/STRIDE; Digital Blocks BitBLT.)
+- **Basis:** iDMA's `tensor_ND` backend gives the 2D/ND strided **move**; **no permissive
+  open BitBLT engine exists** (DB9100 is proprietary), so we add a **small custom SV
+  blit/fill/ROP stage** to iDMA's stream backend (the project already hand-writes SV).
+- **Configurability:** HSIZE/VSIZE/STRIDE register model (VDMA-compatible), optional
+  ROP/blend/rotation stages as build-time enables.
+
+### 5.3 Why both
+The multi-channel DMA is the general data mover; the 2D DMA is a **Service-Tile-class
+accelerator** (S11) for graphics/display/imaging workloads — and a self-hosting example
+of a hardware Service Tile driven by the app-cluster over AXI.
+
+## 6. Consequences
 
 - **Interconnect (S04/C04) rewritten** around PULP `axi` + the three-plane split; the
   mailbox NoC is repositioned as the AXI-fronted region-data plane (investment retained).
 - **BMC (S05/C05)** gains XBUS→AXI4 master capability (full system access); private
   peripherals unchanged.
-- **NEW subsystem** (app-cluster SoC) added: VexRiscv-SMP + PLIC/CLINT + OpenSBI/Linux +
-  DDR3 dependency. This is the platform's user-facing "PS".
+- **NEW subsystem — application-processor SoC (S15, new):** the configurable core
+  cluster behind the AXI4 socket + PLIC/CLINT + OpenSBI/Linux + the wrapped-DRAM
+  component + the DMA subsystem. This is the platform's user-facing "PS".
+- **NEW component — DMA subsystem:** `iDMA` multi-channel + 2D graphics DMA (iDMA+blit),
+  configurable, in the processor subsystem.
+- **DRAM becomes a HAL component** (`eth_dram_ctrl` AXI4 slave + per-target glue +
+  future own-controller socket) — unblocks the processor path from the DDR question.
 - The `axi_lite_mailbox` PULP module aligns naturally with the existing mailbox
   doorbell concept (BMC↔app interrupts).
-- **Verilator-verifiability preserved:** all chosen IP (PULP axi, VexRiscv-SMP
-  pre-generated Verilog, NEORV32-converted) is plain SV/Verilog → simulatable in
-  Verilator/iverilog. ⚠️ PULP `axi` uses SV interfaces (`AXI_BUS` macros) — Verilator 5
-  OK, **iverilog weak** → the interconnect is likely Verilator-only, or needs a
-  ports-only wrapper (1-day spike to confirm before committing — a G6 spike).
-- **Zynq US+** becomes the Linux-cluster-capable target (PS DDR + can also host CVA6
-  later); **GW5** remains the overlay-fabric + BMC battleground (with DDR3 bring-up as
-  the app-cluster enabler).
+- **Verilator-verifiability preserved:** PULP `axi`/`iDMA`, CVA6, VexRiscv-SMP
+  pre-generated Verilog, NEORV32-converted are all plain SV/Verilog. ⚠️ PULP libs use
+  SV interfaces (`AXI_BUS` macros) — Verilator 5 OK, **iverilog weak** → the
+  interconnect is likely Verilator-only, or needs a ports-only wrapper (1-day spike).
+- **Zynq US+** hosts the larger Linux-cluster configs (PS DDR + CVA6/quad); **GW5**
+  hosts the overlay-fabric + BMC + the smaller app-cluster configs (single-CVA6 or
+  quad-VexRiscv-SMP), with the DDR3-hard-IP wrapper as its full-Linux enabler.
 
-## 5. Open items for the maintainer (G6 — ratify before code)
+## 7. Open items for the maintainer (G6 — ratify before code)
 
 1. **Ratify the three-plane AXI + PULP `axi` library** (and the SHL-0.51 license-mix note).
-2. **App-processor core = VexRiscv-SMP (Option A)** vs CVA6 single-core (Option B) vs defer.
-3. **DRAM strategy for the Linux cluster on GW5:** (a) Zynq-primary, (b) GW5 DDR3 hard-IP wrapper, or (c) DDR-less reduced config — pick one (or stage c→b).
-4. **SV-interface/iverilog spike:** budget 1 day to confirm PULP `axi` sim path (Verilator-only vs ports-wrapper) before vendoring.
-5. **Core-count target:** confirm 4-core is the goal (vs 1-core-then-scale), given the overlay LUT budget on GW5.
+2. **Processor subsystem (§3):** confirm the **core-agnostic AXI4 socket + configurable
+   generator**, with **CVA6 (RVA23-aligned RV64) as the RV64 default** and **VexRiscv-SMP
+   as the RV32 SMP alternative**, RVA23-complete deferred to a future core/tapeout.
+   (This is the honest reading of "RV64 following RVA23" given no open RVA23 core fits.)
+3. **DRAM (§4):** ratify the wrapped `eth_dram_ctrl` component + per-target glue + the
+   reserved own-controller socket (tapeout).
+4. **DMA (§5):** ratify **PULP iDMA (multi-channel)** + **iDMA-ND + custom blit/ROP (2D
+   graphics)** as the DMA subsystem basis.
+5. **SV-interface/iverilog spike:** budget 1 day to confirm the PULP `axi`/`iDMA` sim
+   path (Verilator-only vs ports-wrapper) before vendoring.
+6. **Core-count target on GW5:** confirm single-CVA6 vs quad-VexRiscv-SMP for the 138K
+   (4-core RV64 = Zynq-US+/tapeout).
+
