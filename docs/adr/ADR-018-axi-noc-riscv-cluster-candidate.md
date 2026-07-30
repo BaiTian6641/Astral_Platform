@@ -230,8 +230,22 @@ of a hardware Service Tile driven by the app-cluster over AXI.
    reserved own-controller socket (tapeout).
 4. **DMA (§5):** ratify **PULP iDMA (multi-channel)** + **iDMA-ND + custom blit/ROP (2D
    graphics)** as the DMA subsystem basis.
-5. **SV-interface/iverilog spike:** budget 1 day to confirm the PULP `axi`/`iDMA` sim
-   path (Verilator-only vs ports-wrapper) before vendoring.
+5. ~~**SV-interface/iverilog spike**~~ — **RESOLVED 2026-07-30 (de-risking spike done):**
+   Verilator 5.051 compiles both PULP `axi` (v0.39.10) and `iDMA` (v0.6.5) clean
+   (struct-typed cores via `AXI_TYPEDEF_*`); iverilog 14 is blocked by SV interfaces
+   (in `*_intf` wrappers) **and** iDMA's packed-2D-array parameters (no workaround) →
+   **sim strategy settled: Verilator-only for the interconnect/DMA; iverilog stays for
+   the fabric TBs** (new `make lint-interconnect`/`test-interconnect` target; `make
+   test-sv` untouched). Vendoring plan (~2-3 person-days) + SHL-0.51 license handling
+   recorded in `/memories/repo/pulp-axi-idma-spike.md`. **No maintainer decision needed
+   on this item.**
 6. **Core-count target on GW5:** confirm single-CVA6 vs quad-VexRiscv-SMP for the 138K
    (4-core RV64 = Zynq-US+/tapeout).
+
+### Ready to execute on ratification
+Once items 1-4 + 6 are answered, the first build step (P-A0) is well-defined: vendor the
+PULP `axi`/`iDMA` subset (per the spike plan), add the `make lint-interconnect` Verilator
+target, instantiate `axi_lite_xbar` + `idma_nd_midend` in a smoke TB, and bridge the
+BMC's XBUS→AXI4. All IP is Verilator-verified; the only open choices are architectural
+(items 2/6) and the DRAM/DMA ratification (items 3/4).
 
