@@ -33,6 +33,10 @@ package emri_pkg;
   localparam logic [15:0] R_OCC_STATUS     = 16'h0A;
   localparam logic [15:0] R_OCC_FRAME_ADDR = 16'h0B;
   localparam logic [15:0] R_OCC_WORD_COUNT = 16'h0C;
+  // (R_OCC_DECODE @ 0x0D — a hardware DECODE trigger that pulses frame_decoder
+  //  start from the regfile — is a v0.1 feature, not yet implemented. The v0
+  //  bit-packed path drives the decoder's start_i directly (host/testbench
+  //  pulse). 0x0D stays reserved in the EMRI spec for that v0.1 register.)
   localparam logic [15:0] R_SESSION_CMD    = 16'h10;
   localparam logic [15:0] R_SESSION_STATUS = 16'h11;
   localparam logic [15:0] R_RX_BUF_CTRL    = 16'h12;
