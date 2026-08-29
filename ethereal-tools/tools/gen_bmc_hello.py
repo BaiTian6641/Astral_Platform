@@ -39,10 +39,12 @@ from pathlib import Path
 
 # NOP = addi x0, x0, 0 (used to pad the image; harmless if ever executed).
 from emri_constants import (
+    OCC_BLANK,
     OCC_CMD_START,
     OCC_STATUS_DONE_FLAG,
     OCC_WRITE,
     R_OCC_CMD,
+    R_OCC_DECODE,
     R_OCC_FRAME_ADDR,
     R_OCC_STATUS,
     R_OCC_WDATA,
@@ -76,6 +78,7 @@ OFF_OCC_WDATA = R_OCC_WDATA * 4
 OFF_OCC_STATUS = R_OCC_STATUS * 4
 OFF_OCC_FRAME_ADDR = R_OCC_FRAME_ADDR * 4
 OFF_OCC_WORD_COUNT = R_OCC_WORD_COUNT * 4
+OFF_OCC_DECODE = R_OCC_DECODE * 4
 
 
 def _lui(rd: int, imm20: int) -> int:
@@ -416,6 +419,93 @@ def build_words_occ(frame_addr: int, data: list[int]) -> list[int]:
     return prog + [NOP] * (ROM_WORDS - len(prog))
 
 
+def build_words_occ_fabric(frame_words: list[int]) -> list[int]:
+    """Image streaming a REAL packed config frame into the fabric (Phase E).
+
+    Chain: NEORV32 -> XBUS -> eth_wb2axi -> eth_axi_xbar -> emri_axi_adapter
+    -> emri_regfile -> occ_top -> frame_decoder -> fabric_top. The BMC (not a
+    host BFM) configures a real fabric region with a packed column image.
+
+    Sequence (self-contained deploy, emri-v0.md §3.1):
+      1. OCC_FRAME_ADDR=0, OCC_WORD_COUNT=N (N = DATA words, CRC tail excluded)
+      2. OCC_DECODE = col 0  -> pulses dec_start_o (frame_decoder starts capture)
+      3. OCC_CMD = START|WRITE|region0
+      4. loop: read each packed word from a ROM data table (IMEM) and push it
+         via OCC_WDATA (the `sw` stalls until the skid accepts it — no polling)
+      5. poll OCC_STATUS done_flag (bit3), re-read status, print
+         "OF " + hex(status) + "\\n". Clean WRITE of frame 0 -> 0x00000008.
+
+    The packed ``frame_words`` (``pack_tb_frames.py`` output, tail dropped) are
+    appended as a data table AFTER the code; the push loop reads them from IMEM
+    (mapped at 0x0) via a base register whose value is fixed up once the code
+    length is known.
+
+    Register plan: x5=UART0 base, x6/x7 UART scratch, x8=const scratch,
+    x26=table base, x27=EMRI base, x28=loop counter, x29=data word,
+    x30=cmd/status, x31=poll scratch.
+    """
+    n = len(frame_words)
+    region = 0
+    cmd_word = (1 << OCC_CMD_START) | (region << 2) | OCC_WRITE
+
+    prog: list[int] = [
+        _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
+        _addi(6, 0, 1),  # x6 = UART_CTRL_EN
+        _sw(6, 0, 5),  # CTRL = enable
+        _lui(27, EMRI_BASE >> 12),  # x27 = EMRI window base 0x40002000
+        _sw(0, OFF_OCC_FRAME_ADDR, 27),  # OCC_FRAME_ADDR = 0
+    ]
+    prog += _const32(8, n)  # x8 = N
+    prog.append(_sw(8, OFF_OCC_WORD_COUNT, 27))  # OCC_WORD_COUNT = N
+
+    # ---- BLANK the column first (FABulous red line; clears X-init cfg SRAM) ---
+    prog += _const32(8, 0)  # x8 = col 0
+    prog.append(_sw(8, OFF_OCC_DECODE, 27))  # OCC_DECODE (pulse dec_start)
+    prog += _const32(8, (1 << OCC_CMD_START) | (region << 2) | OCC_BLANK)
+    prog.append(_sw(8, OFF_OCC_CMD, 27))  # OCC_CMD = START|BLANK
+    poll = len(prog)  # poll for BLANK done
+    prog.append(_lw(30, OFF_OCC_STATUS, 27))
+    prog.append(_andi(31, 30, 1 << OCC_STATUS_DONE_FLAG))
+    prog.append(_beq(31, 0, (poll - len(prog)) * 4))
+
+    # ---- WRITE the packed image ---------------------------------------------
+    prog += _const32(8, 0)  # x8 = col 0
+    prog.append(_sw(8, OFF_OCC_DECODE, 27))  # OCC_DECODE (pulse dec_start)
+    prog += _const32(8, cmd_word)  # x8 = START|WRITE|region0
+    prog.append(_sw(8, OFF_OCC_CMD, 27))  # OCC_CMD = start write
+    # push loop over the ROM data table
+    prog += _const32(28, n)  # x28 = counter = N
+    tbl_fix_idx = len(prog)  # where const32(26, table_base) goes (fixed below)
+    prog += [0, 0]  # placeholder: const32(26, table_base)
+    loop_head = len(prog)
+    prog.append(_lw(29, 0, 26))  # x29 = table[i]
+    prog.append(_sw(29, OFF_OCC_WDATA, 27))  # OCC_WDATA push
+    prog.append(_addi(26, 26, 4))  # x26 += 4 (next word)
+    prog.append(_addi(28, 28, -1))  # counter--
+    prog.append(_bne(28, 0, (loop_head - len(prog)) * 4))  # loop while != 0
+    # poll done_flag (bit3)
+    poll = len(prog)
+    prog.append(_lw(30, OFF_OCC_STATUS, 27))  # x30 = OCC_STATUS
+    prog.append(_andi(31, 30, 1 << OCC_STATUS_DONE_FLAG))  # x31 = done_flag
+    prog.append(_beq(31, 0, (poll - len(prog)) * 4))  # spin while 0
+    # re-read status and print it
+    prog.append(_lw(30, OFF_OCC_STATUS, 27))  # x30 = OCC_STATUS (final)
+    _emit_char(prog, "O")  # banner
+    _emit_char(prog, "F")
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 30)
+    _emit_char(prog, "\n")
+    prog.append(_jal(0, 0))  # halt
+    # data table starts right after the code; fix up the table-base load
+    table_base_byte = len(prog) * 4  # IMEM is mapped at 0x0, word i at byte 4*i
+    prog[tbl_fix_idx : tbl_fix_idx + 2] = _const32(26, table_base_byte)
+    prog += [w & 0xFFFFFFFF for w in frame_words]  # the packed column data
+
+    if len(prog) > ROM_WORDS:
+        raise ValueError(f"program too large: {len(prog)} words > {ROM_WORDS}")
+    return prog + [NOP] * (ROM_WORDS - len(prog))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -431,12 +521,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["hello", "xbus", "xbar", "emri", "occ"],
+        choices=["hello", "xbus", "xbar", "emri", "occ", "occ-fabric"],
         default="hello",
         help="hello = print --message; xbus = XBUS write+readback, print value; "
         "xbar = two-window write+readback via eth_axi_xbar, print both values; "
         "emri = read EMRI MAGIC+CAPABILITIES via the AXI path, print both; "
-        "occ = stream an OCC config frame via the AXI mgmt path, print status",
+        "occ = stream an OCC config frame via the AXI mgmt path, print status; "
+        "occ-fabric = stream a REAL packed frame (needs --frame-hex) into the "
+        "fabric via R_OCC_DECODE, print status",
     )
     parser.add_argument(
         "--wval",
@@ -461,9 +553,31 @@ def main(argv: list[str] | None = None) -> int:
         default="0xC0DE0000,0xC0DE0001,0xC0DE0002,0xC0DE0003",
         help="occ mode: comma-separated config words to stream (default 4x 0xC0DE000i)",
     )
+    parser.add_argument(
+        "--frame-hex",
+        dest="frame_hex",
+        default=None,
+        help="occ-fabric mode: path to a packed frame .hex (pack_tb_frames.py "
+        "output); the CRC tail word is dropped, DATA words are streamed",
+    )
     args = parser.parse_args(argv)
 
-    if args.mode == "occ":
+    if args.mode == "occ-fabric":
+        if not args.frame_hex:
+            parser.error("--mode occ-fabric requires --frame-hex <path>")
+        lines = [
+            ln.strip()
+            for ln in Path(args.frame_hex).read_text().splitlines()
+            if ln.strip()
+        ]
+        all_words = [int(ln, 16) & 0xFFFFFFFF for ln in lines]
+        data_words = all_words[:-1]  # drop the CRC16 tail (last word)
+        words = build_words_occ_fabric(data_words)
+        note = (
+            f"mode=occ-fabric n={len(data_words)} from {args.frame_hex} "
+            f"(prints 'OF ' + OCC_STATUS hex + '\\n')"
+        )
+    elif args.mode == "occ":
         frame_addr = int(args.frame_addr, 0) & 0xFFFFFFFF
         data = [int(v, 0) & 0xFFFFFFFF for v in args.occ_data.split(",")]
         words = build_words_occ(frame_addr, data)

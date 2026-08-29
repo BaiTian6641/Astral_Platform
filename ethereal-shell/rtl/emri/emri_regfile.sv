@@ -66,7 +66,8 @@ module emri_regfile #(
 
   // -- frame_decoder start trigger (v0.1, emri-v0.md §3.1)
   output logic        dec_start_o,          // 1-cycle pulse on R_OCC_DECODE write
-  output logic [7:0]  dec_col_o             // target fabric column (col_i)
+  output logic [7:0]  dec_col_o,            // target fabric column (col_i)
+  input  logic        dec_busy_i            // frame_decoder busy_o (write backpressure)
 );
   import emri_pkg::*;
 
@@ -193,9 +194,13 @@ module emri_regfile #(
   // OCC_DECODE start trigger (v0.1, spec §3.1): a write to R_OCC_DECODE
   // latches col_id and pulses dec_start_o for ONE fabric-clock cycle
   // (-> frame_decoder.start_i), making a packed deploy self-contained over
-  // the register ABI (no host/TB sideband strobe). host_ready for this write
-  // is immediate (it is neither occ_cmd_start nor occ_wdata_push, so the
-  // ready logic's default write case returns 1). Reads as 0 (read-mux default).
+  // the register ABI (no host/TB sideband strobe).
+  //   SELF-TIMING BACKPRESSURE: the write is held (host_ready_o low) while the
+  // decoder is BUSY (dec_busy_i), and the start pulse fires only when the
+  // write is ACCEPTED (decoder idle). This makes back-to-back deploys
+  // (BLANK then WRITE) self-sequencing: the BMC's next R_OCC_DECODE write
+  // stalls until the previous decode completes, so its start_i is never
+  // dropped (the decoder ignores start_i while busy). Reads as 0.
   // ------------------------------------------------------------------
   logic       dec_start_r;
   logic [7:0] dec_col_r;
@@ -206,7 +211,7 @@ module emri_regfile #(
     end else begin
       dec_start_r <= 1'b0;  // default: single-cycle pulse
       if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
-          (host_addr_i == R_OCC_DECODE)) begin
+          (host_addr_i == R_OCC_DECODE) && !dec_busy_i) begin
         dec_start_r <= 1'b1;
         dec_col_r   <= host_wdata_i[7:0];
       end
@@ -331,6 +336,11 @@ module emri_regfile #(
         host_ready_o = occ_start_r && occ_cmd_ready_i;
       end else if (addr_is_occ_wdata_push) begin
         host_ready_o = !occ_wdata_pending_r || occ_wdata_ready_i;
+      end else if (host_addr_i == R_OCC_DECODE) begin
+        // DECODE trigger: ready only when the frame_decoder is idle (the
+        // decoder ignores start_i while busy, so backpressure the write until
+        // it can be honored — self-timing multi-command deploys).
+        host_ready_o = !dec_busy_i;
       end else begin
         host_ready_o = 1'b1;  // plain RW / RO-write: immediate
       end

@@ -129,12 +129,21 @@ fabric-clock cycle (→ `frame_decoder.start_i`), starting capture of the OCC
 frame stream that the next `OCC_CMD`(BLANK/WRITE) streams. Self-clearing (a
 write is a pulse, not a level). Read-as-0.
 
+**Self-timing backpressure (v0.1):** the `OCC_DECODE` write is **held**
+(`host_ready` low) while the frame decoder is BUSY (`dec_busy_i`), and the
+start pulse fires only when the write is *accepted* (decoder idle). This makes
+back-to-back deploys (BLANK then WRITE) self-sequencing: the next `OCC_DECODE`
+write stalls until the previous decode completes, so its `start_i` is never
+dropped (the decoder ignores `start_i` while busy). Without this the host/BMC
+would have to poll decoder status or guess a delay.
+
 **Deploy sequence (packed, BMC- or host-driven):**
 1. Write `OCC_FRAME_ADDR` + `OCC_WORD_COUNT` (= DATA words, CRC tail excluded).
-2. Write `OCC_DECODE = {col_id}` → pulses `dec_start_o` (decoder begins capture).
+2. Write `OCC_DECODE = {col_id}` → `dec_start_o` when the decoder is idle
+   (held if busy, see backpressure above).
 3. Write `OCC_CMD = {region_id, cmd=BLANK|WRITE, start=1}` (+ stream `OCC_WDATA` for WRITE).
 4. Decoder auto-decodes once `column_data_words(col)` DATA words are captured;
-   host/BMC polls `OCC_STATUS.done_flag` (+ decoder `done_o` in hardware).
+   the next `OCC_DECODE` write self-times against decode completion.
 
 ---
 
