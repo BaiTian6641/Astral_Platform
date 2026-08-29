@@ -51,6 +51,10 @@ ROM_WORDS = 256
 # regions -> routed to XBUS -> our eth_wb2axi -> the eth_axi fabric.
 XBUS_BASE = 0x40000000
 
+# Second XBUS window (xbar mode): routed by eth_axi_xbar to a SECOND slave,
+# proving address decode. 4 KiB-apart windows match the TB's ADDR_MAP masks.
+XBUS2_BASE = 0x40001000
+
 
 def _lui(rd: int, imm20: int) -> int:
     return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0b0110111
@@ -171,6 +175,28 @@ def _emit_hex_nibble(prog: list[int], reg: int) -> None:
     prog.append(_sw(10, 4, 5))
 
 
+def _const32(rd: int, val: int) -> list[int]:
+    """Return the LUI+ADDI pair loading the 32-bit constant ``val`` into ``rd``.
+
+    LUI shifts a 20-bit immediate left by 12; ADDI adds a signed 12-bit
+    immediate. The standard split is hi20 = (val >> 12) + carry, lo_s = low
+    12 bits sign-adjusted (carry when the low 12 bits have the top bit set,
+    which ADDI would subtract from hi).
+    """
+    lo12 = val & 0xFFF
+    carry = 1 if lo12 >= 0x800 else 0
+    hi20 = ((val >> 12) + carry) & 0xFFFFF
+    lo_s = lo12 - 0x1000 if lo12 >= 0x800 else lo12
+    return [_lui(rd, hi20), _addi(rd, rd, lo_s)]
+
+
+def _emit_hex32(prog: list[int], reg: int) -> None:
+    """Append code printing all 8 hex digits of ``reg`` (MSB-first)."""
+    for i in range(8):
+        prog.append(_srli(10, reg, 28 - i * 4))  # bring nibble i (from MSB) to low
+        _emit_hex_nibble(prog, 10)
+
+
 def build_words(message: str) -> list[int]:
     """Return the hello image as a list of 32-bit words, padded to ``ROM_WORDS``."""
     prog: list[int] = [
@@ -195,32 +221,57 @@ def build_words_xbus(wval: int) -> list[int]:
     space + 8 hex digits (MSB-first) + "\\n" over UART0. This proves the BMC
     drives the AXI fabric end-to-end.
     """
-    # rv32 32-bit constant load via LUI+ADDI. LUI shifts the 20-bit immediate
-    # left by 12; ADDI adds a signed 12-bit immediate. The standard split is
-    # hi20 = (wval >> 12) + carry, lo_s = low-12-bits (sign-extended, carry if
-    # the low 12 bits have the top bit set, which ADDI would subtract from hi).
-    lo12 = wval & 0xFFF
-    carry = 1 if lo12 >= 0x800 else 0
-    hi20 = ((wval >> 12) + carry) & 0xFFFFF
-    lo_s = lo12 - 0x1000 if lo12 >= 0x800 else lo12
-
     prog: list[int] = [
         _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
         _addi(6, 0, 1),  # x6 = UART_CTRL_EN
         _sw(6, 0, 5),  # CTRL = enable
         _lui(28, XBUS_BASE >> 12),  # x28 = XBUS base 0x40000000 (LUI imm<<12)
-        _lui(29, hi20),  # x29 = wval high 20 bits (carry-adjusted)
-        _addi(29, 29, lo_s),  # x29 = wval (full 32-bit)
-        _sw(29, 0, 28),  # XBUS[0x40000000] = wval   (AXI write)
-        _lw(30, 0, 28),  # x30 = XBUS[0x40000000]    (AXI read back)
     ]
+    prog += _const32(29, wval)  # x29 = wval
+    prog.append(_sw(29, 0, 28))  # XBUS[0x40000000] = wval   (AXI write)
+    prog.append(_lw(30, 0, 28))  # x30 = XBUS[0x40000000]    (AXI read back)
     _emit_char(prog, "A")  # banner
     _emit_char(prog, "X")
     _emit_char(prog, " ")
-    # print 8 hex digits of x30, MSB-first
-    for i in range(8):
-        prog.append(_srli(10, 30, 28 - i * 4))  # bring nibble i (from MSB) to low
-        _emit_hex_nibble(prog, 10)
+    _emit_hex32(prog, 30)  # print 8 hex digits of x30, MSB-first
+    _emit_char(prog, "\n")
+    prog.append(_jal(0, 0))  # halt
+
+    if len(prog) > ROM_WORDS:
+        raise ValueError(f"program too large: {len(prog)} words > {ROM_WORDS}")
+    return prog + [NOP] * (ROM_WORDS - len(prog))
+
+
+def build_words_xbar(wval0: int, wval1: int) -> list[int]:
+    """Image exercising the BMC -> eth_wb2axi -> eth_axi_xbar -> 2 slaves path.
+
+    Writes ``wval0`` to window 0 (``XBUS_BASE``) and ``wval1`` to window 1
+    (``XBUS2_BASE``) — the xbar routes each by address decode — reads both
+    back, then prints "XB " + hex(wval0) + " " + hex(wval1) + "\\n" over
+    UART0. Proves the BMC drives the xbar fabric end-to-end incl. routing.
+
+    Register plan: x5=UART0 base, x6/x7 UART scratch, x10/x11 hex scratch,
+    x28=win0 base, x27=win1 base, x30=readback0, x25=readback1.
+    """
+    prog: list[int] = [
+        _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
+        _addi(6, 0, 1),  # x6 = UART_CTRL_EN
+        _sw(6, 0, 5),  # CTRL = enable
+        _lui(28, XBUS_BASE >> 12),  # x28 = win0 base 0x40000000
+        _lui(27, XBUS2_BASE >> 12),  # x27 = win1 base 0x40001000
+    ]
+    prog += _const32(29, wval0)  # x29 = wval0
+    prog.append(_sw(29, 0, 28))  # win0[0] = wval0   (AXI write, route slave0)
+    prog += _const32(26, wval1)  # x26 = wval1
+    prog.append(_sw(26, 0, 27))  # win1[0] = wval1   (AXI write, route slave1)
+    prog.append(_lw(30, 0, 28))  # x30 = win0[0]     (read back slave0)
+    prog.append(_lw(25, 0, 27))  # x25 = win1[0]     (read back slave1)
+    _emit_char(prog, "X")  # banner
+    _emit_char(prog, "B")
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 30)
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 25)
     _emit_char(prog, "\n")
     prog.append(_jal(0, 0))  # halt
 
@@ -244,18 +295,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["hello", "xbus"],
+        choices=["hello", "xbus", "xbar"],
         default="hello",
-        help="hello = print --message; xbus = XBUS write+readback, print value",
+        help="hello = print --message; xbus = XBUS write+readback, print value; "
+        "xbar = two-window write+readback via eth_axi_xbar, print both values",
     )
     parser.add_argument(
         "--wval",
         default="0x5AA5C33C",
-        help="32-bit value the xbus mode writes/reads (default 0x5AA5C33C)",
+        help="32-bit value the xbus mode writes/reads (default 0x5AA5C33C); "
+        "xbar mode window-0 value",
+    )
+    parser.add_argument(
+        "--wval2",
+        default="0xC33C5AA5",
+        help="xbar mode window-1 value (default 0xC33C5AA5)",
     )
     args = parser.parse_args(argv)
 
-    if args.mode == "xbus":
+    if args.mode == "xbar":
+        wval0 = int(args.wval, 0) & 0xFFFFFFFF
+        wval1 = int(args.wval2, 0) & 0xFFFFFFFF
+        words = build_words_xbar(wval0, wval1)
+        note = (
+            f"mode=xbar wval0=0x{wval0:08x} wval1=0x{wval1:08x} "
+            f"(prints 'XB ' + 8 hex + ' ' + 8 hex + '\\n')"
+        )
+    elif args.mode == "xbus":
         wval = int(args.wval, 0) & 0xFFFFFFFF
         words = build_words_xbus(wval)
         note = f"mode=xbus wval=0x{wval:08x} (prints 'AX ' + 8 hex + '\\n')"
