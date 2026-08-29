@@ -218,5 +218,108 @@ module eth_wb2axi #(
     assign wb_err_o = (state_r == S_RESP) &  err_r;
     assign wb_dat_o = rdat_r;
 
+`ifdef FORMAL
+    // ==================================================================
+    // Formal properties (SymbiYosys, see ethereal-shell/formal/eth_wb2axi.sby).
+    // Prove: AXI VALID stability, write-completes-only-on-B (regression guard
+    // for the 2026-08-30 premature-ack bug), read-completes-only-on-R, and the
+    // OKAY->ack / SLVERR|DECERR->err response mapping. Assumptions constrain
+    // the AXI slave and the Wishbone master to their protocol contracts.
+    // ==================================================================
+    logic past_valid = 1'b0;
+    always_ff @(posedge clk_i) past_valid <= 1'b1;
+
+    // Initialize deterministically: hold reset for the first cycle so the FSM
+    // starts in S_IDLE (otherwise the engine picks an arbitrary initial state
+    // and produces spurious counterexamples unrelated to real operation).
+    always_ff @(posedge clk_i) begin
+        if (!past_valid) assume(!rst_ni);
+    end
+
+    // ---- Assumptions on the environment (AXI slave + Wishbone master) -------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // AXI slave: a response is held stable until accepted.
+            if ($past(m_axi_bvalid) && !$past(m_axi_bready))
+                assume(m_axi_bvalid && (m_axi_bresp == $past(m_axi_bresp)));
+            if ($past(m_axi_rvalid) && !$past(m_axi_rready))
+                assume(m_axi_rvalid && (m_axi_rdata == $past(m_axi_rdata))
+                       && (m_axi_rresp == $past(m_axi_rresp)));
+            // AW/W/AR *_ready are free (the slave may accept or stall).
+
+            // AXI ordering (spec A3.4.1): the slave asserts B only after BOTH
+            // the AW and W handshakes complete, and R only after the AR
+            // handshake completes. So while a request channel is presented and
+            // not yet accepted, the matching response must NOT be offered.
+            // (Without this the engine could violate AXI by answering early,
+            // e.g. B while AW is stalled, which is not a DUT bug.)
+            if (m_axi_awvalid && !m_axi_awready) assume(!m_axi_bvalid);
+            if (m_axi_wvalid  && !m_axi_wready)  assume(!m_axi_bvalid);
+            if (m_axi_arvalid && !m_axi_arready) assume(!m_axi_rvalid);
+
+            // Wishbone master (NEORV32 XBUS): a presented classic transfer is
+            // held stable until it completes (ack/err).
+            if ($past(wb_cyc_i) && $past(wb_stb_i) && !$past(wb_ack_o) && !$past(wb_err_o)) begin
+                assume(wb_cyc_i && wb_stb_i);
+                assume(wb_adr_i == $past(wb_adr_i));
+                assume(wb_dat_i == $past(wb_dat_i));
+                assume(wb_sel_i == $past(wb_sel_i));
+                assume(wb_we_i  == $past(wb_we_i));
+            end
+            // After a completion the master drops stb (single classic transfers).
+            if ($past(wb_ack_o) || $past(wb_err_o))
+                assume(!wb_stb_i);
+        end
+    end
+
+    // ---- Assertions on the DUT (eth_wb2axi) ----------------------------------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // prop 1: AXI request VALIDs + payloads are stable while stalled
+            // (registered; spec §2 rule 1 — no comb input->VALID path).
+            if ($past(m_axi_awvalid) && !$past(m_axi_awready)) begin
+                assert(m_axi_awvalid);
+                assert(m_axi_awaddr == $past(m_axi_awaddr));
+            end
+            if ($past(m_axi_wvalid) && !$past(m_axi_wready)) begin
+                assert(m_axi_wvalid);
+                assert(m_axi_wdata == $past(m_axi_wdata));
+                assert(m_axi_wstrb == $past(m_axi_wstrb));
+            end
+            if ($past(m_axi_arvalid) && !$past(m_axi_arready)) begin
+                assert(m_axi_arvalid);
+                assert(m_axi_araddr == $past(m_axi_araddr));
+            end
+
+            // prop 2 (REGRESSION GUARD): a WRITE completes ONLY on the B
+            // response — the FSM never leaves S_WDATA without bvalid. (The
+            // 2026-08-30 bug transitioned on the AW&W handshake, acking early
+            // and leaving B unconsumed.)
+            if ($past(state_r) == S_WDATA && !$past(m_axi_bvalid))
+                assert(state_r == S_WDATA);
+            // a READ completes ONLY on the R response.
+            if ($past(state_r) == S_RDATA && !$past(m_axi_rvalid))
+                assert(state_r == S_RDATA);
+
+            // Auxiliary invariants (strengthen k-induction): an AXI request
+            // VALID only exists in its data state (raised on entry, dropped on
+            // accept or on the transition to S_RESP). These constrain the
+            // induction state space to reachable configurations.
+            if (m_axi_awvalid) assert(state_r == S_WDATA);
+            if (m_axi_wvalid)  assert(state_r == S_WDATA);
+            if (m_axi_arvalid) assert(state_r == S_RDATA);
+
+            // prop 3: Wishbone completion only in S_RESP; the response maps
+            // OKAY->ack, SLVERR/DECERR->err (never ack on an error response).
+            if (wb_ack_o) assert(state_r == S_RESP && !err_r);
+            if (wb_err_o) assert(state_r == S_RESP &&  err_r);
+            if ($past(state_r) == S_WDATA && $past(m_axi_bvalid) && ($past(m_axi_bresp) != 2'b00))
+                assert(state_r == S_RESP && err_r);
+            if ($past(state_r) == S_RDATA && $past(m_axi_rvalid) && ($past(m_axi_rresp) != 2'b00))
+                assert(state_r == S_RESP && err_r);
+        end
+    end
+`endif
+
 endmodule
 `default_nettype wire

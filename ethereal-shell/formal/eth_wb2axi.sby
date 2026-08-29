@@ -1,0 +1,22 @@
+# eth_wb2axi formal proof (SymbiYosys).
+# Proves: AXI VALID stability, write-completes-only-on-B (regression guard for
+# the 2026-08-30 premature-ack bug), read-completes-only-on-R, and the
+# OKAY->ack / SLVERR|DECERR->err response mapping. Assumptions constrain the
+# AXI slave and the Wishbone master to their protocol contracts.
+# Run:  sby -f eth_wb2axi.sby
+[tasks]
+prove
+
+[options]
+prove: mode prove
+prove: depth 40
+
+[engines]
+prove: smtbmc
+
+[script]
+read -formal eth_wb2axi.sv
+prep -top eth_wb2axi
+
+[files]
+ethereal-shell/rtl/axi/eth_wb2axi.sv
