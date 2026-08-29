@@ -80,7 +80,10 @@ module emri_axi_adapter #(
     input  logic [31:0]           host_rdata_i,
     input  logic                  host_ready_i
 );
-    import emri_pkg::*;
+    // (emri_pkg is referenced with explicit scoping — Yosys's default SV
+    // frontend for the formal build does not accept `import pkg::*;`.)
+    localparam logic [1:0] SPI_OP_RD = emri_pkg::SPI_OP_RD;
+    localparam logic [1:0] SPI_OP_WR = emri_pkg::SPI_OP_WR;
 
     localparam int STRB_W = AXI_DW / 8;
 
@@ -285,6 +288,77 @@ module emri_axi_adapter #(
     logic unused_ok;
     assign unused_ok = &{1'b0, aw_pl_out[2:0], ar_pl_out[2:0]};
     // verilator lint_on UNUSEDSIGNAL
+
+`ifdef FORMAL
+    // ==================================================================
+    // Formal properties (SymbiYosys, see formal/emri_axi_adapter.sby).
+    // Prove: SLVERR never issues a host request + no deadlock on SLVERR
+    // (regression guard for the 2026-08-30 self-caught SLVERR deadlock fix),
+    // valid host requests held until host_ready, and response VALID stability.
+    // ==================================================================
+    logic past_valid = 1'b0;
+    always_ff @(posedge clk_i) past_valid <= 1'b1;
+
+    // Initialize deterministically: hold reset for the first cycle.
+    always_ff @(posedge clk_i) begin
+        if (!past_valid) assume(!rst_ni);
+    end
+
+    // ---- Assumptions on the environment (AXI master + EMRI host) -------------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // AXI master (xbar): request VALID+payload stable until accepted.
+            if ($past(s_axi_awvalid) && !$past(s_axi_awready)) begin
+                assume(s_axi_awvalid);
+                assume(s_axi_awaddr == $past(s_axi_awaddr));
+            end
+            if ($past(s_axi_wvalid) && !$past(s_axi_wready)) begin
+                assume(s_axi_wvalid);
+                assume(s_axi_wdata == $past(s_axi_wdata));
+                assume(s_axi_wstrb == $past(s_axi_wstrb));
+            end
+            if ($past(s_axi_arvalid) && !$past(s_axi_arready)) begin
+                assume(s_axi_arvalid);
+                assume(s_axi_araddr == $past(s_axi_araddr));
+            end
+            // host_ready_i is a free input (models EMRI backpressure: reads are
+            // always ready, OCC-path writes may stall). host_rdata_i is free.
+        end
+    end
+
+    // ---- Assertions on the DUT (emri_axi_adapter) -----------------------------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // prop A (REGRESSION GUARD): a SLVERR request NEVER issues a host
+            // request — the host phase is skipped for errors (host_req gated by
+            // host_run = OKAY). This is the core of the deadlock fix.
+            if (req_resp_r == RESP_SLVERR) assert(!host_req_o);
+
+            // prop B (REGRESSION GUARD): NO DEADLOCK on SLVERR — the FSM leaves
+            // the host-wait state on an error WITHOUT needing host_ready_i
+            // (emri only asserts host_ready while host_req is high, which the
+            // SLVERR path suppresses, so waiting for it would hang forever).
+            if ($past(state_r) == S_WR_HOST && $past(req_resp_r) == RESP_SLVERR)
+                assert(state_r == S_WR_B);
+            if ($past(state_r) == S_RD_HOST && $past(req_resp_r) == RESP_SLVERR)
+                assert(state_r == S_RD_R);
+
+            // prop C: a valid (OKAY) host request is HELD until host_ready_i.
+            if ($past(state_r) == S_WR_HOST && $past(host_run) && !$past(host_ready_i))
+                assert(state_r == S_WR_HOST && host_req_o);
+            if ($past(state_r) == S_RD_HOST && $past(host_run) && !$past(host_ready_i))
+                assert(state_r == S_RD_HOST && host_req_o);
+
+            // prop D: response VALIDs stable while stalled (state-derived).
+            if ($past(s_axi_bvalid) && !$past(s_axi_bready)) assert(s_axi_bvalid);
+            if ($past(s_axi_rvalid) && !$past(s_axi_rready)) assert(s_axi_rvalid);
+
+            // prop E: B/R only exist in their response states (structural).
+            if (s_axi_bvalid) assert(state_r == S_WR_B);
+            if (s_axi_rvalid) assert(state_r == S_RD_R);
+        end
+    end
+`endif
 
 endmodule
 `default_nettype wire

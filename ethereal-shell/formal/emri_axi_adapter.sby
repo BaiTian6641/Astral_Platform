@@ -1,0 +1,25 @@
+# emri_axi_adapter formal proof (SymbiYosys).
+# Proves: SLVERR never issues a host request + no deadlock on SLVERR
+# (regression guard for the 2026-08-30 self-caught SLVERR deadlock fix), valid
+# host requests held until host_ready, and response VALID stability.
+# Run:  sby -f emri_axi_adapter.sby
+[tasks]
+prove
+
+[options]
+prove: mode prove
+prove: depth 40
+
+[engines]
+prove: smtbmc
+
+[script]
+read -formal emri_pkg.sv
+read -formal eth_axi_skidbuf.sv
+read -formal emri_axi_adapter.sv
+prep -top emri_axi_adapter
+
+[files]
+ethereal-shell/rtl/emri/emri_pkg.sv
+ethereal-shell/rtl/axi/eth_axi_skidbuf.sv
+ethereal-shell/rtl/emri/emri_axi_adapter.sv
