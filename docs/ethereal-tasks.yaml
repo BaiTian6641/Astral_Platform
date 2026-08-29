@@ -11,14 +11,15 @@ project:
   decisions:
     route: overlay-first (fine-grained virtual reconfigurable fabric)
     platforms: [gowin-gw5ast-138, zynq-ultrascale-plus]
-    licenses: {software: MIT, hardware_rtl: CERN-OHL-S-2.0, docs_specs: CC-BY-SA-4.0}
+    licenses:
+      { software: MIT, hardware_rtl: CERN-OHL-S-2.0, docs_specs: CC-BY-SA-4.0 }
     bus: EBI (AXI4-Lite + custom NoC + tiny fallback)
-    host_link: {data: SPI, monitor: I2C (PMBus-style)}
+    host_link: { data: SPI, monitor: I2C (PMBus-style) }
     control_plane: independent-then-unified (ADR-010)
     management:
-      bmc: "soft-core RISC-V in fabric (primary: NEORV32, fallback: VexRiscv)"  # ADR-013/016
-      small_devices: mFSM (register-based, host-driven)                        # ADR-014
-      unified_abi: EMRI (BMC and mFSM expose identical register interface)     # ADR-015
+      bmc: "soft-core RISC-V in fabric (primary: NEORV32, fallback: VexRiscv)" # ADR-013/016
+      small_devices: mFSM (register-based, host-driven) # ADR-014
+      unified_abi: EMRI (BMC and mFSM expose identical register interface) # ADR-015
       deprecated: gowin-ae350-hardcore (paid toolchain, unusable software)
 
 phases:
