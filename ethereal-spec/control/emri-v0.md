@@ -55,7 +55,7 @@ registers (Phase-1 E1-IO2), no event-log ring (E1-RUN4), no scheduler regs
 Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 
 | Offset | Name | R/W | Width | Meaning |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `0x00` | `MAGIC` | R | 32 | `0x45544852` ("ETHR"). Presence/endianness probe. |
 | `0x01` | `ABI_VERSION` | R | 32 | `{maj[31:16], min[15:0]}`. v0 = `0x0000_0000`. |
 | `0x02` | `CAPABILITIES` | R | 32 | bit0 `has_bmc`, bit1 `has_dma`, bit2 `has_i2c_mon`, bit3 `has_trng`, bit4 `has_jtag_dbg`. Others reserved-0. |
@@ -87,7 +87,7 @@ telemetry block @ `0x40+`, scheduler @ `0x60+`). (`0x0D` repurposed for
 The OCC command trigger. **Bit layout:**
 
 | Bits | Field | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `[1:0]` | `cmd` | OCC opcode: `0=NOP, 1=WRITE, 2=READBACK, 3=BLANK` (matches `occ_top.cmd_i`). |
 | `[5:2]` | `region_id` | Target region (v0: 0 or 1). Sets `region_locked_i` source + `OCC_FRAME_ADDR.region_id`. |
 | `[7:6]` | reserved | 0. |
@@ -95,6 +95,7 @@ The OCC command trigger. **Bit layout:**
 | `[31:9]` | reserved | 0. |
 
 **Sequence for a WRITE (host-driven, mFSM mode):**
+
 1. Host writes `OCC_FRAME_ADDR` + `OCC_WORD_COUNT`.
 2. Host writes `OCC_CMD = {region_id, cmd=WRITE, start=1}`.
 3. mFSM/BMC asserts `cmd_valid` to OCC until `cmd_ready`.
@@ -120,7 +121,7 @@ writes). In the host-driven capstones the decoder's `start_i` was pulsed by a
 EMRI. `OCC_DECODE` makes the deploy **self-contained over the register ABI**:
 
 | Bits | Field | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `[7:0]` | `col_id` | Target fabric column (`col_i` to `frame_decoder`). |
 | `[31:8]` | reserved | 0. |
 
@@ -138,6 +139,7 @@ dropped (the decoder ignores `start_i` while busy). Without this the host/BMC
 would have to poll decoder status or guess a delay.
 
 **Deploy sequence (packed, BMC- or host-driven):**
+
 1. Write `OCC_FRAME_ADDR` + `OCC_WORD_COUNT` (= DATA words, CRC tail excluded).
 2. Write `OCC_DECODE = {col_id}` → `dec_start_o` when the decoder is idle
    (held if busy, see backpressure above).
@@ -150,7 +152,7 @@ would have to poll decoder status or guess a delay.
 ## 4. OCC_STATUS register (offset `0x0A`)
 
 | Bits | Field | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `[2:0]` | `status` | **Live** `status_o` from `occ_top` (`0=IDLE,1=BUSY,2=DONE,3=ERROR,4=LOCKED,5=NEEDS_BLANK`). `DONE`/`ERROR`/etc. pulse for **one cycle** — unobservable by a host polling over SPI; use `[3]`/`[5:4]` instead. |
 | `[3]` | `done_flag` | **Sticky** completion pending (host polls THIS). Latched when `occ_top` reaches any terminal state; cleared on the next `OCC_CMD.start` write. |
 | `[5:4]` | `done_code` | Completion code, valid when `[3]=1`: `0=DONE, 1=ERROR, 2=NEEDS_BLANK, 3=LOCKED`. |
@@ -218,7 +220,7 @@ ABI; chosen over a variable mailbox stream for sim-provability):
 ### Request frame (host → device, 7 bytes, MSB-first)
 
 | Byte | Field | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | 0 | `OP` | `0x00=RD, 0x01=WR, 0x02=BLOCK_RD, 0x03=OCC_PUSH`. |
 | 1-2 | `ADDR` | Word offset (big-endian). |
 | 3-6 | `DATA` | Write data (big-endian); ignored on RD. |
@@ -226,7 +228,7 @@ ABI; chosen over a variable mailbox stream for sim-provability):
 ### Response frame (device → host, 7 bytes)
 
 | Byte | Field | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | 0 | `STATUS` | `0x00=OK, 0x01=BAD_OP, 0x02=BAD_ADDR, 0x03=BUSY`. |
 | 1-2 | `ADDR` | Echo of request ADDR. |
 | 3-6 | `DATA` | Read data (RD) or 0 (WR). |
@@ -254,7 +256,7 @@ on the EMRI-register **read** path back to the SPI master (C05 §3.2).
 ## 8. BMC vs mFSM behavioral differences (the full table)
 
 | Aspect | BMC mode (`has_bmc=1`) | mFSM mode (`has_bmc=0`) |
-|---|---|---|
+| --- | --- | --- |
 | OCC_CMD start | BMC firmware issues it internally | host writes `OCC_CMD.start=1` |
 | Image verify | Ed25519 + CRC32 in firmware | host (`ethimg`) verifies; mFSM trusts host + OCC CRC32 |
 | Session FSM | absent (BMC is the FSM) | present, host-driven |

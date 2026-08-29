@@ -18,6 +18,7 @@ Deploy flow (mFSM, host-driven, EMRI v0):
 Plan-Ref: ethereal-plan/subsystems/S08-运行时daemon与ethctl.md sec 2.1/§2.3,
           ethereal-spec/control/emri-v0.md sec 2/3/4/7.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -81,7 +82,7 @@ class Transport(Protocol):
 
 @dataclass
 class RecordedTxn:
-    op: str          # "rd" | "wr" | "push"
+    op: str  # "rd" | "wr" | "push"
     addr: int
     data: int
 
@@ -120,9 +121,7 @@ class RecordTransport:
             "name": name,
             "region": region,
             "frames_words": frames_words,
-            "txn_log": [
-                {"op": t.op, "addr": t.addr, "data": t.data} for t in self.log
-            ],
+            "txn_log": [{"op": t.op, "addr": t.addr, "data": t.data} for t in self.log],
         }
 
 
@@ -414,9 +413,7 @@ class Daemon:
 
         # extract frames from the tar (frames not on disk as a file)
         frames_bytes = _extract_frames(eth_path, man.target)
-        return self.deploy(
-            frames_bytes, region=region, frame_addr=frame_addr
-        )
+        return self.deploy(frames_bytes, region=region, frame_addr=frame_addr)
 
 
 def _extract_frames(eth_path: Path, target: str) -> bytes:
@@ -486,11 +483,13 @@ def _cli(argv: list[str] | None = None) -> int:
             )
             print(
                 f"deployed region{r.region}: {r.words_written} words, "
-                f"{r.elapsed_s*1000:.1f} ms"
+                f"{r.elapsed_s * 1000:.1f} ms"
             )
             if args.mode == "plan" and args.plan_out:
                 # recompute frames_words for the plan
-                frames_bytes = _extract_frames(Path(args.eth), _target_of(Path(args.eth)))
+                frames_bytes = _extract_frames(
+                    Path(args.eth), _target_of(Path(args.eth))
+                )
                 words = [
                     struct.unpack_from("<I", frames_bytes, i)[0]
                     for i in range(0, len(frames_bytes), 4)
