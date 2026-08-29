@@ -38,6 +38,17 @@ import sys
 from pathlib import Path
 
 # NOP = addi x0, x0, 0 (used to pad the image; harmless if ever executed).
+from emri_constants import (
+    OCC_CMD_START,
+    OCC_STATUS_DONE_FLAG,
+    OCC_WRITE,
+    R_OCC_CMD,
+    R_OCC_FRAME_ADDR,
+    R_OCC_STATUS,
+    R_OCC_WDATA,
+    R_OCC_WORD_COUNT,
+)
+
 NOP = 0x00000013
 
 # IMEM ROM physical depth in the vendored minimal netlist (neorv32_imem_rom
@@ -58,6 +69,13 @@ XBUS2_BASE = 0x40001000
 # EMRI management window (emri mode): the xbar routes this to the
 # emri_axi_adapter -> emri_regfile peripheral. Matches tb_bmc_axi_emri.
 EMRI_BASE = 0x40002000
+
+# OCC byte offsets within the EMRI window (register word-offset * 4).
+OFF_OCC_CMD = R_OCC_CMD * 4
+OFF_OCC_WDATA = R_OCC_WDATA * 4
+OFF_OCC_STATUS = R_OCC_STATUS * 4
+OFF_OCC_FRAME_ADDR = R_OCC_FRAME_ADDR * 4
+OFF_OCC_WORD_COUNT = R_OCC_WORD_COUNT * 4
 
 
 def _lui(rd: int, imm20: int) -> int:
@@ -116,6 +134,20 @@ def _blt(rs1: int, rs2: int, imm: int) -> int:
         | (rs2 << 20)
         | (rs1 << 15)
         | (0b100 << 12)
+        | (((imm >> 1) & 0xF) << 8)
+        | (((imm >> 11) & 0x1) << 7)
+        | 0b1100011
+    )
+
+
+def _bne(rs1: int, rs2: int, imm: int) -> int:
+    # BNE: branch if rs1 != rs2. funct3 = 001.
+    return (
+        (((imm >> 12) & 0x1) << 31)
+        | (((imm >> 5) & 0x3F) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (0b001 << 12)
         | (((imm >> 1) & 0xF) << 8)
         | (((imm >> 11) & 0x1) << 7)
         | 0b1100011
@@ -319,6 +351,71 @@ def build_words_emri() -> list[int]:
     return prog + [NOP] * (ROM_WORDS - len(prog))
 
 
+def build_words_occ(frame_addr: int, data: list[int]) -> list[int]:
+    """Image driving a real OCC region-config WRITE via the AXI mgmt path.
+
+    Chain: NEORV32 -> XBUS -> eth_wb2axi -> eth_axi_xbar -> emri_axi_adapter
+    -> emri_regfile -> occ_top -> column_cfg_ram. This is the Phase-D loop
+    closure: the BMC (not a host BFM) streams a config frame into the fabric.
+
+    Sequence (mirrors the host sequence in tb_emri_occ_loop.sv):
+      1. OCC_FRAME_ADDR = frame_addr, OCC_WORD_COUNT = len(data)
+      2. OCC_CMD = START | WRITE | region(frame_addr top 4 bits)
+      3. push each data word via OCC_WDATA (the BMC `sw` stalls until the
+         skid accepts it — backpressure is transparent, no firmware polling)
+      4. poll OCC_STATUS until the sticky done_flag (bit3), check done_code
+         [5:4]==0 (DONE), then print "OC " + hex(status) + "\\n".
+
+    On a clean reset all regions start non-dirty (E0-FAB5), so the first WRITE
+    is accepted without a BLANK. After a successful WRITE of N words at frame
+    base F, OCC_STATUS reads: done_flag=1, done_code=0, live=IDLE, crc=0,
+    region=0, frame_echo=F -> for F=0 the word is exactly 0x00000008.
+
+    Register plan: x5=UART0 base, x6/x7 UART scratch, x10/x11 hex scratch,
+    x27=EMRI window base, x28=frame addr, x29=word count / data word,
+    x30=cmd / status readback, x31=poll scratch.
+    """
+    n = len(data)
+    region = (frame_addr >> 12) & 0xF  # occ_top region id = frame_addr top 4 bits
+    cmd_word = (1 << OCC_CMD_START) | (region << 2) | OCC_WRITE
+
+    prog: list[int] = [
+        _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
+        _addi(6, 0, 1),  # x6 = UART_CTRL_EN
+        _sw(6, 0, 5),  # CTRL = enable
+        _lui(27, EMRI_BASE >> 12),  # x27 = EMRI window base 0x40002000
+    ]
+    # 1. frame address + word count
+    prog += _const32(28, frame_addr)  # x28 = frame_addr
+    prog.append(_sw(28, OFF_OCC_FRAME_ADDR, 27))  # OCC_FRAME_ADDR = frame_addr
+    prog += _const32(29, n)  # x29 = N
+    prog.append(_sw(29, OFF_OCC_WORD_COUNT, 27))  # OCC_WORD_COUNT = N
+    # 2. issue WRITE command (held until occ_top accepts via host_ready)
+    prog += _const32(30, cmd_word)  # x30 = START|WRITE|region
+    prog.append(_sw(30, OFF_OCC_CMD, 27))  # OCC_CMD = start write
+    # 3. stream the config words (unrolled; each `sw` stalls until accepted)
+    for w in data:
+        prog += _const32(29, w & 0xFFFFFFFF)  # x29 = data word
+        prog.append(_sw(29, OFF_OCC_WDATA, 27))  # OCC_WDATA push
+    # 4. poll done_flag (bit3)
+    poll = len(prog)
+    prog.append(_lw(30, OFF_OCC_STATUS, 27))  # x30 = OCC_STATUS
+    prog.append(_andi(31, 30, 1 << OCC_STATUS_DONE_FLAG))  # x31 = done_flag
+    prog.append(_beq(31, 0, (poll - len(prog)) * 4))  # spin while 0
+    # 5. re-read status and print it (deterministic: 0x00000008 for frame 0)
+    prog.append(_lw(30, OFF_OCC_STATUS, 27))  # x30 = OCC_STATUS (final)
+    _emit_char(prog, "O")  # banner
+    _emit_char(prog, "C")
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 30)
+    _emit_char(prog, "\n")
+    prog.append(_jal(0, 0))  # halt
+
+    if len(prog) > ROM_WORDS:
+        raise ValueError(f"program too large: {len(prog)} words > {ROM_WORDS}")
+    return prog + [NOP] * (ROM_WORDS - len(prog))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -334,11 +431,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["hello", "xbus", "xbar", "emri"],
+        choices=["hello", "xbus", "xbar", "emri", "occ"],
         default="hello",
         help="hello = print --message; xbus = XBUS write+readback, print value; "
         "xbar = two-window write+readback via eth_axi_xbar, print both values; "
-        "emri = read EMRI MAGIC+CAPABILITIES via the AXI path, print both",
+        "emri = read EMRI MAGIC+CAPABILITIES via the AXI path, print both; "
+        "occ = stream an OCC config frame via the AXI mgmt path, print status",
     )
     parser.add_argument(
         "--wval",
@@ -351,9 +449,29 @@ def main(argv: list[str] | None = None) -> int:
         default="0xC33C5AA5",
         help="xbar mode window-1 value (default 0xC33C5AA5)",
     )
+    parser.add_argument(
+        "--frame-addr",
+        dest="frame_addr",
+        default="0x0",
+        help="occ mode: config frame base address (default 0x0)",
+    )
+    parser.add_argument(
+        "--occ-data",
+        dest="occ_data",
+        default="0xC0DE0000,0xC0DE0001,0xC0DE0002,0xC0DE0003",
+        help="occ mode: comma-separated config words to stream (default 4x 0xC0DE000i)",
+    )
     args = parser.parse_args(argv)
 
-    if args.mode == "emri":
+    if args.mode == "occ":
+        frame_addr = int(args.frame_addr, 0) & 0xFFFFFFFF
+        data = [int(v, 0) & 0xFFFFFFFF for v in args.occ_data.split(",")]
+        words = build_words_occ(frame_addr, data)
+        note = (
+            f"mode=occ frame=0x{frame_addr:x} n={len(data)} "
+            f"(prints 'OC ' + OCC_STATUS hex + '\\n')"
+        )
+    elif args.mode == "emri":
         words = build_words_emri()
         note = "mode=emri (prints 'EM ' + MAGIC hex + ' ' + CAP hex + '\\n')"
     elif args.mode == "xbar":
