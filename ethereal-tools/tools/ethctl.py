@@ -342,7 +342,7 @@ class Daemon:
             # shouldn't happen for BLANK itself, but handle defensively
             self._blank(region, frame_addr, word_count)
 
-    def _write_frames(self, region: int, frame_addr: int, words: list[int]) -> None:
+    def _write_frames(self, region: int, frame_addr: int, words: list[int]) -> int:
         self.transport.write(R_OCC_FRAME_ADDR, frame_addr)
         self.transport.write(R_OCC_WORD_COUNT, len(words))
         self.transport.write(
@@ -426,7 +426,7 @@ def _extract_frames(eth_path: Path, target: str) -> bytes:
         try:
             f = tf.extractfile(member)
         except KeyError:
-            raise DaemonError(f"{eth_path}: missing {member}")
+            raise DaemonError(f"{eth_path}: missing {member}") from None
         if f is None:
             raise DaemonError(f"{eth_path}: empty {member}")
         return f.read()
