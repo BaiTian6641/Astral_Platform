@@ -62,7 +62,11 @@ module emri_regfile #(
   input  logic        occ_wdata_ready_i,
   input  logic [2:0]  occ_status_i,
   input  logic        occ_crc_error_i,
-  output logic        occ_region_locked_o   // v0: hardwired 0 (see Details)
+  output logic        occ_region_locked_o,  // v0: hardwired 0 (see Details)
+
+  // -- frame_decoder start trigger (v0.1, emri-v0.md §3.1)
+  output logic        dec_start_o,          // 1-cycle pulse on R_OCC_DECODE write
+  output logic [7:0]  dec_col_o             // target fabric column (col_i)
 );
   import emri_pkg::*;
 
@@ -184,6 +188,32 @@ module emri_regfile #(
       endcase
     end
   end
+
+  // ------------------------------------------------------------------
+  // OCC_DECODE start trigger (v0.1, spec §3.1): a write to R_OCC_DECODE
+  // latches col_id and pulses dec_start_o for ONE fabric-clock cycle
+  // (-> frame_decoder.start_i), making a packed deploy self-contained over
+  // the register ABI (no host/TB sideband strobe). host_ready for this write
+  // is immediate (it is neither occ_cmd_start nor occ_wdata_push, so the
+  // ready logic's default write case returns 1). Reads as 0 (read-mux default).
+  // ------------------------------------------------------------------
+  logic       dec_start_r;
+  logic [7:0] dec_col_r;
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      dec_start_r <= 1'b0;
+      dec_col_r   <= 8'h0;
+    end else begin
+      dec_start_r <= 1'b0;  // default: single-cycle pulse
+      if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+          (host_addr_i == R_OCC_DECODE)) begin
+        dec_start_r <= 1'b1;
+        dec_col_r   <= host_wdata_i[7:0];
+      end
+    end
+  end
+  assign dec_start_o = dec_start_r;
+  assign dec_col_o   = dec_col_r;
 
   // ------------------------------------------------------------------
   // REGION_INFO read (windowed by region_sel_r)

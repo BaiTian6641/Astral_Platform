@@ -67,6 +67,7 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x0A` | `OCC_STATUS` | R | 32 | `{status[6:0], region_id[11:8], crc_error[16], reserved, frame_addr[31:16]}`. Mirrors `occ_top.status_o` + sticky `crc_error`. See §4. |
 | `0x0B` | `OCC_FRAME_ADDR` | RW | 16 | OCC frame base address (`frame_addr_i` to `occ_top`). `{region_id[15:12], col_id[11:4], rsv[3:0]}`. |
 | `0x0C` | `OCC_WORD_COUNT` | RW | 16 | Frame word count (`word_count_i` to `occ_top`). |
+| `0x0D` | `OCC_DECODE` | W | 32 | **frame_decoder start trigger** (v0.1). Writing pulses `dec_start_o` → `frame_decoder.start_i`; `data[7:0]` = target fabric column (`col_i`). Self-clearing pulse. Makes a packed deploy self-contained (no host/TB sideband strobe). See §3.1. |
 | `0x10` | `SESSION_CMD` | RW | 8 | mFSM session FSM control. `0=nop, 1=begin_rx, 2=verify(host-done), 3=occ_go, 4=abort`. BMC mode: ignored (BMC drives OCC directly). |
 | `0x11` | `SESSION_STATUS` | R | 8 | `{state[3:0], done[4], err[7:4]}`. See §5. |
 | `0x12` | `RX_BUF_CTRL` | RW | 32 | `{wr_ptr[31:16], depth[15:0]}`. Image-staging buffer (mFSM rx_buf). v0: depth ≤ 16KB. |
@@ -74,9 +75,10 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
 
-**Reserved ranges** (`0x06-0x07`, `0x0D-0x0F`, `0x13-0x1F`, `0x22-0x2F`, `0x32+`):
+**Reserved ranges** (`0x06-0x07`, `0x0E-0x0F`, `0x13-0x1F`, `0x22-0x2F`, `0x32+`):
 read-as-0, write-ignored. Reserved for v0.1/v1 (event-log ring @ `0x38`,
-telemetry block @ `0x40+`, scheduler @ `0x60+`).
+telemetry block @ `0x40+`, scheduler @ `0x60+`). (`0x0D` repurposed for
+`OCC_DECODE` in v0.1 — see §3.1.)
 
 ---
 
@@ -106,6 +108,33 @@ The OCC command trigger. **Bit layout:**
 > its per-region dirty bit + `S_NEEDS_BLANK` status (E0-FAB5). A WRITE to a dirty
 > region returns `NEEDS_BLANK`; the host MUST issue `BLANK` first. EMRI does not
 > second-guess this — it surfaces the status verbatim.
+
+---
+
+## 3.1 OCC_DECODE register (offset `0x0D`, v0.1)
+
+The **frame_decoder start trigger** for the packed/bit-packed frame path
+(`frame_decoder` demuxes an OCC bit-packed column stream into fabric `cfg`
+writes). In the host-driven capstones the decoder's `start_i` was pulsed by a
+**testbench sideband** (`dec_start`), which the BMC/host cannot reach through
+EMRI. `OCC_DECODE` makes the deploy **self-contained over the register ABI**:
+
+| Bits | Field | Meaning |
+|---|---|---|
+| `[7:0]` | `col_id` | Target fabric column (`col_i` to `frame_decoder`). |
+| `[31:8]` | reserved | 0. |
+
+**Semantics:** a write latches `col_id` and pulses `dec_start_o` for **one**
+fabric-clock cycle (→ `frame_decoder.start_i`), starting capture of the OCC
+frame stream that the next `OCC_CMD`(BLANK/WRITE) streams. Self-clearing (a
+write is a pulse, not a level). Read-as-0.
+
+**Deploy sequence (packed, BMC- or host-driven):**
+1. Write `OCC_FRAME_ADDR` + `OCC_WORD_COUNT` (= DATA words, CRC tail excluded).
+2. Write `OCC_DECODE = {col_id}` → pulses `dec_start_o` (decoder begins capture).
+3. Write `OCC_CMD = {region_id, cmd=BLANK|WRITE, start=1}` (+ stream `OCC_WDATA` for WRITE).
+4. Decoder auto-decodes once `column_data_words(col)` DATA words are captured;
+   host/BMC polls `OCC_STATUS.done_flag` (+ decoder `done_o` in hardware).
 
 ---
 
