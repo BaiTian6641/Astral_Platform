@@ -34,6 +34,7 @@ _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+# pi-lens-ignore: E402
 import ethimg
 from emri_constants import (
     OCC_BLANK,
