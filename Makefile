@@ -1,6 +1,11 @@
 # =============================================================================
 # Ethereal Logic Platform — root Makefile (task E0-INF3)
 # =============================================================================
+# NOTE (2026-08-30): pi-lens dispatches shellcheck on this file (Makefile ->
+# "shell" kind); shellcheck cannot parse GNU make conditionals (ifeq), so its
+# SC1073/SC1065/SC1064/SC1072 findings here are false positives (recorded as
+# such in the pi-lens disposition store). This Makefile is validated by `make`
+# itself and CI, not by shellcheck.
 # GNU make required (cocotb's makefiles and the awk help target assume GNU
 # make). All recipes use TAB indentation per the Makefile spec.
 #
@@ -36,7 +41,7 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/emri/emri_axi_adapter.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
 # Vendored NEORV32 all-Verilog netlist (machine-generated, BSD-3). NOT G1-ours —
 # provided to bmc_core as a dep; its ~536 vendor warnings are documented-waived
@@ -80,6 +85,8 @@ else
 	  case $$m in \
 	    mem_t|dsp_t)         deps="$(RTL_INF_DEPS)" ;; \
 	    emri_regfile)        deps="ethereal-shell/rtl/emri/emri_pkg.sv" ;; \
+	    emri_axi_adapter)    deps="ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
+	                         waiver="-Wno-UNUSEDPARAM" ;; \
 	    eth_axi_stream)      deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
 	                         waiver="-Wno-DECLFILENAME" ;; \
 	    eth_axi_lite_slave)  deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv" ;; \
@@ -150,6 +157,9 @@ else
 	@echo "[test-sv] tb_eth_wb2axi"; $(IVERILOG) -g2012 -o /tmp/tb_wb2axi ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-fabric/tests/axi/tb_eth_wb2axi.sv 2>/dev/null && vvp /tmp/tb_wb2axi | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] gen_bmc_hello --mode xbar (regen xbar image)"; .venv/bin/python ethereal-tools/tools/gen_bmc_hello.py --mode xbar --out generated/bmc/bmc_xbar.hex >/dev/null && echo "  image ok"
 	@echo "[test-sv] tb_bmc_axi_xbar"; $(IVERILOG) -g2012 -o /tmp/tb_bmcxbar ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/bmc/neorv32_verilog_wrapper.v ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-fabric/tests/bmc/tb_bmc_axi_xbar.sv 2>/dev/null && vvp /tmp/tb_bmcxbar | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_emri_axi_adapter"; $(IVERILOG) -g2012 -o /tmp/tb_emriad ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/emri/emri_axi_adapter.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/tests/emri/tb_emri_axi_adapter.sv 2>/dev/null && vvp /tmp/tb_emriad | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] gen_bmc_hello --mode emri (regen emri image)"; .venv/bin/python ethereal-tools/tools/gen_bmc_hello.py --mode emri --out generated/bmc/bmc_emri.hex >/dev/null && echo "  image ok"
+	@echo "[test-sv] tb_bmc_axi_emri"; $(IVERILOG) -g2012 -o /tmp/tb_bmcemri ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/bmc/neorv32_verilog_wrapper.v ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_axi_adapter.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/tests/bmc/tb_bmc_axi_emri.sv 2>/dev/null && vvp /tmp/tb_bmcemri | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_axi_lite_slave"; $(IVERILOG) -g2012 -o /tmp/tb_axils ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-fabric/tests/axi/tb_axi_lite_slave.sv 2>/dev/null && vvp /tmp/tb_axils | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_axi_stream"; $(IVERILOG) -g2012 -o /tmp/tb_axistream ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-fabric/tests/axi/tb_axi_stream.sv 2>/dev/null && vvp /tmp/tb_axistream | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_axi_xbar"; $(IVERILOG) -g2012 -o /tmp/tb_axbar ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-fabric/tests/axi/tb_axi_xbar.sv 2>/dev/null && vvp /tmp/tb_axbar | grep -q "TEST PASSED" && echo "  PASS"

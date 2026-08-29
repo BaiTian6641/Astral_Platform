@@ -55,6 +55,10 @@ XBUS_BASE = 0x40000000
 # proving address decode. 4 KiB-apart windows match the TB's ADDR_MAP masks.
 XBUS2_BASE = 0x40001000
 
+# EMRI management window (emri mode): the xbar routes this to the
+# emri_axi_adapter -> emri_regfile peripheral. Matches tb_bmc_axi_emri.
+EMRI_BASE = 0x40002000
+
 
 def _lui(rd: int, imm20: int) -> int:
     return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0b0110111
@@ -280,6 +284,41 @@ def build_words_xbar(wval0: int, wval1: int) -> list[int]:
     return prog + [NOP] * (ROM_WORDS - len(prog))
 
 
+def build_words_emri() -> list[int]:
+    """Image reading EMRI identity registers via the AXI management path.
+
+    Chain: NEORV32 -> XBUS -> eth_wb2axi -> eth_axi_xbar -> emri_axi_adapter
+    -> emri_regfile. Reads MAGIC (word 0) and CAPABILITIES (word 2) from the
+    EMRI window at ``EMRI_BASE`` and prints "EM " + hex(magic) + " " +
+    hex(capabilities) + "\\n" over UART0. With HAS_BMC=1 the expected output
+    is "EM 45544852 00000001\\n" — proving the BMC reaches the management
+    register plane through the AXI fabric end-to-end.
+
+    Register plan: x5=UART0 base, x6/x7 UART scratch, x10/x11 hex scratch,
+    x27=EMRI window base, x30=MAGIC readback, x25=CAPABILITIES readback.
+    """
+    prog: list[int] = [
+        _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
+        _addi(6, 0, 1),  # x6 = UART_CTRL_EN
+        _sw(6, 0, 5),  # CTRL = enable
+        _lui(27, EMRI_BASE >> 12),  # x27 = EMRI window base 0x40002000
+        _lw(30, 0, 27),  # x30 = EMRI.MAGIC         (word 0, byte 0x00)
+        _lw(25, 8, 27),  # x25 = EMRI.CAPABILITIES  (word 2, byte 0x08)
+    ]
+    _emit_char(prog, "E")  # banner
+    _emit_char(prog, "M")
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 30)
+    _emit_char(prog, " ")
+    _emit_hex32(prog, 25)
+    _emit_char(prog, "\n")
+    prog.append(_jal(0, 0))  # halt
+
+    if len(prog) > ROM_WORDS:
+        raise ValueError(f"program too large: {len(prog)} words > {ROM_WORDS}")
+    return prog + [NOP] * (ROM_WORDS - len(prog))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -295,10 +334,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=["hello", "xbus", "xbar"],
+        choices=["hello", "xbus", "xbar", "emri"],
         default="hello",
         help="hello = print --message; xbus = XBUS write+readback, print value; "
-        "xbar = two-window write+readback via eth_axi_xbar, print both values",
+        "xbar = two-window write+readback via eth_axi_xbar, print both values; "
+        "emri = read EMRI MAGIC+CAPABILITIES via the AXI path, print both",
     )
     parser.add_argument(
         "--wval",
@@ -313,7 +353,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.mode == "xbar":
+    if args.mode == "emri":
+        words = build_words_emri()
+        note = "mode=emri (prints 'EM ' + MAGIC hex + ' ' + CAP hex + '\\n')"
+    elif args.mode == "xbar":
         wval0 = int(args.wval, 0) & 0xFFFFFFFF
         wval1 = int(args.wval2, 0) & 0xFFFFFFFF
         words = build_words_xbar(wval0, wval1)
