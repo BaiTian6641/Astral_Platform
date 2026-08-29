@@ -2,6 +2,7 @@
 # 与《Ethereal-平台实施蓝图-v2.md》及《Ethereal-蓝图v2.1-BMC与运行时修订.md》配套。
 # v2.1 变更：弃用 GW5 AE350 硬核（付费工具链）；管理单元改为 fabric 内 RISC-V 软核（BMC，
 # 主选 NEORV32），小器件降级为 mFSM（与 BMC 统一 EMRI 寄存器 ABI）。
+# 状态同步：2026-08-30 与 git 历史/验收报告对齐（status: done/in_progress 依据 docs/reports/ + 提交记录）。
 # 字段说明：
 #   id / title / phase / deps / est_days / deliverable / acceptance / status
 
@@ -15,7 +16,7 @@ project:
     host_link: {data: SPI, monitor: I2C (PMBus-style)}
     control_plane: independent-then-unified (ADR-010)
     management:
-      bmc: soft-core RISC-V in fabric (primary: NEORV32, fallback: VexRiscv)  # ADR-013/016
+      bmc: "soft-core RISC-V in fabric (primary: NEORV32, fallback: VexRiscv)"  # ADR-013/016
       small_devices: mFSM (register-based, host-driven)                        # ADR-014
       unified_abi: EMRI (BMC and mFSM expose identical register interface)     # ADR-015
       deprecated: gowin-ae350-hardcore (paid toolchain, unusable software)
@@ -66,7 +67,7 @@ phases:
       - 统一编排器（bundle/多板/声明式）
       - BMC 固件迁移 Zephyr，BMC 成为 Astral 节点
       - 4 个参考设计套件
-      - >=2 名核心外部贡献者
+      - ">=2 名核心外部贡献者"
 
   - id: phase-5
     name: 商业级演进
@@ -85,7 +86,7 @@ tasks:
     est_days: 1
     deliverable: 仓库组（ethereal-fabric/shell/tools/runtime/spec/images/astral-os/docs）
     acceptance: clone 后 README 与许可证链接全部有效；DCO 检查启用
-    status: todo
+    status: done
 
   - id: E0-INF2
     title: CI 骨架（Verilator lint + cocotb 回归 + 文档构建）
@@ -94,7 +95,7 @@ tasks:
     est_days: 1
     deliverable: GitHub Actions 工作流
     acceptance: dummy RTL 测试在 CI 变绿
-    status: todo
+    status: in_progress
 
   - id: E0-INF3
     title: 仿真环境 Dockerfile（Verilator5 + cocotb + Yosys + VPR8）
@@ -103,7 +104,7 @@ tasks:
     est_days: 2
     deliverable: Dockerfile + Makefile（make sim）
     acceptance: 干净机器 30 分钟内复现仿真环境
-    status: todo
+    status: done
 
   - id: E0-INF4
     title: 商标/名称可用性检查（Ethereal/Astral）
@@ -112,7 +113,7 @@ tasks:
     est_days: 0.5
     deliverable: 检查记录文档
     acceptance: GitHub org/域名/开源商标冲突结论明确
-    status: todo
+    status: done
 
   - id: E0-FAB1
     title: eLUT4+FF 单元 RTL
@@ -121,7 +122,7 @@ tasks:
     est_days: 1
     deliverable: rtl/clb/elut4.sv + cocotb 测试
     acceptance: 随机真值表 1000 组比对通过
-    status: todo
+    status: done
 
   - id: E0-FAB2
     title: CLB-T cluster RTL（N=8, Clos IIB, 参数化）
@@ -130,7 +131,7 @@ tasks:
     est_days: 3
     deliverable: rtl/clb/clb_t.sv
     acceptance: cluster 内 LUT→LUT 连通性穷举通过
-    status: todo
+    status: done
 
   - id: E0-FAB3
     title: Switch box + 通道互联（W=12, 两源轨道优先）
@@ -139,7 +140,7 @@ tasks:
     est_days: 4
     deliverable: rtl/interconnect/ + 拓扑表
     acceptance: 4x4 cluster 网格例化成功，无组合环
-    status: todo
+    status: done
 
   - id: E0-FAB4
     title: 配置帧组织 + OCC v0（WRITE/BLANK/READBACK）
@@ -148,7 +149,7 @@ tasks:
     est_days: 4
     deliverable: rtl/occ/ + 帧地址映射生成脚本
     acceptance: 经 OCC 写配置后 fabric 行为=指定电路（加法器/计数器样例）
-    status: todo
+    status: done
 
   - id: E0-FAB5
     title: blank-before-write 与 region 配置锁
@@ -157,7 +158,7 @@ tasks:
     est_days: 2
     deliverable: OCC 扩展 + 断言
     acceptance: 改写相邻 region 时本 region 输出无毛刺（断言监测）；LOCK 后写被丢弃
-    status: todo
+    status: done
 
   - id: E0-FAB6
     title: fabric-gen v0（fabric.yaml → 顶层 Verilog + 帧映射 JSON）
@@ -166,7 +167,7 @@ tasks:
     est_days: 3
     deliverable: tools/fabric_gen/
     acceptance: 2x2 与 4x4 两种 fabric 均通过 E0-FAB4 验收用例
-    status: todo
+    status: done
 
   - id: E0-MAP1
     title: Yosys 定制综合（eLUT4 techlib + synth_ethereal）
@@ -175,7 +176,7 @@ tasks:
     est_days: 2
     deliverable: tools/mapper/yosys/
     acceptance: c17/c432 映射为 eLUT4 网表，LUT 数合理
-    status: todo
+    status: done
 
   - id: E0-MAP2
     title: VPR 架构文件（eLUT4 cluster + W=12）
@@ -184,7 +185,7 @@ tasks:
     est_days: 4
     deliverable: tools/mapper/vpr/arch_ethereal.xml
     acceptance: VPR 对 c432 完成 pack/place/route，时序报告可读
-    status: todo
+    status: done
 
   - id: E0-MAP3
     title: bitgen v0（VPR 结果 → 配置帧比特流）
@@ -193,7 +194,7 @@ tasks:
     est_days: 5
     deliverable: tools/mapper/bitgen/
     acceptance: c432 端到端载入仿真 fabric，输出与参考模型 bit-true
-    status: todo
+    status: done
 
   - id: E0-MAP4
     title: FABulous 流程评估 spike → ADR-012（MAP 路线决策）
@@ -202,7 +203,7 @@ tasks:
     est_days: 3
     deliverable: 评估笔记 + docs/adr/ADR-012.md
     acceptance: 路线 A(VPR) / B(FABulous) 决策记录完成
-    status: todo
+    status: done
 
   - id: E0-MAP5
     title: 基准电路集（AES-128/PRESENT/FIR16/CRC32/PWM + 黄金向量）
@@ -211,7 +212,7 @@ tasks:
     est_days: 4
     deliverable: benchmarks/
     acceptance: 全部基准经完整流程在仿真 fabric 运行正确
-    status: todo
+    status: done
 
   - id: E0-SHL1
     title: EBI-Tiny 总线 RTL + 地址映射 decoder
@@ -229,7 +230,7 @@ tasks:
     est_days: 3
     deliverable: sim/tb_shell/
     acceptance: 仿真内完成完整容器部署周期：写配置→启动→读结果→blank→换镜像→再运行
-    status: todo
+    status: in_progress
 
   - id: E0-SHL3
     title: 性能建模（配置字节数/时延模型/虚拟 Fmax 初值）
@@ -248,7 +249,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-fabric/hal/gowin_gw5/
     acceptance: 4x4 fabric 综合后物理 LUT 开销 ≤45:1 并报告实际值
-    status: todo
+    status: in_progress
 
   - id: E1-PLT2
     title: Base image 构建流（Gowin EDA 工程模板 + 脚本化）
@@ -275,7 +276,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-shell/bmc/（bmc_core wrapper，核可替换）
     acceptance: 仿真与 GW5 双平台 hello-world + Shell CSR 读写；BMC 总开销报告（LUT+BSRAM）
-    status: todo
+    status: in_progress
 
   - id: E1-BMC2
     title: BMC 固件框架（boot 双分区 + 驱动层 + lifecycle 状态机骨架）
@@ -302,7 +303,7 @@ tasks:
     est_days: 2
     deliverable: rtl/emri/ + ethctl 探测逻辑
     acceptance: ethctl 自动识别 BMC/mFSM 模式并调整会话语义
-    status: todo
+    status: in_progress
 
   - id: E1-IO1
     title: SPI 数据通道（NEORV32 SDI + EFP-SPI 帧协议固件栈 + CRC16）
@@ -347,7 +348,7 @@ tasks:
     est_days: 2
     deliverable: tools/ethimg/
     acceptance: 篡改任意字节即验签失败
-    status: todo
+    status: done
 
   - id: E1-RUN2
     title: ethereal-daemon v1（BMC 固件：验签→region 分配→OCC(DMA) 加载→生命周期）
@@ -356,7 +357,7 @@ tasks:
     est_days: 4
     deliverable: bmc-fw/daemon/
     acceptance: run/stop/ps/restart 全通；坏签名/满 region/写冲突优雅报错
-    status: todo
+    status: in_progress
 
   - id: E1-RUN3
     title: ethctl CLI（Docker 风格命令集）
@@ -365,7 +366,7 @@ tasks:
     est_days: 3
     deliverable: tools/ethctl/
     acceptance: ethctl run aes128.eth --region 0 在 30s 内完成部署
-    status: todo
+    status: in_progress
 
   - id: E1-RUN4
     title: region 看门狗 v1（心跳+超时 blank+事件日志）
@@ -383,7 +384,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-images/ 三个镜像
     acceptance: 2 region 轮换运行；热替换 <10ms(BMC+DMA) / <100ms(上位机经 SPI)
-    status: todo
+    status: in_progress
 
   - id: E1-DMO2
     title: 热替换稳定性测试（2x10000 次 + 干扰监测）
@@ -411,7 +412,7 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/mem_t/
     acceptance: AES S-box MEM-T 版 vs LUT 版 eLUT 占用降 ≥5x
-    status: todo
+    status: in_progress
 
   - id: E2-FAB2
     title: DSP-T tile（27x18 MAC 模式封装）
@@ -420,7 +421,7 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/dsp_t/
     acceptance: FIR16 DSP-T 链实测 Fmax 与吞吐达标（vs LUT 版 ≥10x 吞吐）
-    status: todo
+    status: in_progress
 
   - id: E2-FAB3
     title: SSM-T tile + 上下文保存 v1（FF 状态扫描读/写，BMC 编排）
@@ -438,7 +439,7 @@ tasks:
     est_days: 5
     deliverable: fabric-gen v2 + 帧映射 v2
     acceptance: 混合 tile region 生成/配置/运行全链路通过
-    status: todo
+    status: in_progress
 
   - id: E2-FAB5
     title: 互联优化 v2（两源轨道 + LUT 平台期对齐）
@@ -456,7 +457,7 @@ tasks:
     est_days: 8
     deliverable: tools/mapper v2
     acceptance: 含 RAM/DSP 的基准端到端 bit-true
-    status: todo
+    status: in_progress
 
   - id: E2-IO1
     title: L2 代理库扩展（SPI/I2C master/PWM/QEI）+ RFC-004 冻结
@@ -483,7 +484,7 @@ tasks:
     est_days: 4
     deliverable: rtl/mfsm/
     acceptance: 仿真中上位机脚本经 EMRI 驱动完整部署流程；ethctl 无感切换
-    status: todo
+    status: in_progress
 
   - id: E2-BMC2
     title: （可选）VexRiscv 备选核 wrapper 验证

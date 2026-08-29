@@ -44,6 +44,13 @@ NOP = 0x00000013
 # memory reg[255:0]); the image is padded to this many 32-bit words.
 ROM_WORDS = 256
 
+# XBUS target window. NEORV32 XBUS = the "void": any access outside
+# IMEM(0x00000000) / DMEM(0x80000000) / IO(0xFFE00000+) routes to XBUS, and the
+# full 32-bit CPU address forwards to xbus_adr_o unchanged (neorv32_xbus.vhd
+# `xbus_adr_o <= bus_req.addr`). 0x40000000 is safely clear of all internal
+# regions -> routed to XBUS -> our eth_wb2axi -> the eth_axi fabric.
+XBUS_BASE = 0x40000000
+
 
 def _lui(rd: int, imm20: int) -> int:
     return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0b0110111
@@ -76,6 +83,10 @@ def _andi(rd: int, rs1: int, imm: int) -> int:
     return ((imm & 0xFFF) << 20) | (rs1 << 15) | (0b111 << 12) | (rd << 7) | 0b0010011
 
 
+def _add(rd: int, rs1: int, rs2: int) -> int:
+    return (rs2 << 20) | (rs1 << 15) | (0b000 << 12) | (rd << 7) | 0b0110011
+
+
 def _beq(rs1: int, rs2: int, imm: int) -> int:
     return (
         (((imm >> 12) & 0x1) << 31)
@@ -83,6 +94,20 @@ def _beq(rs1: int, rs2: int, imm: int) -> int:
         | (rs2 << 20)
         | (rs1 << 15)
         | (0b000 << 12)
+        | (((imm >> 1) & 0xF) << 8)
+        | (((imm >> 11) & 0x1) << 7)
+        | 0b1100011
+    )
+
+
+def _blt(rs1: int, rs2: int, imm: int) -> int:
+    # BLT: branch if rs1 < rs2 (signed). funct3 = 100.
+    return (
+        (((imm >> 12) & 0x1) << 31)
+        | (((imm >> 5) & 0x3F) << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
+        | (0b100 << 12)
         | (((imm >> 1) & 0xF) << 8)
         | (((imm >> 11) & 0x1) << 7)
         | 0b1100011
@@ -100,21 +125,103 @@ def _jal(rd: int, imm: int) -> int:
     )
 
 
+def _emit_char(prog: list[int], ch: str) -> None:
+    """Append the poll-TX-then-store sequence for one character.
+
+    Assumes x5 = UART0 base and UART0 already enabled. Uses x6 (char) + x7
+    (poll scratch).
+    """
+    prog.append(_addi(6, 0, ord(ch)))  # x6 = char
+    poll = len(prog)  # index of the poll loop head (in words)
+    prog.append(_lw(7, 0, 5))  # x7 = CTRL
+    prog.append(_srli(7, 7, 19))  # TX_NFULL -> bit0
+    prog.append(_andi(7, 7, 1))  # isolate
+    prog.append(_beq(7, 0, (poll - len(prog)) * 4))  # spin while full
+    prog.append(_sw(6, 4, 5))  # DATA = char
+
+
+def _emit_hex_nibble(prog: list[int], reg: int) -> None:
+    """Append code that prints the low nibble of ``reg`` as one hex char.
+
+    Uses x10 (nibble/char) + x11 (constant 10) + x7 (poll scratch). UART0 must
+    already be enabled with x5 = base. The digit/letter select uses BLT with a
+    fixed-up branch offset, then a JAL skips the digit path.
+    """
+    prog.append(_andi(10, reg, 0xF))  # x10 = reg & 0xF
+    prog.append(_addi(11, 0, 10))  # x11 = 10
+    blt_idx = len(prog)
+    prog.append(0)  # placeholder: BLT x10, x11 -> digit path (fixed below)
+    # >= 10 (letter) path: char = 'A' + (x10 - 10) = x10 + 55 (uppercase hex,
+    # matching the tb_bmc_axi_master expected message "AX 5AA5C33C\n")
+    prog.append(_addi(10, 10, 55))
+    jal_idx = len(prog)
+    prog.append(0)  # placeholder: JAL -> store (skip digit path, fixed below)
+    digit_idx = len(prog)
+    prog.append(_addi(10, 10, ord("0")))  # digit path: char = '0' + x10
+    store_idx = len(prog)
+    # fix up branch/jump targets (offsets are byte-relative to the instruction)
+    prog[blt_idx] = _blt(10, 11, (digit_idx - blt_idx) * 4)
+    prog[jal_idx] = _jal(0, (store_idx - jal_idx) * 4)
+    # poll TX-not-full then store the char in x10
+    poll = len(prog)
+    prog.append(_lw(7, 0, 5))
+    prog.append(_srli(7, 7, 19))
+    prog.append(_andi(7, 7, 1))
+    prog.append(_beq(7, 0, (poll - len(prog)) * 4))
+    prog.append(_sw(10, 4, 5))
+
+
 def build_words(message: str) -> list[int]:
-    """Return the image as a list of 32-bit words, padded to ``ROM_WORDS``."""
+    """Return the hello image as a list of 32-bit words, padded to ``ROM_WORDS``."""
     prog: list[int] = [
         _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
         _addi(6, 0, 1),  # x6 = UART_CTRL_EN
         _sw(6, 0, 5),  # CTRL = enable
     ]
     for ch in message:
-        prog.append(_addi(6, 0, ord(ch)))  # x6 = char
-        poll = len(prog)  # index of the poll loop head (in words)
-        prog.append(_lw(7, 0, 5))  # x7 = CTRL
-        prog.append(_srli(7, 7, 19))  # TX_NFULL -> bit0
-        prog.append(_andi(7, 7, 1))  # isolate
-        prog.append(_beq(7, 0, (poll - len(prog)) * 4))  # spin while full
-        prog.append(_sw(6, 4, 5))  # DATA = char
+        _emit_char(prog, ch)
+    prog.append(_jal(0, 0))  # halt
+
+    if len(prog) > ROM_WORDS:
+        raise ValueError(f"program too large: {len(prog)} words > {ROM_WORDS}")
+    return prog + [NOP] * (ROM_WORDS - len(prog))
+
+
+def build_words_xbus(wval: int) -> list[int]:
+    """Image that does an XBUS write+readback and prints the value over UART0.
+
+    Writes ``wval`` to the XBUS-window register at ``XBUS_BASE`` (via the
+    eth_wb2axi bridge -> eth_axi slave), reads it back, then prints "AX" + a
+    space + 8 hex digits (MSB-first) + "\\n" over UART0. This proves the BMC
+    drives the AXI fabric end-to-end.
+    """
+    # rv32 32-bit constant load via LUI+ADDI. LUI shifts the 20-bit immediate
+    # left by 12; ADDI adds a signed 12-bit immediate. The standard split is
+    # hi20 = (wval >> 12) + carry, lo_s = low-12-bits (sign-extended, carry if
+    # the low 12 bits have the top bit set, which ADDI would subtract from hi).
+    lo12 = wval & 0xFFF
+    carry = 1 if lo12 >= 0x800 else 0
+    hi20 = ((wval >> 12) + carry) & 0xFFFFF
+    lo_s = lo12 - 0x1000 if lo12 >= 0x800 else lo12
+
+    prog: list[int] = [
+        _lui(5, 0xFFF50),  # x5 = UART0 base 0xFFF50000
+        _addi(6, 0, 1),  # x6 = UART_CTRL_EN
+        _sw(6, 0, 5),  # CTRL = enable
+        _lui(28, XBUS_BASE >> 12),  # x28 = XBUS base 0x40000000 (LUI imm<<12)
+        _lui(29, hi20),  # x29 = wval high 20 bits (carry-adjusted)
+        _addi(29, 29, lo_s),  # x29 = wval (full 32-bit)
+        _sw(29, 0, 28),  # XBUS[0x40000000] = wval   (AXI write)
+        _lw(30, 0, 28),  # x30 = XBUS[0x40000000]    (AXI read back)
+    ]
+    _emit_char(prog, "A")  # banner
+    _emit_char(prog, "X")
+    _emit_char(prog, " ")
+    # print 8 hex digits of x30, MSB-first
+    for i in range(8):
+        prog.append(_srli(10, 30, 28 - i * 4))  # bring nibble i (from MSB) to low
+        _emit_hex_nibble(prog, 10)
+    _emit_char(prog, "\n")
     prog.append(_jal(0, 0))  # halt
 
     if len(prog) > ROM_WORDS:
@@ -133,15 +240,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--message",
         default="HI\n",
-        help="message to print over UART0 (default 'HI\\n')",
+        help="message to print over UART0 (default 'HI\\n'); ignored when --mode=xbus",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["hello", "xbus"],
+        default="hello",
+        help="hello = print --message; xbus = XBUS write+readback, print value",
+    )
+    parser.add_argument(
+        "--wval",
+        default="0x5AA5C33C",
+        help="32-bit value the xbus mode writes/reads (default 0x5AA5C33C)",
     )
     args = parser.parse_args(argv)
 
-    message = args.message.encode().decode("unicode_escape")
-    words = build_words(message)
+    if args.mode == "xbus":
+        wval = int(args.wval, 0) & 0xFFFFFFFF
+        words = build_words_xbus(wval)
+        note = f"mode=xbus wval=0x{wval:08x} (prints 'AX ' + 8 hex + '\\n')"
+    else:
+        message = args.message.encode().decode("unicode_escape")
+        words = build_words(message)
+        note = f"mode=hello message={message!r}"
+
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("".join(f"{w:08x}\n" for w in words))
-    print(f"[gen_bmc_hello] wrote {len(words)} words -> {args.out} (message={message!r})")
+    print(f"[gen_bmc_hello] wrote {len(words)} words -> {args.out} ({note})")
     return 0
 
 

@@ -39,14 +39,34 @@ module tb_bmc_hello;
     logic uart0_rxd;
 
     // -- DUT: bmc_core (NEORV32 inside) --------------------------------------
+    // The XBUS/AXI master is idle for this hello test (no XBUS access in the
+    // image), so the AXI master inputs are tied benign (never a valid transfer).
     bmc_core dut (
-        .clk_i       (clk),
-        .rst_ni      (rst_n),
-        .uart0_txd_o (uart0_txd),
-        .uart0_rxd_i (uart0_rxd),
-        .dbg_en_i    (1'b0),
-        .bus_req_o   (),
-        .heartbeat_o ()
+        .clk_i         (clk),
+        .rst_ni        (rst_n),
+        .uart0_txd_o   (uart0_txd),
+        .uart0_rxd_i   (uart0_rxd),
+        .m_axi_awvalid (),
+        .m_axi_awready (1'b0),
+        .m_axi_awaddr  (),
+        .m_axi_awprot  (),
+        .m_axi_wvalid  (),
+        .m_axi_wready  (1'b0),
+        .m_axi_wdata   (),
+        .m_axi_wstrb   (),
+        .m_axi_bvalid  (1'b0),
+        .m_axi_bready  (),
+        .m_axi_bresp   (2'b00),
+        .m_axi_arvalid (),
+        .m_axi_arready (1'b0),
+        .m_axi_araddr  (),
+        .m_axi_arprot  (),
+        .m_axi_rvalid  (1'b0),
+        .m_axi_rready  (),
+        .m_axi_rdata   (32'h0),
+        .m_axi_rresp   (2'b00),
+        .dbg_en_i      (1'b0),
+        .heartbeat_o   ()
     );
 
     // -- Clock ----------------------------------------------------------------
@@ -56,10 +76,12 @@ module tb_bmc_hello;
     // -- IMEM image preload (backdoor into the generated netlist ROM) --------
     // Hierarchical path: bmc_core.u_core -> neorv32_top -> imem -> imem_rom ROM.
     localparam string IMAGE = "generated/bmc/bmc_hello.hex";
+    // NOTE (2026-08-08): regenerating the netlist for XBUS renamed the ROM array
+    // n6830 -> n6964 (GHDL node renumbering). Update this path on any regen.
     initial begin
         $readmemh(IMAGE, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_imem_enabled_neorv32_imem_inst
-                  .imem_rom_imem_rom_inst.n6830);
+                  .imem_rom_imem_rom_inst.n6964);
     end
 
     // -- UART 8N1 receive (idle-high, start bit low, LSB first) --------------
