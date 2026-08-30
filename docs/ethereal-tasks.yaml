@@ -286,7 +286,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-runtime/bmc-fw/
     acceptance: 固件 UART 启动；region 状态机空转演示；FW 双分区自更新演示
-    status: todo
+    status: in_progress
 
   - id: E1-BMC3
     title: BMC 调试通道（UART 控制台 + JTAG 排针 + OpenOCD 配置）
