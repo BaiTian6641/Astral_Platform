@@ -237,7 +237,7 @@ module mailbox_switch_2x1 #(
         force_be = (lat_ctr == 2'd3) && any_be;
 
         for (int i = 0; i < 3; i++) begin
-          int idx = (rr + i) % 3; // ensure rotation over 3 sources
+          int idx = (int'(rr) + i) % 3; // ensure rotation over 3 sources (rr cast to int: G1 width-clean)
           logic idx_req; logic idx_prio; logic [3:0] idx_hops;
           case (idx)
             0: begin idx_req = req0; idx_prio = prio0; idx_hops = hops0; end
@@ -327,9 +327,9 @@ module mailbox_switch_2x1 #(
       need_dl0 = ingress_tgt[i][0];
       need_dl1 = ingress_tgt[i][1];
 
-      has_all = (!need_up  || (sel_up  == i)) &&
-                (!need_dl0 || (sel_dl0 == i)) &&
-                (!need_dl1 || (sel_dl1 == i));
+      has_all = (!need_up  || (int'(sel_up)  == i)) &&
+                (!need_dl0 || (int'(sel_dl0) == i)) &&
+                (!need_dl1 || (int'(sel_dl1) == i));
       grant_src[i] = has_all && (ingress_tgt[i] != 3'b000);
 
       // DEBUG: show per-source arbitration decision and flit info
