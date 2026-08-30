@@ -16,6 +16,7 @@
  *           ethereal-plan/components/C05-BMC组件.md §4.2 (lifecycle FSM).
  */
 #include "drivers/uart.h"
+#include "drivers/emri.h"
 
 /* Region lifecycle states (C05 §4.2). v0: no hardware side-effects. */
 typedef enum {
@@ -59,7 +60,17 @@ int main(void)
 {
     uart_init();
     uart_puts("bmc-fw v0 skeleton boot OK\n");
-    uart_puts("EMRI MAGIC=0x45544852 lifecycle: ");
+
+    /* Read the EMRI identity over the AXI management fabric (XBUS -> eth_wb2axi
+       -> xbar -> emri_axi_adapter -> emri_regfile). This proves the C firmware
+       drives the management plane end-to-end (the daemon's foundation). */
+    uint32_t magic = emri_read(EMRI_MAGIC_WORD);     /* expect 0x45544852 "ETHR" */
+    uint32_t cap   = emri_read(EMRI_CAP_WORD);       /* expect 0x1 (has_bmc) */
+    uart_puts("EMRI MAGIC=");
+    uart_puthex32(magic);
+    uart_puts(" CAP=");
+    uart_puthex32(cap);
+    uart_puts(" lifecycle: ");
 
     /* Skeleton lifecycle spin: drive region 0 through one full cycle. */
     region_load(&g_regions[0], /*image_id=*/1u);

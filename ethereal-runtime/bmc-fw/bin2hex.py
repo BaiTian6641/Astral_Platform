@@ -8,6 +8,7 @@ same format gen_bmc_hello.py emits). Pads to a 4-byte boundary.
 
 Plan-Ref: ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.2.
 """
+
 from __future__ import annotations
 
 import sys
