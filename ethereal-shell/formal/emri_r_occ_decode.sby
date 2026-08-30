@@ -1,0 +1,25 @@
+# emri_regfile R_OCC_DECODE formal proof (SymbiYosys).
+# Proves the R_OCC_DECODE sequencing contract: dec_start fires ONLY on an
+# accepted write while the decoder is IDLE (regression guard for the
+# 2026-08-30 dec_start-dropped-when-busy fix + dec_start-pulse-window
+# hardening), airtight backpressure (host_ready = !dec_busy_i && !dec_start_r),
+# single-cycle pulse, and column-id latch.
+# Run:  sby -f emri_r_occ_decode.sby
+[tasks]
+prove
+
+[options]
+prove: mode prove
+prove: depth 40
+
+[engines]
+prove: smtbmc
+
+[script]
+read -formal emri_pkg.sv
+read -formal emri_regfile.sv
+prep -top emri_regfile
+
+[files]
+ethereal-shell/rtl/emri/emri_pkg.sv
+ethereal-shell/rtl/emri/emri_regfile.sv

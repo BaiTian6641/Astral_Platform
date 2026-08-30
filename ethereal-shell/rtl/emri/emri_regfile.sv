@@ -69,7 +69,39 @@ module emri_regfile #(
   output logic [7:0]  dec_col_o,            // target fabric column (col_i)
   input  logic        dec_busy_i            // frame_decoder busy_o (write backpressure)
 );
-  import emri_pkg::*;
+  // emri_pkg constants, aliased via explicit package scoping. (Yosys's
+  // default SV frontend used for the formal/sby build does not accept
+  // `import pkg::*;` — slang/surelog unavailable in this build. Explicit
+  // scoping works in Yosys, iverilog, and verilator, and still uses the
+  // shared emri_pkg single source of truth — no ABI drift.)
+  localparam logic [31:0] EMRI_MAGIC       = emri_pkg::EMRI_MAGIC;
+  localparam logic [31:0] EMRI_ABI_VERSION = emri_pkg::EMRI_ABI_VERSION;
+  localparam logic [15:0] R_MAGIC          = emri_pkg::R_MAGIC;
+  localparam logic [15:0] R_ABI_VERSION    = emri_pkg::R_ABI_VERSION;
+  localparam logic [15:0] R_CAPABILITIES   = emri_pkg::R_CAPABILITIES;
+  localparam logic [15:0] R_PLATFORM_ID    = emri_pkg::R_PLATFORM_ID;
+  localparam logic [15:0] R_NUM_REGIONS    = emri_pkg::R_NUM_REGIONS;
+  localparam logic [15:0] R_REGION_SEL     = emri_pkg::R_REGION_SEL;
+  localparam logic [15:0] R_REGION_INFO    = emri_pkg::R_REGION_INFO;
+  localparam logic [15:0] R_OCC_CMD        = emri_pkg::R_OCC_CMD;
+  localparam logic [15:0] R_OCC_WDATA      = emri_pkg::R_OCC_WDATA;
+  localparam logic [15:0] R_OCC_STATUS     = emri_pkg::R_OCC_STATUS;
+  localparam logic [15:0] R_OCC_FRAME_ADDR = emri_pkg::R_OCC_FRAME_ADDR;
+  localparam logic [15:0] R_OCC_WORD_COUNT = emri_pkg::R_OCC_WORD_COUNT;
+  localparam logic [15:0] R_OCC_DECODE     = emri_pkg::R_OCC_DECODE;
+  localparam logic [15:0] R_SESSION_CMD    = emri_pkg::R_SESSION_CMD;
+  localparam logic [15:0] R_SESSION_STATUS = emri_pkg::R_SESSION_STATUS;
+  localparam logic [15:0] R_RX_BUF_CTRL    = emri_pkg::R_RX_BUF_CTRL;
+  localparam logic [15:0] R_HEALTH_STATUS  = emri_pkg::R_HEALTH_STATUS;
+  localparam logic [15:0] R_MON_TEMP       = emri_pkg::R_MON_TEMP;
+  localparam logic [15:0] R_MON_VCCINT     = emri_pkg::R_MON_VCCINT;
+  localparam int          OCC_CMD_START    = emri_pkg::OCC_CMD_START;
+  localparam logic [2:0]  OCC_S_DONE       = emri_pkg::OCC_S_DONE;
+  localparam logic [2:0]  OCC_S_ERROR      = emri_pkg::OCC_S_ERROR;
+  localparam logic [2:0]  OCC_S_LOCKED     = emri_pkg::OCC_S_LOCKED;
+  localparam logic [2:0]  OCC_S_NEEDS_BLANK = emri_pkg::OCC_S_NEEDS_BLANK;
+  localparam logic [1:0]  SPI_OP_WR        = emri_pkg::SPI_OP_WR;
+  localparam logic [1:0]  SPI_OP_OCC_PUSH  = emri_pkg::SPI_OP_OCC_PUSH;
 
   // ------------------------------------------------------------------
   // Capabilities (parameter-derived; spec §2). v0: only has_bmc is meaningful;
@@ -211,7 +243,7 @@ module emri_regfile #(
     end else begin
       dec_start_r <= 1'b0;  // default: single-cycle pulse
       if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
-          (host_addr_i == R_OCC_DECODE) && !dec_busy_i) begin
+          (host_addr_i == R_OCC_DECODE) && !dec_busy_i && !dec_start_r) begin
         dec_start_r <= 1'b1;
         dec_col_r   <= host_wdata_i[7:0];
       end
@@ -337,14 +369,76 @@ module emri_regfile #(
       end else if (addr_is_occ_wdata_push) begin
         host_ready_o = !occ_wdata_pending_r || occ_wdata_ready_i;
       end else if (host_addr_i == R_OCC_DECODE) begin
-        // DECODE trigger: ready only when the frame_decoder is idle (the
-        // decoder ignores start_i while busy, so backpressure the write until
-        // it can be honored — self-timing multi-command deploys).
-        host_ready_o = !dec_busy_i;
+        // DECODE trigger: ready only when the frame_decoder is idle AND no
+        // start pulse is already in flight. The decoder ignores start_i while
+        // busy, and dec_busy_i only rises one cycle AFTER dec_start_o (when
+        // the decoder enters STREAM), so without the !dec_start_r term a
+        // second trigger in the dec_start pulse window would be silently
+        // dropped. Gating on both makes multi-command deploys airtight.
+        host_ready_o = !dec_busy_i && !dec_start_r;
       end else begin
         host_ready_o = 1'b1;  // plain RW / RO-write: immediate
       end
     end
   end
+
+`ifdef FORMAL
+    // ==================================================================
+    // Formal properties (SymbiYosys, see formal/emri_r_occ_decode.sby).
+    // Prove the R_OCC_DECODE sequencing contract (regression guard for the
+    // 2026-08-30 dec_start-dropped-when-busy fix + the dec_start-pulse-window
+    // hardening): the start pulse fires ONLY on an accepted write while the
+    // decoder is IDLE and no pulse is in flight, the write is back-pressured
+    // (host_ready = !dec_busy_i && !dec_start_r), the pulse is single-cycle,
+    // and the column id is latched.
+    // ==================================================================
+    logic past_valid = 1'b0;
+    always_ff @(posedge clk_i) past_valid <= 1'b1;
+
+    // Initialize deterministically: hold reset for the first cycle.
+    always_ff @(posedge clk_i) begin
+        if (!past_valid) assume(!rst_ni);
+    end
+
+    // ---- Assumptions on the environment (host driver + frame_decoder) --------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // The host driver (emri_axi_adapter) holds a request + payload
+            // stable until it is accepted (host_ready_o high).
+            if ($past(host_req_i) && !$past(host_ready_o)) begin
+                assume(host_req_i);
+                assume(host_we_i    == $past(host_we_i));
+                assume(host_op_i    == $past(host_op_i));
+                assume(host_addr_i  == $past(host_addr_i));
+                assume(host_wdata_i == $past(host_wdata_i));
+            end
+            // dec_busy_i is a free input (the decoder may be busy or idle).
+        end
+    end
+
+    // ---- Assertions on the dec_start logic ------------------------------------
+    always_ff @(posedge clk_i) begin
+        if (past_valid && $past(rst_ni) && rst_ni) begin
+            // prop 1 (REGRESSION GUARD): dec_start_o is only generated when
+            // the decoder was IDLE at acceptance time ($past) — a trigger can
+            // never be issued-then-ignored. (dec_busy_i at the pulse cycle is
+            // the decoder's RESPONSE to the trigger, external to this module,
+            // so the provable form is the acceptance-time condition.)
+            if (dec_start_o) assert($past(!dec_busy_i));
+
+            // prop 2: the R_OCC_DECODE write is back-pressured by decoder busy
+            // OR an in-flight start pulse (airtight self-sequencing).
+            if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                (host_addr_i == R_OCC_DECODE))
+                assert(host_ready_o == (!dec_busy_i && !dec_start_r));
+
+            // prop 3: dec_start_o is a single-cycle pulse.
+            if ($past(dec_start_o)) assert(!dec_start_o);
+
+            // prop 4: the column id is latched from the accepted write.
+            if (dec_start_o) assert(dec_col_o == $past(host_wdata_i[7:0]));
+        end
+    end
+`endif
 
 endmodule
