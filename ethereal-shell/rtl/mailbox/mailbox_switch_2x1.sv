@@ -277,17 +277,24 @@ module mailbox_switch_2x1 #(
   logic [1:0] sel_up, sel_dl0, sel_dl1;
 
   always_comb begin
-    logic req_up0  = ingress_req[0] && ingress_tgt[0][2] && !up_fifo_full;
-    logic req_up1  = ingress_req[1] && ingress_tgt[1][2] && !up_fifo_full;
-    logic req_up2  = ingress_req[2] && ingress_tgt[2][2] && !up_fifo_full;
+    // G1/IMPLICITSTATIC: declare block-local temps WITHOUT an initializer and
+    // assign them in the block (a `logic x = <expr>;` decl+init in a block is
+    // implicitly STATIC with the init run once — wrong for combinational temps).
+    logic req_up0, req_up1, req_up2;
+    logic req_dl00, req_dl01, req_dl02;
+    logic req_dl10, req_dl11, req_dl12;
 
-    logic req_dl00 = ingress_req[0] && ingress_tgt[0][0] && !dl0_fifo_full;
-    logic req_dl01 = ingress_req[1] && ingress_tgt[1][0] && !dl0_fifo_full;
-    logic req_dl02 = ingress_req[2] && ingress_tgt[2][0] && !dl0_fifo_full;
+    req_up0  = ingress_req[0] && ingress_tgt[0][2] && !up_fifo_full;
+    req_up1  = ingress_req[1] && ingress_tgt[1][2] && !up_fifo_full;
+    req_up2  = ingress_req[2] && ingress_tgt[2][2] && !up_fifo_full;
 
-    logic req_dl10 = ingress_req[0] && ingress_tgt[0][1] && !dl1_fifo_full;
-    logic req_dl11 = ingress_req[1] && ingress_tgt[1][1] && !dl1_fifo_full;
-    logic req_dl12 = ingress_req[2] && ingress_tgt[2][1] && !dl1_fifo_full;
+    req_dl00 = ingress_req[0] && ingress_tgt[0][0] && !dl0_fifo_full;
+    req_dl01 = ingress_req[1] && ingress_tgt[1][0] && !dl0_fifo_full;
+    req_dl02 = ingress_req[2] && ingress_tgt[2][0] && !dl0_fifo_full;
+
+    req_dl10 = ingress_req[0] && ingress_tgt[0][1] && !dl1_fifo_full;
+    req_dl11 = ingress_req[1] && ingress_tgt[1][1] && !dl1_fifo_full;
+    req_dl12 = ingress_req[2] && ingress_tgt[2][1] && !dl1_fifo_full;
 
     sel_up  = pick_src(lock_up,  rr_up,  lat_ctr_up,
                        req_up0,  ingress_flit[0].tag.prio, ingress_flit[0].tag.hops,
