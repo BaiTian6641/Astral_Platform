@@ -21,7 +21,9 @@ EXTRA_ARGS += --timing -Wall -Wno-DECLFILENAME
 
 # Pull in cocotb's verilator build + run rules (provides the default `sim`
 # and `clean` targets). Must be included AFTER the variables above.
-include $(shell cocotb-config --makefiles)/Makefile.simules
+# Makefile.sim is the correct include for cocotb 1.9 (Docker image) and 2.x
+# (local .venv); `Makefile.simules` was a stale name that matched neither.
+include $(shell cocotb-config --makefiles)/Makefile.sim
 
 # --- Extra convenience targets (cocotb does not define `test` or `lint`) -------
 .PHONY: test lint

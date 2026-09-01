@@ -19,7 +19,7 @@ or, via the root Makefile:
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import RisingEdge, ReadOnly, Timer
 
 
 @cocotb.test()
@@ -27,20 +27,23 @@ async def test_counter_increments_after_reset(dut):
     """After sync reset deasserts, count_o increments by 1 each rising edge."""
     # Start a 10 ns-period clock in the background. Requires Verilator
     # `--timing` (passed via EXTRA_ARGS in this dir's Makefile).
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
 
     # Hold reset low across the first rising edge so the sync reset path clears
     # the count before we start checking increments.
     dut.rst_ni.value = 0
     await RisingEdge(dut.clk_i)
+    await ReadOnly()  # sample after NBA updates settle (cocotb read-sync idiom)
     got = int(dut.count_o.value)
     assert got == 0, f"count not zeroed by reset: got {got}"
 
     # Deassert reset; from here each rising edge must add 1 (mod 256).
+    await Timer(1, unit="ns")  # leave ReadOnly phase before driving again
     dut.rst_ni.value = 1
     expected = 0
     for _ in range(64):
         await RisingEdge(dut.clk_i)
+        await ReadOnly()
         expected = (expected + 1) & 0xFF
         got = int(dut.count_o.value)
         assert got == expected, f"increment mismatch: expected {expected}, got {got}"
@@ -49,16 +52,19 @@ async def test_counter_increments_after_reset(dut):
 @cocotb.test()
 async def test_counter_wraps_at_255(dut):
     """Force the count near the top of the range and confirm it wraps to 0."""
-    cocotb.start_soon(Clock(dut.clk_i, 10, units="ns").start())
+    cocotb.start_soon(Clock(dut.clk_i, 10, unit="ns").start())
 
     # Reset to a known 0.
     dut.rst_ni.value = 0
     await RisingEdge(dut.clk_i)
+    await ReadOnly()
     assert int(dut.count_o.value) == 0
 
     # Run 256 cycles -> back to 0 (wrap). 257th cycle would be 1.
+    await Timer(1, unit="ns")
     dut.rst_ni.value = 1
     for _ in range(256):
         await RisingEdge(dut.clk_i)
+    await ReadOnly()
     got = int(dut.count_o.value)
     assert got == 0, f"counter did not wrap after 256 cycles: got {got}"
