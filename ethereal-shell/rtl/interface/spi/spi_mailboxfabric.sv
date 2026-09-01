@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      spi_mailboxfabric
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). SPI fabric adapter (host<->MailboxFabric bridge); verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       SPI fabric adapter (host<->MailboxFabric bridge); -Wall CLEAN (S04-P0#2, 2026-09-01; trivial width casts + documented unused sinks only).
 `timescale 1ns/1ps
 
 // SPI SAT-IP with AXI‑MailboxFabric stream interface
@@ -68,7 +68,7 @@ module spi_mailboxfabric #(
     .clk(clk), .rst_n(rst_n),
 
     .tx_valid(ep_tx_valid), .tx_ready(ep_tx_ready), .tx_data(ep_tx_data), .tx_dest_id(ep_tx_dest),
-    .tx_opcode(ep_tx_opcode), .tx_prio(ep_tx_prio), .tx_eop(ep_tx_eop), .tx_debug(1'b0),
+    .tx_opcode(ep_tx_opcode), .tx_prio(2'(ep_tx_prio)), .tx_eop(ep_tx_eop), .tx_debug(1'b0),
     .rx_valid(ep_rx_valid), .rx_ready(ep_rx_ready), .rx_data(ep_rx_data), .rx_hdr(ep_rx_hdr), .rx_irq(ep_rx_irq), .rx_error(ep_rx_err), .rx_dest_id(ep_rx_dest_id),
 
     .link_tx_valid(mb_tx_valid), .link_tx_ready(mb_tx_ready), .link_tx_data(mb_tx_data), .link_tx_dest_id(mb_tx_dest_id),
@@ -103,6 +103,17 @@ module spi_mailboxfabric #(
   logic [15:0] cfg_dest;
   logic        busy;
   logic        done_flag;
+  // G1/UNUSEDSIGNAL sinks (advisory cleanup S04-P0#2; zero behavior change):
+  // - ep_rx_hdr/irq/err: the SPI bridge consumes only the RX payload; header
+  //   metadata, IRQ and error flags are endpoint status not needed here.
+  // - ep_rx_dest_id[15:4]: only the 4-bit CSR index [3:0] is decoded (spec §2.1).
+  // - tx_buf[63:8]: with default TX_LEN=1 only the low byte is shifted out;
+  //   upper bytes are headroom for wider TX_LEN configurations.
+  // - rx_buf/done_flag: legacy duplicates of resp_buf/rx_rdy completion state,
+  //   retained for debug; host readback path is a backlog item (MIGRATION §5).
+  logic _unused_bridge;
+  assign _unused_bridge = &{1'b0, ep_rx_hdr, ep_rx_irq, ep_rx_err,
+                            ep_rx_dest_id[15:4], tx_buf[63:8], rx_buf, done_flag};
 
   // Stream CSR handling
   wire wr_fire = ep_rx_valid && ep_rx_ready;
@@ -114,8 +125,8 @@ module spi_mailboxfabric #(
     if (!rst_n) begin
       tx_buf     <= 64'h0;
       rx_buf     <= 64'h0;
-      tx_bits_reg <= TX_LEN*8;
-      rx_bits_reg <= RX_LEN*8;
+      tx_bits_reg <= 8'(TX_LEN*8);
+      rx_bits_reg <= 8'(RX_LEN*8);
       cfg_dest   <= DEFAULT_DEST;
       trmt_pulse <= 1'b0;
       busy       <= 1'b0;

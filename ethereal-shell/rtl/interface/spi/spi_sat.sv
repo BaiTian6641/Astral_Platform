@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      spi_sat
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). SPI satellite adapter (MailboxFabric endpoint side); verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       SPI satellite adapter (MailboxFabric endpoint side); 1 documented backlog warning remains (BLKSEQ rx_shift_next, design-judgment item, MIGRATION-mailbox.md §5).
 `timescale 1ns/1ps
 
 // Simple SPI SAT-IP (master, mode 0):
@@ -61,6 +61,13 @@ module spi_sat #(
   logic [7:0] tx_bits_eff;
   logic [7:0] rx_bits_eff;
   logic [7:0] total_bits_eff;
+  // G1/UNUSEDSIGNAL sinks (advisory cleanup S04-P0#2; zero behavior change):
+  // - rx_shift[63]: the MISO shift chain only ever reads [62:0]/[RX_BITS-1:0];
+  //   the top bit is shift-through headroom.
+  // - tx_bits_lat/total_bits_lat: latched copies kept for debug; the engine
+  //   intentionally runs from the _eff combinational values (see MIGRATION §5).
+  logic _unused_sat;
+  assign _unused_sat = &{1'b0, rx_shift[63], tx_bits_lat, total_bits_lat};
 
   always_comb begin
     tx_bits_eff = (tx_bits == 0) ? TX_BITS[7:0] : (tx_bits > TX_BITS[7:0] ? TX_BITS[7:0] : tx_bits);
@@ -139,7 +146,7 @@ module spi_sat #(
 
               if (bit_cnt == 1) begin
                 if (rx_bits_lat == 0) resp <= '0;
-                else resp <= rx_shift_next[RX_BITS-1:0] >> (RX_BITS - rx_bits_lat);
+                else resp <= rx_shift_next[RX_BITS-1:0] >> (RX_BITS - 32'(rx_bits_lat));
                 busy <= 1'b0;
                 sclk_reg <= 1'b0;
                 done_pulse <= 1'b1;

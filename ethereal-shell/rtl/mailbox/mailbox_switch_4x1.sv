@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_switch_4x1
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; changes behavior-preserving (width casts / unused sinks / arg narrowing only).
 `timescale 1ns/1ps
 // Mailbox Switch 4x1: four downlinks, one uplink with QoS + route-lock (AXI4-Lite full-duplex)
 module mailbox_switch_4x1 #(
@@ -271,7 +271,7 @@ module mailbox_switch_4x1 #(
         tgt = from_uplink ? 5'b01111 : 5'b11111; // avoid sending back up when already from uplink
       end else if (cluster == MY_CLUSTER_ID) begin
         if (dest_local == 8'hFF) tgt = 5'b01111; // cluster broadcast
-        else if (dest_local < 8'd4) tgt[dest_local] = 1'b1;
+        else if (dest_local < 8'd4) tgt[dest_local[$clog2(N_OUT)-1:0]] = 1'b1;
       end else begin
         tgt = from_uplink ? '0 : 5'b10000; // locals send upstream only
       end
@@ -280,7 +280,7 @@ module mailbox_switch_4x1 #(
   endfunction
 
   // QoS arbiter: BE min service (1-in-4), hop tiebreak, RR among equals
-  function automatic int pick_src(
+  function automatic logic [RR_W-1:0] pick_src(
     input lock_t lock,
     input logic [RR_W-1:0] rr,
     input logic [1:0] lat_ctr_in,
@@ -302,7 +302,7 @@ module mailbox_switch_4x1 #(
         sel = -1;
         best_hops = 4'd0;
         for (int k = 0; k < N_IN; k++) begin
-          idx = rr + k;
+          idx = int'(rr) + k;
           if (idx >= N_IN) idx = idx - N_IN;
           if (!req[idx]) continue;
           if (force_be && prio[idx]) continue;
@@ -312,7 +312,9 @@ module mailbox_switch_4x1 #(
             best_hops = hops[idx];
           end
         end
-        pick_src = sel;
+        // "none" (-1) truncates to the all-ones sentinel, matching the
+        // callers' default sel_out value — width-clean, no behavior change.
+        pick_src = RR_W'(sel);
       end
     end
   endfunction
@@ -518,6 +520,14 @@ module mailbox_switch_4x1 #(
   assign fifo_r_en[2] = !fifo_empty[2] && m_dl2_awready && m_dl2_wready;
   assign fifo_r_en[3] = !fifo_empty[3] && m_dl3_awready && m_dl3_wready;
   assign fifo_r_en[4] = !fifo_empty[4] && m_up_awready  && m_up_wready;
+  // G1/UNUSEDSIGNAL: the B (write-response) channel terminates at every hop.
+  // Per spec §2.6 the fabric is fire-and-forget (no end-to-end BVALID); this
+  // switch ACKs its own ingress writes (resp_pending -> dlX/up_bvalid) and
+  // unconditionally accepts the downstream hop's response (m_*_bready = 1'b1).
+  // The downstream bvalid carries no payload (no bresp field exists), so it is
+  // intentionally discarded here.
+  logic _unused_bresp;
+  assign _unused_bresp = &{1'b0, m_up_bvalid, m_dl0_bvalid, m_dl1_bvalid, m_dl2_bvalid, m_dl3_bvalid};
 
   // ---------------------------------------------------------------------------
   // AR/R channel (one outstanding per ingress; disallow broadcast reads)
@@ -560,7 +570,7 @@ module mailbox_switch_4x1 #(
   function automatic int pick_ar_src(
     input logic [N_IN-1:0] req_m,
     input logic [N_IN-1:0][N_OUT-1:0] tgt,
-    input int o
+    input logic [$clog2(N_OUT)-1:0] o
   );
     begin
       pick_ar_src = -1;
@@ -576,7 +586,7 @@ module mailbox_switch_4x1 #(
   always_comb begin
     for (int o = 0; o < N_OUT; o++) begin
       if (ar_busy_out[o]) ar_sel[o] = -1;
-      else ar_sel[o] = pick_ar_src(ar_req_masked, ar_tgt, o);
+      else ar_sel[o] = pick_ar_src(ar_req_masked, ar_tgt, o[$clog2(N_OUT)-1:0]);
     end
   end
 
@@ -722,11 +732,6 @@ module mailbox_switch_4x1 #(
   assign m_dl3_rready = ar_busy_out[3] && ((ar_pending_src[3]==0 && dl0_rready) || (ar_pending_src[3]==1 && dl1_rready) || (ar_pending_src[3]==2 && dl2_rready) || (ar_pending_src[3]==3 && dl3_rready) || (ar_pending_src[3]==4 && up_rready));
   assign m_up_rready  = ar_busy_out[4] && ((ar_pending_src[4]==0 && dl0_rready) || (ar_pending_src[4]==1 && dl1_rready) || (ar_pending_src[4]==2 && dl2_rready) || (ar_pending_src[4]==3 && dl3_rready) || (ar_pending_src[4]==4 && up_rready));
 
-  // Helpers
-  function automatic logic is_latency(input mailbox_tag_t t);
-    return t.prio;
-  endfunction
-
   // Lock + RR + latency counters
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -749,12 +754,12 @@ module mailbox_switch_4x1 #(
 
         // Advance RR on enqueue when not locked
         if (fifo_w_en[o] && !lock_out[o].lock_active) begin
-          if (rr_out[o] == N_IN-1) rr_out[o] <= '0; else rr_out[o] <= rr_out[o] + 1'b1;
+          if (rr_out[o] == RR_W'(N_IN-1)) rr_out[o] <= '0; else rr_out[o] <= rr_out[o] + 1'b1;
         end
 
         // Latency counters for BE min service
         if (fifo_w_en[o]) begin
-          lat_ctr[o] <= is_latency(fifo_w_flit[o].tag) ? ((lat_ctr[o] == 2'd3) ? 2'd3 : lat_ctr[o] + 1'b1) : 2'd0;
+          lat_ctr[o] <= fifo_w_flit[o].tag.prio ? ((lat_ctr[o] == 2'd3) ? 2'd3 : lat_ctr[o] + 1'b1) : 2'd0;
         end
       end
     end

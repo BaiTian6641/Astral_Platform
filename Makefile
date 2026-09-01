@@ -53,6 +53,8 @@ RTL_INF_DEPS := ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/e
 RTL_FILES := $(RTL_FABRIC_DEPS)
 # Imported (not-yet-G1-clean) Mailbox RTL — linted separately, never fatal.
 MAILBOX_RTL := $(shell find ethereal-shell/rtl/mailbox ethereal-shell/rtl/interface -type f \( -name '*.sv' -o -name '*.v' \) 2>/dev/null)
+# Mailbox NoC core (G1-clean since S04-P0#2, 2026-09-01) — graduates to `lint`.
+MAILBOX_CORE_RTL := ethereal-shell/rtl/mailbox/mailbox_pkg.sv ethereal-shell/rtl/mailbox/mailbox_fifo.sv ethereal-shell/rtl/mailbox/mailbox_endpoint.sv ethereal-shell/rtl/mailbox/mailbox_endpoint_stream.sv ethereal-shell/rtl/mailbox/mailbox_switch_2x1.sv ethereal-shell/rtl/mailbox/mailbox_switch_2x1_stream.sv ethereal-shell/rtl/mailbox/mailbox_switch_4x1.sv ethereal-shell/rtl/mailbox/mailbox_switch_4x1_stream.sv ethereal-shell/rtl/mailbox/mailbox_center.sv ethereal-shell/rtl/mailbox/mailbox_center_stream.sv
 
 SMOKE_DIR := ethereal-fabric/tests/smoke
 
@@ -101,18 +103,44 @@ else
 	done
 	@echo "[lint] fabric modules (-Wall -Wno-UNOPTFLAT; intended loops per C01 sec2.4): clb_t, fabric_top"
 	verilator --lint-only -Wall -Wno-UNOPTFLAT --top-module fabric_top -Mdir obj_dir/lint_fabric $(RTL_FABRIC_DEPS)
+	@echo "[lint] mailbox NoC core (S04-P0#2 graduated 2026-09-01): per-module strict -Wall"
+	@for f in $(MAILBOX_CORE_RTL); do \
+	  m=$$(basename $$f .sv); \
+	  if [ "$$m" = "mailbox_pkg" ]; then continue; fi; \
+	  deps="ethereal-shell/rtl/mailbox/mailbox_pkg.sv"; \
+	  case $$m in \
+	    mailbox_fifo) \
+	                         deps="" ;; \
+	    mailbox_switch_2x1_stream|mailbox_switch_4x1_stream|mailbox_center_stream) ;; \
+	    *)                   deps="$$deps ethereal-shell/rtl/mailbox/mailbox_fifo.sv" ;; \
+	  esac; \
+	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_$$m $$deps $$f || exit 1; \
+	done
 	@echo "[lint] OK - all project RTL lint-clean."
 endif
 
-lint-mailbox: ## Lint the IMPORTED Mailbox NoC (NOT G1-clean yet — see MIGRATION-mailbox.md §5). Advisory; warnings expected.
+lint-mailbox: ## Lint the IMPORTED SPI/UART adapters (2 documented backlog warnings — MIGRATION-mailbox.md §5.2 #7-8). Advisory.
 ifeq ($(VERILATOR),)
 	@echo "[lint-mailbox] ERROR: verilator not found on PATH. Use 'make docker-shell' then 'make lint-mailbox'."
 	@exit 1
 else ifeq ($(strip $(MAILBOX_RTL)),)
 	@echo "[lint-mailbox] No imported mailbox RTL under ethereal-shell/rtl/{mailbox,interface}/."
 else
-	@echo "[lint-mailbox] Imported Mailbox RTL is NOT yet G1-clean (cleanup backlog pending). Warnings are EXPECTED; this target never fails CI."
-	-verilator --lint-only -Wall $(MAILBOX_RTL)
+	@echo "[lint-mailbox] mailbox/ is -Wall CLEAN (S04-P0#2; see report). interface/ retains 2 documented design-judgment warnings (BLKSEQ spi_sat, MULTIDRIVEN uart_mailboxfabric). Advisory: never fails CI."
+	@for f in $(MAILBOX_RTL); do \
+	  m=$$(basename $$f .sv); \
+	  if [ "$$m" = "mailbox_pkg" ]; then continue; fi; \
+	  deps="ethereal-shell/rtl/mailbox/mailbox_pkg.sv"; \
+	  case $$m in \
+	    mailbox_fifo|spi_sat|uart_sat)                          deps="" ;; \
+	    mailbox_switch_2x1_stream|mailbox_switch_4x1_stream|mailbox_center_stream) ;; \
+	    spi_mailboxfabric)  deps="$$deps ethereal-shell/rtl/mailbox/mailbox_fifo.sv ethereal-shell/rtl/mailbox/mailbox_endpoint_stream.sv ethereal-shell/rtl/interface/spi/spi_sat.sv" ;; \
+	    uart_mailboxfabric) deps="$$deps ethereal-shell/rtl/mailbox/mailbox_fifo.sv ethereal-shell/rtl/mailbox/mailbox_endpoint_stream.sv" ;; \
+	    *)                  deps="$$deps ethereal-shell/rtl/mailbox/mailbox_fifo.sv" ;; \
+	  esac; \
+	  echo "[lint-mailbox] --top-module $$m"; \
+	  verilator --lint-only -Wall --top-module $$m -Mdir obj_dir/lint_mbox_$$m $$deps $$f || true; \
+	done
 endif
 
 formal: ## Run SymbiYosys formal proofs (sby) over modules with FORMAL properties

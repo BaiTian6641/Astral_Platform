@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_switch_2x1
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; behavior-preserving (old/new equivalence smoke, 20k random cycles, passed).
 `timescale 1ns/1ps
 // Mailbox Switch 2x1: one uplink, two downlinks with QoS + route-lock (AXI4-Lite full-duplex)
 module mailbox_switch_2x1 #(
@@ -162,7 +162,9 @@ module mailbox_switch_2x1 #(
   logic                 up_fifo_empty, dl0_fifo_empty, dl1_fifo_empty;
 
   flit_t up_head, dl0_head, dl1_head;
-  flit_t up_w_flit, dl0_w_flit, dl1_w_flit;
+  // Only the tag of the just-enqueued flit is needed below (eop/prio); extract
+  // it directly instead of re-widening the whole flit (G1 width-clean).
+  mailbox_tag_t up_w_tag, dl0_w_tag, dl1_w_tag;
 
   typedef struct packed {
     logic lock_active;
@@ -411,9 +413,26 @@ module mailbox_switch_2x1 #(
   assign up_head  = flit_t'(up_fifo_r_data);
   assign dl0_head = flit_t'(dl0_fifo_r_data);
   assign dl1_head = flit_t'(dl1_fifo_r_data);
-  assign up_w_flit  = flit_t'(up_fifo_w_data);
-  assign dl0_w_flit = flit_t'(dl0_fifo_w_data);
-  assign dl1_w_flit = flit_t'(dl1_fifo_w_data);
+  assign up_w_tag  = mailbox_tag_t'(up_fifo_w_data[$bits(mailbox_tag_t)-1:0]);
+  assign dl0_w_tag = mailbox_tag_t'(dl0_fifo_w_data[$bits(mailbox_tag_t)-1:0]);
+  assign dl1_w_tag = mailbox_tag_t'(dl1_fifo_w_data[$bits(mailbox_tag_t)-1:0]);
+  // Only .eop (route-lock) and .prio (QoS) of the enqueued tags are consumed
+  // below; the remaining tag fields travel on with the flit and are
+  // intentionally not re-read here (G1/UNUSEDSIGNAL sink).
+  logic _unused_w_tag;
+  assign _unused_w_tag = &{1'b0,
+                            up_w_tag.src_id,  up_w_tag.opcode,  up_w_tag.hops,  up_w_tag.parity,
+                            dl0_w_tag.src_id, dl0_w_tag.opcode, dl0_w_tag.hops, dl0_w_tag.parity,
+                            dl1_w_tag.src_id, dl1_w_tag.opcode, dl1_w_tag.hops, dl1_w_tag.parity};
+
+  // G1/UNUSEDSIGNAL: the B (write-response) channel terminates at every hop.
+  // Per spec §2.6 the fabric is fire-and-forget (no end-to-end BVALID); this
+  // switch ACKs its own ingress writes (resp_pending -> dlX/up_bvalid) and
+  // unconditionally accepts the downstream hop's response (m_*_bready = 1'b1).
+  // The downstream bvalid carries no payload (no bresp field exists), so it is
+  // intentionally discarded here.
+  logic _unused_bresp;
+  assign _unused_bresp = &{1'b0, m_up_bvalid, m_dl0_bvalid, m_dl1_bvalid};
 
   // Drive outbound AXI-Lite from FIFO heads
   assign m_up_awvalid  = !up_fifo_empty;
@@ -476,7 +495,7 @@ module mailbox_switch_2x1 #(
   function automatic int pick_ar_src(
     input logic [2:0] req_m,
     input logic [2:0][2:0] tgt,
-    input int o
+    input logic [1:0] o
   );
     begin
       pick_ar_src = -1;
@@ -492,7 +511,7 @@ module mailbox_switch_2x1 #(
   always_comb begin
     for (int o = 0; o < 3; o++) begin
       if (ar_busy_out[o]) ar_sel[o] = -1;
-      else ar_sel[o] = pick_ar_src(ar_req_masked, ar_tgt, o);
+      else ar_sel[o] = pick_ar_src(ar_req_masked, ar_tgt, o[1:0]);
     end
   end
 
@@ -588,10 +607,6 @@ module mailbox_switch_2x1 #(
   assign m_up_rready  = ar_busy_out[2] && ((ar_pending_src[2]==2'd0 && dl0_rready) || (ar_pending_src[2]==2'd1 && dl1_rready) || (ar_pending_src[2]==2'd2 && up_rready));
 
   // Lock + QoS bookkeeping
-  function automatic logic is_latency(input mailbox_tag_t t);
-    return t.prio;
-  endfunction
-
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       lock_up   <= '0; lock_dl0 <= '0; lock_dl1 <= '0;
@@ -600,28 +615,28 @@ module mailbox_switch_2x1 #(
     end else begin
       // Update locks on enqueue events (route-lock until eop seen)
       if (up_fifo_w_en) begin
-        if (!lock_up.lock_active && !up_w_flit.tag.eop) begin
+        if (!lock_up.lock_active && !up_w_tag.eop) begin
           lock_up.lock_active <= 1'b1;
           lock_up.lock_src    <= sel_up;
-        end else if (lock_up.lock_active && (sel_up == lock_up.lock_src) && up_w_flit.tag.eop) begin
+        end else if (lock_up.lock_active && (sel_up == lock_up.lock_src) && up_w_tag.eop) begin
           lock_up.lock_active <= 1'b0;
         end
       end
 
       if (dl0_fifo_w_en) begin
-        if (!lock_dl0.lock_active && !dl0_w_flit.tag.eop) begin
+        if (!lock_dl0.lock_active && !dl0_w_tag.eop) begin
           lock_dl0.lock_active <= 1'b1;
           lock_dl0.lock_src    <= sel_dl0;
-        end else if (lock_dl0.lock_active && (sel_dl0 == lock_dl0.lock_src) && dl0_w_flit.tag.eop) begin
+        end else if (lock_dl0.lock_active && (sel_dl0 == lock_dl0.lock_src) && dl0_w_tag.eop) begin
           lock_dl0.lock_active <= 1'b0;
         end
       end
 
       if (dl1_fifo_w_en) begin
-        if (!lock_dl1.lock_active && !dl1_w_flit.tag.eop) begin
+        if (!lock_dl1.lock_active && !dl1_w_tag.eop) begin
           lock_dl1.lock_active <= 1'b1;
           lock_dl1.lock_src    <= sel_dl1;
-        end else if (lock_dl1.lock_active && (sel_dl1 == lock_dl1.lock_src) && dl1_w_flit.tag.eop) begin
+        end else if (lock_dl1.lock_active && (sel_dl1 == lock_dl1.lock_src) && dl1_w_tag.eop) begin
           lock_dl1.lock_active <= 1'b0;
         end
       end
@@ -633,13 +648,13 @@ module mailbox_switch_2x1 #(
 
       // Latency counters (saturate at 3) for BE minimum service
       if (up_fifo_w_en) begin
-        lat_ctr_up <= is_latency(up_w_flit.tag) ? ((lat_ctr_up == 2'd3) ? 2'd3 : lat_ctr_up + 1'b1) : 2'd0;
+        lat_ctr_up <= up_w_tag.prio ? ((lat_ctr_up == 2'd3) ? 2'd3 : lat_ctr_up + 1'b1) : 2'd0;
       end
       if (dl0_fifo_w_en) begin
-        lat_ctr_dl0 <= is_latency(dl0_w_flit.tag) ? ((lat_ctr_dl0 == 2'd3) ? 2'd3 : lat_ctr_dl0 + 1'b1) : 2'd0;
+        lat_ctr_dl0 <= dl0_w_tag.prio ? ((lat_ctr_dl0 == 2'd3) ? 2'd3 : lat_ctr_dl0 + 1'b1) : 2'd0;
       end
       if (dl1_fifo_w_en) begin
-        lat_ctr_dl1 <= is_latency(dl1_w_flit.tag) ? ((lat_ctr_dl1 == 2'd3) ? 2'd3 : lat_ctr_dl1 + 1'b1) : 2'd0;
+        lat_ctr_dl1 <= dl1_w_tag.prio ? ((lat_ctr_dl1 == 2'd3) ? 2'd3 : lat_ctr_dl1 + 1'b1) : 2'd0;
       end
     end
   end

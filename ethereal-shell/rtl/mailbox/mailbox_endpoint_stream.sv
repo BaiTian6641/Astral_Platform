@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_endpoint_stream
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; changes behavior-preserving (package-qualified type refs only).
 `timescale 1ns/1ps
 // AXI‑MailboxFabric Endpoint (Leaf): stream-based dual-role endpoint
 module mailbox_endpoint_stream #(
@@ -54,12 +54,12 @@ module mailbox_endpoint_stream #(
 
   typedef struct packed {
     logic [NODE_ID_WIDTH-1:0] dest_id;
-    mailbox_flit_t            flit;
+    mailbox_pkg::mailbox_flit_t   flit;
   } tx_entry_t;
 
   typedef struct packed {
     logic [NODE_ID_WIDTH-1:0] dest_id;
-    mailbox_flit_t            flit;
+    mailbox_pkg::mailbox_flit_t   flit;
   } rx_entry_t;
 
   localparam int TXW = $bits(tx_entry_t);
@@ -70,7 +70,7 @@ module mailbox_endpoint_stream #(
   logic [TXW-1:0] tx_w_data, tx_r_data;
   tx_entry_t tx_head;
 
-  mailbox_flit_t tx_flit;
+  mailbox_pkg::mailbox_flit_t tx_flit;
   always_comb begin
     tx_flit.hdr.src_id = SRC_ID;
     tx_flit.hdr.opcode = tx_opcode;

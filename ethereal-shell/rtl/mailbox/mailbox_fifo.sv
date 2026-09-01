@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_fifo
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall: CLEAN (S04-P0#2, 2026-09-01).
 `timescale 1ns/1ps
 // Simple synchronous FIFO with parameterizable depth and width
 module mailbox_fifo #(

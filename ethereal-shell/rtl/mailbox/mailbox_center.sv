@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_center
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; changes behavior-preserving (width casts / unused sinks / arg narrowing only).
 `timescale 1ns/1ps
 // Mailbox Center: root router connecting 4 switches + HP port (AXI4-Lite full-duplex)
 module mailbox_center #(
@@ -261,18 +261,16 @@ module mailbox_center #(
   endfunction
 
   function automatic logic [N_OUT-1:0] decode_read_target(
-    input logic [15:0] adr
+    input logic [7:0] cluster_id
   );
-    logic [7:0] cluster;
     logic [N_OUT-1:0] tgt;
     begin
-      cluster = adr[15:8];
       tgt = '0;
-      if (cluster == 8'h00) begin
+      if (cluster_id == 8'h00) begin
         tgt[4] = 1'b1;
       end else begin
         for (int i = 0; i < 4; i++) begin
-          if (cluster == CHILD_CLUSTER_ID[i]) tgt[i] = 1'b1;
+          if (cluster_id == CHILD_CLUSTER_ID[i]) tgt[i] = 1'b1;
         end
       end
       decode_read_target = tgt;
@@ -280,15 +278,14 @@ module mailbox_center #(
   endfunction
 
   function automatic logic [N_OUT-1:0] decode_targets(
-    input logic [15:0] adr,
+    input logic [7:0] cluster,
     input logic        from_hp
   );
-    logic [7:0] cluster;
-    logic [7:0] dest_local;
+    // Center routes writes by cluster only; the endpoint-local field [7:0]
+    // is decoded one tier down at the switches (spec §3.1/§3.2), so this
+    // helper takes just the cluster byte.
     logic [N_OUT-1:0] tgt;
     begin
-      cluster = adr[15:8];
-      dest_local = adr[7:0];
       tgt = '0;
       if (cluster == 8'hFF) begin
         tgt = from_hp ? 5'b11111 : 5'b11111; // broadcasts replicate everywhere
@@ -304,7 +301,7 @@ module mailbox_center #(
   endfunction
 
   // AR/R routing helpers
-  function automatic logic [15:0] araddr_for_idx(input int idx);
+  function automatic logic [15:0] araddr_for_idx(input logic [$clog2(N_IN)-1:0] idx);
     case (idx)
       0: araddr_for_idx = sw0_araddr;
       1: araddr_for_idx = sw1_araddr;
@@ -315,7 +312,7 @@ module mailbox_center #(
   endfunction
 
   function automatic logic source_rready(
-    input int src
+    input logic [$clog2(N_IN)-1:0] src
   );
     case (src)
       0: source_rready = sw0_rready;
@@ -327,7 +324,7 @@ module mailbox_center #(
   endfunction
 
   function automatic logic [31:0] target_rdata(
-    input int tgt
+    input logic [$clog2(N_OUT)-1:0] tgt
   );
     case (tgt)
       0: target_rdata = m_sw0_rdata;
@@ -338,7 +335,7 @@ module mailbox_center #(
     endcase
   endfunction
 
-  function automatic int pick_src(
+  function automatic logic [RR_W-1:0] pick_src(
     input lock_t lock,
     input logic [RR_W-1:0] rr,
     input logic [1:0] lat_ctr_in,
@@ -361,7 +358,7 @@ module mailbox_center #(
         sel = -1;
         best_hops = 4'd0;
         for (int k = 0; k < N_IN; k++) begin
-          idx = rr + k;
+          idx = int'(rr) + k;
           if (idx >= N_IN) idx = idx - N_IN;
           if (!req[idx]) continue;
           if (force_be && prio[idx]) continue;
@@ -371,7 +368,9 @@ module mailbox_center #(
             best_hops = hops[idx];
           end
         end
-        pick_src = sel;
+        // "none" (-1) truncates to the all-ones sentinel, matching the
+        // callers' default sel_out value — width-clean, no behavior change.
+        pick_src = RR_W'(sel);
       end
     end
   endfunction
@@ -388,11 +387,11 @@ module mailbox_center #(
     ingress_req[3] = sw3_awvalid && sw3_wvalid && !resp_pending[3];
     ingress_req[4] = hp_awvalid  && hp_wvalid  && !resp_pending[4];
 
-    ingress_tgt[0] = decode_targets(sw0_awaddr, 1'b0);
-    ingress_tgt[1] = decode_targets(sw1_awaddr, 1'b0);
-    ingress_tgt[2] = decode_targets(sw2_awaddr, 1'b0);
-    ingress_tgt[3] = decode_targets(sw3_awaddr, 1'b0);
-    ingress_tgt[4] = decode_targets(hp_awaddr, 1'b1);
+    ingress_tgt[0] = decode_targets(sw0_awaddr[15:8], 1'b0);
+    ingress_tgt[1] = decode_targets(sw1_awaddr[15:8], 1'b0);
+    ingress_tgt[2] = decode_targets(sw2_awaddr[15:8], 1'b0);
+    ingress_tgt[3] = decode_targets(sw3_awaddr[15:8], 1'b0);
+    ingress_tgt[4] = decode_targets(hp_awaddr[15:8], 1'b1);
 
     ingress_flit[0] = '{adr:sw0_awaddr, dat:sw0_wdata, strb:sw0_wstrb, tag:update_tag(sw0_tag, sw0_wdata)};
     ingress_flit[1] = '{adr:sw1_awaddr, dat:sw1_wdata, strb:sw1_wstrb, tag:update_tag(sw1_tag, sw1_wdata)};
@@ -438,11 +437,11 @@ module mailbox_center #(
     ar_req[3] = sw3_arvalid && !ar_outstanding[3];
     ar_req[4] = hp_arvalid  && !ar_outstanding[4];
 
-    ar_tgt[0] = decode_read_target(sw0_araddr);
-    ar_tgt[1] = decode_read_target(sw1_araddr);
-    ar_tgt[2] = decode_read_target(sw2_araddr);
-    ar_tgt[3] = decode_read_target(sw3_araddr);
-    ar_tgt[4] = decode_read_target(hp_araddr);
+    ar_tgt[0] = decode_read_target(sw0_araddr[15:8]);
+    ar_tgt[1] = decode_read_target(sw1_araddr[15:8]);
+    ar_tgt[2] = decode_read_target(sw2_araddr[15:8]);
+    ar_tgt[3] = decode_read_target(sw3_araddr[15:8]);
+    ar_tgt[4] = decode_read_target(hp_araddr[15:8]);
 
     for (int o = 0; o < N_OUT; o++) begin
       int found;
@@ -450,7 +449,7 @@ module mailbox_center #(
       idx = 0;
       if (!ar_pending[o]) begin
         for (int k = 0; k < N_IN; k++) begin
-          idx = rr_out_ar[o] + k;
+          idx = int'(rr_out_ar[o]) + k;
           if (idx >= N_IN) idx = idx - N_IN;
           if (ar_req[idx] && ar_tgt[idx][o]) begin
             found = idx;
@@ -587,11 +586,11 @@ module mailbox_center #(
     for (int o = 0; o < N_OUT; o++) begin
       if (ar_pending[o]) begin
         case (ar_pending_src[o])
-          0: begin sw0_rvalid = sw0_rvalid | target_rvalid[o]; sw0_rdata = target_rdata(o); end
-          1: begin sw1_rvalid = sw1_rvalid | target_rvalid[o]; sw1_rdata = target_rdata(o); end
-          2: begin sw2_rvalid = sw2_rvalid | target_rvalid[o]; sw2_rdata = target_rdata(o); end
-          3: begin sw3_rvalid = sw3_rvalid | target_rvalid[o]; sw3_rdata = target_rdata(o); end
-          default: begin hp_rvalid = hp_rvalid | target_rvalid[o]; hp_rdata = target_rdata(o); end
+          0: begin sw0_rvalid = sw0_rvalid | target_rvalid[o]; sw0_rdata = target_rdata(o[$clog2(N_OUT)-1:0]); end
+          1: begin sw1_rvalid = sw1_rvalid | target_rvalid[o]; sw1_rdata = target_rdata(o[$clog2(N_OUT)-1:0]); end
+          2: begin sw2_rvalid = sw2_rvalid | target_rvalid[o]; sw2_rdata = target_rdata(o[$clog2(N_OUT)-1:0]); end
+          3: begin sw3_rvalid = sw3_rvalid | target_rvalid[o]; sw3_rdata = target_rdata(o[$clog2(N_OUT)-1:0]); end
+          default: begin hp_rvalid = hp_rvalid | target_rvalid[o]; hp_rdata = target_rdata(o[$clog2(N_OUT)-1:0]); end
         endcase
 
         case (o)
@@ -645,7 +644,7 @@ module mailbox_center #(
         if (ar_fire_out[o]) begin
           ar_pending[o] <= 1'b1;
           ar_pending_src[o] <= ar_sel_idx[o];
-          rr_out_ar[o] <= (rr_out_ar[o] == N_IN-1) ? '0 : rr_out_ar[o] + 1'b1;
+          rr_out_ar[o] <= (rr_out_ar[o] == RR_W'(N_IN-1)) ? '0 : rr_out_ar[o] + 1'b1;
         end else if (r_hs_out[o]) begin
           ar_pending[o] <= 1'b0;
         end
@@ -741,10 +740,14 @@ module mailbox_center #(
   assign fifo_r_en[2] = !fifo_empty[2] && m_sw2_awready && m_sw2_wready;
   assign fifo_r_en[3] = !fifo_empty[3] && m_sw3_awready && m_sw3_wready;
   assign fifo_r_en[4] = !fifo_empty[4] && m_hp_awready  && m_hp_wready;
-
-  function automatic logic is_latency(input mailbox_tag_t t);
-    return t.prio;
-  endfunction
+  // G1/UNUSEDSIGNAL: the B (write-response) channel terminates at every hop.
+  // Per spec §2.6 the fabric is fire-and-forget (no end-to-end BVALID); the
+  // center ACKs its own ingress writes (resp_pending -> swX/hp_bvalid) and
+  // unconditionally accepts each downstream hop's response (m_*_bready = 1'b1).
+  // The downstream bvalid carries no payload (no bresp field exists), so it is
+  // intentionally discarded here.
+  logic _unused_bresp;
+  assign _unused_bresp = &{1'b0, m_sw0_bvalid, m_sw1_bvalid, m_sw2_bvalid, m_sw3_bvalid, m_hp_bvalid};
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -765,11 +768,11 @@ module mailbox_center #(
         end
 
         if (fifo_w_en[o] && !lock_out[o].lock_active) begin
-          if (rr_out[o] == N_IN-1) rr_out[o] <= '0; else rr_out[o] <= rr_out[o] + 1'b1;
+          if (rr_out[o] == RR_W'(N_IN-1)) rr_out[o] <= '0; else rr_out[o] <= rr_out[o] + 1'b1;
         end
 
         if (fifo_w_en[o]) begin
-          lat_ctr[o] <= is_latency(fifo_w_flit[o].tag) ? ((lat_ctr[o] == 2'd3) ? 2'd3 : lat_ctr[o] + 1'b1) : 2'd0;
+          lat_ctr[o] <= fifo_w_flit[o].tag.prio ? ((lat_ctr[o] == 2'd3) ? 2'd3 : lat_ctr[o] + 1'b1) : 2'd0;
         end
       end
     end

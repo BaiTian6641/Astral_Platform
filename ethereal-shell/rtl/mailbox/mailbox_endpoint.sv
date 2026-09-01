@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_endpoint
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; behavior-preserving (old/new equivalence smoke, 20k random cycles, passed).
 `timescale 1ns/1ps
 // Mailbox Endpoint (Leaf): full-duplex AXI4-Lite with pop-on-read + CSR controls
 module mailbox_endpoint #(
@@ -90,7 +90,7 @@ module mailbox_endpoint #(
     logic [15:0] adr;
     logic [31:0] dat;
     logic [3:0]  strb;
-    mailbox_tag_t tag;
+    mailbox_pkg::mailbox_tag_t tag;
   } flit_t;
   localparam int FLIT_W = $bits(flit_t);
 
@@ -115,14 +115,14 @@ module mailbox_endpoint #(
   // ----------------------------
   // TX build + enqueue
   // ----------------------------
-  mailbox_tag_t tx_tag;
-  mailbox_tag_t tx_tag_np;
+  mailbox_pkg::mailbox_tag_t tx_tag;
+  mailbox_pkg::mailbox_tag_t tx_tag_np;
   flit_t tx_w_flit;
   always_comb begin
     tx_tag = '{src_id:SRC_ID, eop:tx_eop, prio:tx_prio, opcode:tx_opcode, hops:4'd0, parity:1'b0};
     tx_tag_np = tx_tag;
     tx_tag_np.parity = 1'b0;
-    tx_tag.parity = compute_parity(tx_data, tx_tag_np);
+    tx_tag.parity = mailbox_pkg::compute_parity(tx_data, tx_tag_np);
 
     tx_w_en   = tx_valid && tx_ready;
     tx_w_flit = '{adr:tx_dest, dat:tx_data, strb:tx_strb, tag:tx_tag};
@@ -146,13 +146,20 @@ module mailbox_endpoint #(
   assign m_tag     = tx_head.tag;
   assign m_bready  = 1'b1;
   assign tx_r_en   = !tx_r_empty && m_awready && m_wready;
+  // G1/UNUSEDSIGNAL: B responses terminate at each hop. Per spec §2.6 the
+  // fabric is fire-and-forget (no end-to-end BVALID); the endpoint pops its TX
+  // FIFO on AW/W acceptance and unconditionally accepts the downstream hop's
+  // response (m_bready = 1'b1). m_bvalid carries no payload (no bresp field
+  // exists), so it is intentionally discarded.
+  logic _unused_bresp;
+  assign _unused_bresp = &{1'b0, m_bvalid};
 
   // ----------------------------
   // Outbound AR (core read requests)
   // ----------------------------
   logic        ar_pending;
   logic [15:0] ar_addr_q;
-  mailbox_tag_t ar_tag_q;
+  mailbox_pkg::mailbox_tag_t ar_tag_q;
 
   assign rd_ready = !ar_pending;
 
@@ -258,6 +265,11 @@ module mailbox_endpoint #(
   assign rx_data  = rx_head.dat;
   assign rx_tag   = rx_head.tag;
   assign rx_irq   = !rx_r_empty;
+  // G1/UNUSEDSIGNAL: RX pop returns only payload+tag to the core (spec §2.4);
+  // the flit's adr/strb fields are transport metadata and are intentionally
+  // not exposed on the core-facing RX interface.
+  logic _unused_rx_head;
+  assign _unused_rx_head = &{1'b0, rx_head.adr, rx_head.strb};
 
   // ----------------------------
   // Slave AR/R (pop on read, DEADBEEF on empty)
@@ -265,6 +277,11 @@ module mailbox_endpoint #(
   logic ar_pending_s;
   logic [3:0] ar_csr_idx;
   logic pop_pending;
+  // G1/UNUSEDSIGNAL: only the 4-bit CSR index (s_araddr[3:0]) is decoded at
+  // the endpoint (spec §2.1); the upper address bits are the node id, already
+  // consumed by fabric routing before the flit arrives here.
+  logic _unused_s_araddr;
+  assign _unused_s_araddr = &{1'b0, s_araddr[15:4]};
 
   assign s_arready = !ar_pending_s;
 

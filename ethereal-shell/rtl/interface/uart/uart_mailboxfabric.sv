@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      uart_mailboxfabric
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). UART fabric adapter (host<->MailboxFabric bridge); verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       UART fabric adapter (host<->MailboxFabric bridge); 1 documented backlog warning remains (MULTIDRIVEN tx_rptr, design-judgment item, MIGRATION-mailbox.md §5).
 `timescale 1ns/1ps
 
 // UART peripheral as an AXI‑MailboxFabric Leaf (Endpoint)
@@ -57,7 +57,7 @@ module uart_mailboxfabric #(
     // Core TX side (from this UART -> fabric)
     .tx_valid(ep_tx_valid), .tx_ready(ep_tx_ready),
     .tx_data(ep_tx_data), .tx_dest_id(ep_tx_dest),
-    .tx_opcode(ep_tx_opcode), .tx_prio(ep_tx_prio), .tx_eop(ep_tx_eop), .tx_debug(1'b0),
+    .tx_opcode(ep_tx_opcode), .tx_prio(2'(ep_tx_prio)), .tx_eop(ep_tx_eop), .tx_debug(1'b0),
 
     // Core RX streaming (used for CSR writes)
     .rx_valid(ep_rx_valid), .rx_ready(ep_rx_ready),
@@ -95,6 +95,12 @@ module uart_mailboxfabric #(
   wire csr0_block = (rx_csr_idx == 4'd0) && tx_full;
   wire wr_fire = ep_rx_valid && ep_rx_ready;
   assign ep_rx_ready = !csr0_block;
+  // G1/UNUSEDSIGNAL sinks (advisory cleanup S04-P0#2; zero behavior change):
+  // - ep_rx_hdr/irq/err: the UART bridge consumes only the RX payload; header
+  //   metadata, IRQ and error flags are endpoint status not needed here.
+  // - ep_rx_dest_id[15:4]: only the 4-bit CSR index [3:0] is decoded (spec §2.1).
+  logic _unused_ep;
+  assign _unused_ep = &{1'b0, ep_rx_hdr, ep_rx_irq, ep_rx_err, ep_rx_dest_id[15:4]};
 
   // Simple write pointer driven by CSR0 writes
   assign tx_w_en = wr_fire && (rx_csr_idx == 4'd0) && !tx_full;
@@ -179,6 +185,16 @@ module uart_mailboxfabric #(
   // Drive UART_TX pin: LSB of shift register
   // When idle, TX line is high
   assign UART_TX = tx_shift[0];
+  // G1/UNUSEDSIGNAL sinks (advisory cleanup S04-P0#2; zero behavior change):
+  // - rx_shift[0]: the start bit shifts through and is never re-read; only
+  //   rx_shift[8:1] (data) is captured.
+  // - rx_data_reg/rx_data_valid: passive RX register pair is written but has
+  //   no host readback path yet (bytes are forwarded via mailbox TX instead);
+  //   readback wiring is a design backlog item (MIGRATION-mailbox.md §5).
+  // - cfg_baud_div: CSR3 accepts a runtime baud divisor but the baud counters
+  //   still use the BAUD_DIV parameter; wiring it up is a design backlog item.
+  logic _unused_rx;
+  assign _unused_rx = &{1'b0, rx_shift[0], rx_data_reg, rx_data_valid, cfg_baud_div};
 
   // ---------------------------
   // UART receive path (serial -> mailbox TX)

@@ -3,6 +3,11 @@
 > Task: **S04-P0#1** (Mailbox RTL export + migration note)
 > Date: 2026-07-24 · Repo: `ethereal-shell/` · Plan-Ref: `ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md`
 > Licensing decision authority: `ethereal-plan/README.md §4` (finalized 2026-07)
+>
+> **Update 2026-09-01 (S04-P0#2, G1 lint cleanup):** §4 lint status and §5 backlog revised —
+> `rtl/mailbox/` is now `verilator --lint-only -Wall` **CLEAN**; `rtl/interface/` retains 2
+> documented design-judgment warnings. Design verdict on the B channel: §5.4. Full evidence:
+> `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
 
 This document records the one-way migration of the self-owned **AXI-MailboxFabric**
 Network-on-Chip (the EBI backbone, subsystem S04) plus its SPI/UART host adapters
@@ -127,15 +132,16 @@ block as an HTML comment at its top.
 
 | Check | Status | Why |
 |---|---|---|
-| `verilator --lint-only -Wall` | ⏳ **PENDING** | The authoring environment has **no `verilator` installed** (and no `docker`). This is a **Docker-gated** validation per `AGENTS.md §7` — the agent authors RTL/scripts; the maintainer runs `make lint`/`docker build` and pastes results. Project rule G1 requires zero warnings (or documented, justified exemptions); that gate is **not yet satisfied** for these files. |
+| `verilator --lint-only -Wall` | ✅ **DONE (mailbox/) · ⚠️ 2 documented warnings (interface/)** | **S04-P0#2 (2026-09-01):** all 10 `rtl/mailbox/` files pass `verilator --lint-only -Wall` per-module with **zero warnings and zero waivers**. `rtl/interface/` passes except 2 documented design-judgment warnings (`BLKSEQ` in `spi_sat`, `MULTIDRIVEN tx_rptr` in `uart_mailboxfabric` — see §5.2 items 7–8). Equivalence smoke (old vs cleaned RTL, 20k random cycles each on `mailbox_switch_2x1` + `mailbox_endpoint`) passed — cleanup is behavior-preserving. Evidence: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`. |
 | `cocotb` mailbox testbench | ⏳ **PENDING** | No testbench was migrated in this task (the `TinyGPU-FPGA/testbench/mailbox_tb.sv` exists upstream but is **out of scope** for S04-P0#1, which is RTL-export-only). A dedicated Ethereal EBI-level cocotb test is a later task. |
 | Header presence (SPDX + Provenance + nettype) | ✅ **DONE** | All 14 files — see §6 self-check output. |
 | Body integrity (verbatim copy) | ✅ **DONE** | Copy was via `cp`; only the header block was inserted. Module names, signal names, line counts unchanged vs source. |
 
-> **G6 note:** the lint result is the maintainer's to provide. Until then, these files
-> must be treated as **lint-unverified** and must NOT be wired into a synthesizable
-> top until `verilator --lint-only -Wall` passes (see cleanup backlog §5 — several
-> items are *expected* to produce `-Wall` findings).
+> **G6 note:** **resolved 2026-09-01 (S04-P0#2):** `rtl/mailbox/` is `verilator --lint-only -Wall` clean
+> (per-module, zero warnings/waivers) and may graduate into the main `make lint` gate —
+> the exact integration edit is proposed in `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
+> `rtl/interface/{spi,uart}/` keeps 2 documented design-judgment warnings (§5.2 items 7–8)
+> and stays on the advisory `make lint-mailbox` gate until they are resolved.
 
 ---
 
@@ -173,12 +179,14 @@ flowchart LR
 
 | # | Deviation | Where (representative) | G1 rule | Fix direction |
 |---|---|---|---|---|
-| 1 | **Procedural `for` loops inside `always_comb`/`always_ff`** | `mailbox_center.sv`: ~17 loops in `always_comb` (e.g. lines 447, 475, 482–483, 492, 499–502, 515, 526, 567, 581, 587, 615) and ~5 in `always_ff` (638, 644, 654, 751, 757) | "no procedural loops inside `always_*` (use `generate/genvar`)" | Convert unrolled-arbitration loops to `generate … for (genvar)`. Bounded `for` with `int i` unrolls fine in most tools but is **forbidden by project policy** and may trip `-Wall`. Likely needs a documented exemption OR refactor. **Largest cleanup item.** |
-| 2 | **FSMs use plain `logic [N:0] state`** instead of `typedef enum` + two-segment style | e.g. `spi_mailboxfabric.sv` `send_state` (`logic [1:0]`, states 0/1/2 as magic numbers); similar patterns in other interface adapters | "FSM must use `typedef enum logic [N:0]` + two-segment" | Introduce `typedef enum`, name the states, split next-state/output. (`mailbox_pkg.sv` does use `typedef enum` for opcodes — extend that idiom to the FSMs.) |
-| 3 | **No trailing `` `default_nettype wire `` restore** at EOF | all 14 files | good hygiene (not strictly G1, but TinyGPU RTL Policy convention) | Append `` `default_nettype wire `` after `endmodule`/`endpackage`. Optional. |
-| 4 | **Incomplete G2 header fields** | all RTL files | G2 header has `Maintainer / Created / Modified / Tags` | Add the missing fields (`Maintainer: BaiTian6641`, `Created: 2024-..` (recover from source git history), `Tags: RTL, SYNTH`, etc.). `Module/Plan-Ref/SPDX/Provenance` already present. |
-| 5 | **`` `timescale 1ns/1ps `` present** | all 14 files | not forbidden by G1; harmless and aids sim reproducibility | Keep as-is, OR centralize timescale at the sim-top per future policy. No action required now. |
-| 6 | **Width-cast / literal-width spot checks** | needs `-Wall` run to enumerate | "literals carry width+base (e.g. `8'hFF`)" | Run `verilator -Wall`, fix each `WIDTH`/`UNOPTFLAT`/`UNUSEDPARAM` finding. Cannot be done without verilator. |
+| 1 | **Procedural `for` loops inside `always_comb`/`always_ff`** | `mailbox_center.sv`: ~17 loops in `always_comb` (e.g. lines 447, 475, 482–483, 492, 499–502, 515, 526, 567, 581, 587, 615) and ~5 in `always_ff` (638, 644, 654, 751, 757) | "no procedural loops inside `always_*` (use `generate/genvar`)" | **STATUS (2026-09-01):** `verilator -Wall` does NOT flag these loops — the RTL is lint-clean with them in place. The G1 policy deviation therefore remains a **style/exemption decision for the maintainer**, not a lint blocker: either grant a documented exemption for bounded arbitration loops, or schedule a `generate`-refactor as a separate task. Not fixed in S04-P0#2 (behavior-preserving mandate). |
+| 2 | **FSMs use plain `logic [N:0] state`** instead of `typedef enum` + two-segment style | e.g. `spi_mailboxfabric.sv` `send_state` (`logic [1:0]`, states 0/1/2 as magic numbers); similar patterns in other interface adapters | "FSM must use `typedef enum logic [N:0]` + two-segment" | **STATUS (2026-09-01):** still open (style-only, no lint finding). Refactor candidate together with the interface/ design-judgment items below. |
+| 3 | **No trailing `` `default_nettype wire `` restore** at EOF | all 14 files | good hygiene (not strictly G1, but TinyGPU RTL Policy convention) | **STATUS (2026-09-01):** still open (optional hygiene; each file opens with `` `default_nettype none ``, so there is no cross-file leakage while all project files follow the same convention). |
+| 4 | **Incomplete G2 header fields** | all RTL files | G2 header has `Maintainer / Created / Modified / Tags` | **STATUS (2026-09-01):** partially improved — the stale "lint PENDING" `Notes:` lines were replaced with the actual lint verdicts during S04-P0#2. `Maintainer/Created/Tags` still to add. |
+| 5 | **`` `timescale 1ns/1ps `` present** | all 14 files | not forbidden by G1; harmless and aids sim reproducibility | Keep as-is. No action. |
+| 6 | **Width-cast / literal-width spot checks** | needs `-Wall` run to enumerate | "literals carry width+base (e.g. `8'hFF`)" | **STATUS (2026-09-01): ✅ DONE.** Enumerated 88 findings (59 `UNUSEDSIGNAL`, 21 `WIDTHEXPAND`, 5 `WIDTHTRUNC`, 1 `BLKSEQ`, 1 `MULTIDRIVEN`, 1 `MULTITOP`) plus 7 package-ordering errors; fixed all `rtl/mailbox/` items and all trivially behavior-preserving `rtl/interface/` items. Remainder = items 7–8 below + `MULTITOP` (an artifact of the single-command `lint-mailbox` invocation; per-module lint is clean — see report for the proposed Makefile restructure). |
+| 7 | **`BLKSEQ`: blocking temp `rx_shift_next` assigned inside `always_ff`** | `spi_sat.sv:143` | `-Wall` | **STATUS (2026-09-01): OPEN — design judgment required.** The temp is written blocking and read within the same clocked process (a common next-value idiom); hoisting it to a continuous assign is behavior-preserving but touches the SPI shift engine, which has no testbench. Defer to the interface cleanup task with a TB. |
+| 8 | **`MULTIDRIVEN`: `tx_rptr` written by two `always_ff` processes** | `uart_mailboxfabric.sv:182` (and the TX FIFO block) | `-Wall` | **STATUS (2026-09-01): OPEN — likely a real bug.** The main FIFO block increments `tx_rptr` on `tx_r_en`, and a second process increments it again on `tx_finished && !tx_empty` (same condition) — the read pointer advances **twice per consumed byte**. Needs a design decision (single-process FIFO) + testbench; recorded here, NOT masked by a waiver. |
 
 ### 5.3 Integration TODOs for later phases (S04 / S06 / S08)
 
@@ -207,6 +215,30 @@ context, not just lint-cleaned:
 - **`mailbox_tb` re-hosting:** upstream `TinyGPU-FPGA/testbench/mailbox_tb.sv` was
   **not** migrated; an Ethereal EBI-level **cocotb** test (per S14 / G1 verification
   vehicle) must be authored as a separate task before the NoC is declared verified.
+---
+
+## 5.4 S04-P0#2 cleanup outcome + B-channel design verdict (2026-09-01)
+
+**B-channel verdict (design review):** the AXI write-response (B) path is
+**intentionally terminated at every hop** — this is per spec, not an omission.
+`docs/mailbox_interconnect_spec.md §2.6` ("Fire-and-Forget: *There is no separate
+write-response (`BVALID`) channel*. Once `tx_ready` is asserted on the handshake
+cycle, the write is accepted.") removes B from the fabric end-to-end; the AXI4-Lite
+front-ends (`mailbox_endpoint` / `mailbox_switch_*` / `mailbox_center`) therefore
+answer their **own** ingress writes (`resp_pending → *_bvalid`) as soon as the flit
+is enqueued, and unconditionally accept the next hop's B (`m_*_bready = 1'b1`)
+while discarding its content (no `bresp` field exists anywhere — B carries no
+payload). The previously-flagged `UNUSEDSIGNAL m_*_bvalid` inputs are hence
+consumed into documented `_unused_*` sinks (one-line justification each, G1).
+No rewiring was required; no functional bug existed on the B path.
+
+**Cleanup result:** `rtl/mailbox/` — 10/10 files `-Wall` clean, zero lint_off
+waivers (all findings fixed by restructuring: width casts, argument narrowing,
+dead-field sinks). `rtl/interface/` — trivial fixes applied; 2 design-judgment
+warnings remain open (§5.2 items 7–8). Behavior preserved: old-vs-new equivalence
+smoke (20 000 random cycles each on `mailbox_switch_2x1` and `mailbox_endpoint`)
+showed bit-identical outputs. Evidence and the proposed `lint-mailbox`/`lint`
+integration diff: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
 
 ---
 

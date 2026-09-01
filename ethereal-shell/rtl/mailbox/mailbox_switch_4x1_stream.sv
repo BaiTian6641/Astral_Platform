@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      mailbox_switch_4x1_stream
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       G1-cleaned S04-P0#2 (2026-09-01): verilator --lint-only -Wall CLEAN, zero waivers; changes behavior-preserving (width casts / unused sinks / arg narrowing only).
 `timescale 1ns/1ps
 // AXI‑MailboxFabric Switch 4x1: four downlinks, one uplink (stream-based)
 module mailbox_switch_4x1_stream #(
@@ -72,14 +72,27 @@ module mailbox_switch_4x1_stream #(
   import mailbox_pkg::*;
 
   function automatic logic is_global(input logic [NODE_ID_WIDTH-1:0] dest);
+    // Only the cluster field [15:8] routes at this tier (spec §2.1); the
+    // endpoint/CSR bits are decoded downstream — sink them (G1/UNUSEDSIGNAL).
+    logic unused_dest_lo;
+    unused_dest_lo = ^dest[7:0];
     return (dest[15:8] == 8'hFF);
   endfunction
   function automatic logic is_local(input logic [NODE_ID_WIDTH-1:0] dest);
+    logic unused_dest_lo; // see is_global (G1/UNUSEDSIGNAL)
+    unused_dest_lo = ^dest[7:0];
     return (dest[15:8] == MY_CLUSTER_ID);
   endfunction
   function automatic logic is_local_bcast(input logic [NODE_ID_WIDTH-1:0] dest);
+    logic unused_dest_lo; // CSR index [3:0] is decoded at the endpoint (G1/UNUSEDSIGNAL)
+    unused_dest_lo = ^dest[3:0];
     return (dest[15:8] == MY_CLUSTER_ID) && (dest[7:4] == 4'hF);
   endfunction
+  // G1/UNUSEDSIGNAL: stream variants are purely combinational crossbars
+  // (single-cycle hops, spec §2.3); clk/rst_n are kept for port-list
+  // uniformity with the AXI4-Lite variants and are intentionally unused.
+  logic _unused_clk_rst;
+  assign _unused_clk_rst = &{1'b0, clk, rst_n};
 
   // Request signals per input
   logic dl0_req_up, dl0_req_dl0, dl0_req_dl1, dl0_req_dl2, dl0_req_dl3, dl0_req_any;

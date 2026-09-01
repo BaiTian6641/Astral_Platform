@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      uart_sat
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       Migrated verbatim (RTL body unchanged). UART satellite adapter (MailboxFabric endpoint side); verilator --lint-only -Wall verification is PENDING (Docker-gated; no verilator in authoring env).
+// Notes:       UART satellite adapter (MailboxFabric endpoint side); -Wall CLEAN (S04-P0#2, 2026-09-01; documented unused sink only).
 `timescale 1ns/1ps
 
 // Simple direct-port UART SAT-IP (no mailbox):
@@ -110,6 +110,11 @@ module uart_sat #(
   end
 
   assign UART_TX = tx_shift[0];
+  // G1/UNUSEDSIGNAL (advisory cleanup S04-P0#2; zero behavior change):
+  // rx_shift[0] is the start bit shifting through the sampler; only
+  // rx_shift[8:1] (data) is captured, so the bottom bit is intentionally unread.
+  logic _unused_rx;
+  assign _unused_rx = &{1'b0, rx_shift[0]};
 
   // RX: simple sampler similar to mailbox variant
   logic [BAUD_CNT_W-1:0] rx_baud_cnt;
