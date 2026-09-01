@@ -35,6 +35,49 @@ R_HEALTH_STATUS = 0x20
 R_MON_TEMP = 0x30
 R_MON_VCCINT = 0x31
 
+# ---- EFP command block (spec sec 3.2, v0.2) ----
+# Host<->BMC-daemon mailbox. All plain RW storage in the regfile (no port-role
+# distinction); the doorbell/clear convention is software. IMG_DIGEST[0..7]
+# occupy 0x18-0x1F, IMG_SIG[0..15] occupy 0x50-0x5F (base offsets below).
+R_EFP_CMD = 0x13  # daemon doorbell: 0=nop 1=run 2=stop 3=restart 4=abort
+R_EFP_REGION = 0x14  # target region; 0xFF = auto-alloc first free (run only)
+R_EFP_IMG_WORDS = 0x15
+R_EFP_STATUS = 0x16  # {state[3:0], busy[4], done[5]}
+R_EFP_ERR = 0x17  # sticky last-error, cleared on next EFP_CMD
+R_IMG_DIGEST = 0x18  # base; +0..7 (32-byte manifest digest)
+R_IMG_SIG = 0x50  # base; +0..15 (64-byte Ed25519 signature)
+IMG_DIGEST_WORDS = 8
+IMG_SIG_WORDS = 16
+
+# EFP doorbell command codes
+EFP_CMD_NOP = 0
+EFP_CMD_RUN = 1
+EFP_CMD_STOP = 2
+EFP_CMD_RESTART = 3
+EFP_CMD_ABORT = 4
+EFP_REGION_AUTO = 0xFF
+
+# EFP daemon lifecycle states (EFP_STATUS.state)
+EFP_S_IDLE = 0
+EFP_S_VERIFY = 1
+EFP_S_ALLOC = 2
+EFP_S_BLANK = 3
+EFP_S_LOAD = 4
+EFP_S_READBACK = 5
+EFP_S_RUNNING = 6
+EFP_S_ERROR = 7
+EFP_S_STOPPED = 8
+
+# EFP sticky error codes (EFP_ERR)
+EFP_ERR_NONE = 0
+EFP_ERR_BAD_SIG = 1
+EFP_ERR_REGION_FULL = 2
+EFP_ERR_REGION_LOCKED = 3
+EFP_ERR_OCC_CRC = 4
+EFP_ERR_OCC_REJECT = 5
+EFP_ERR_BAD_CMD = 6
+EFP_ERR_IMG_LEN_MISMATCH = 7
+
 # ---- CAPABILITIES bits ----
 CAPB_HAS_BMC = 0
 CAPB_HAS_DMA = 1

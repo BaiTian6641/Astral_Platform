@@ -1,29 +1,38 @@
 `default_nettype none
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      tb_bmc_fw (testbench, self-checking)
-// Description: E1-BMC2 checkpoint TB — the REAL C firmware framework
-//              (bmc-fw: crt0 boot + .data copy + .bss clear + lifecycle FSM
-//              skeleton + UART driver) boots on the vendored NEORV32 inside
-//              bmc_core and prints its banner over UART0. This is the first
-//              C (not hand-assembled) firmware on the BMC — proving the
-//              riscv64-unknown-elf bare-metal flow + link.ld ROM/DMEM map +
-//              crt0 startup all work against the real core.
+// Description: E1-RUN2 smoke TB — the REAL C daemon firmware (bmc-fw v0.2:
+//              crt0 DMEM-exec boot stub + Ed25519 boot selftest + EMRI
+//              MAGIC/CAP probe + EFP daemon poll loop) boots on the vendored
+//              NEORV32 inside bmc_core and prints its banner over UART0.
+//              The full daemon command flow is the tb_bmc_daemon capstone;
+//              THIS TB is the firmware/harness smoke: exact-match the boot
+//              byte stream and prove the EMRI probe works over the real AXI
+//              chain (XBUS -> wb2axi -> xbar -> adapter -> regfile).
 //
 //              main.c prints (exact):
-//                "bmc-fw v0 skeleton boot OK\n"
-//                "EMRI MAGIC=0x45544852 lifecycle: LRS done state=00000000\n"
-//                "bmc-fw v0 idle spin\n"
-//              The TB exact-matches the full byte stream.
+//                "bmc-fw v0.2 daemon boot\n"
+//                "ed25519 selftest OK\n"
+//                "EMRI MAGIC=45544852 CAP=00000001\n"
+//                "daemon ready\n"
+//              The TB exact-matches the full byte stream (90 bytes).
 //
-//              No XBUS/AXI access in this firmware (only UART0) — the AXI
-//              master pins are tied benign (matches tb_bmc_hello).
+//              BOOTSTRAP: the vendored netlist IMEM ROM is physically 1 KiB
+//              (imem_rom reads addr_i[9:2]), so the firmware DMEM-execs: the
+//              TB preloads bmc_boot.hex into the ROM array (n6964) and
+//              bmc_dmem_lane{0..3}.hex into the 4 dmem_ram byte-lane sprams
+//              (see bmc-fw/boot/crt0.S BOOTSTRAP NOTE).
 // Maintainer:  BaiTian6641
 // Created:     2026-08-30
+// Modified:    2026-09-01 - E1-RUN2: daemon firmware, DMEM-exec preload,
+//              runs under Verilator --timing (iverilog is too slow for the
+//              ~166M-cycle boot Ed25519 selftest on the iterative-mul NEORV32
+//              netlist; sim-only slowness — ~1.6 s @50 MHz real silicon)
 // Tags:        TESTBENCH
-// Plan-Ref:    ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.2/§3 (E1-BMC2)
-// Notes:       iverilog -g2012. Self-checking; prints "TEST PASSED".
-//              IMEM preload backdoor path matches tb_bmc_hello (ROM array
-//              n6964, renamed on the 2026-08-08 XBUS regen — update on regen).
+// Plan-Ref:    ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.2/§2.3 (E1-RUN2)
+// Notes:       simulated via Verilator --binary --timing (see Makefile
+//              test-sv; ADR-018 §7.5 iverilog constraint exempted here for
+//              cycle count, not language). Self-checking; prints "TEST PASSED".
 //              UART bit time = 2 clk (NEORV32 reset defaults PRSC=0/BAUD=0).
 `timescale 1ns/1ps
 
@@ -150,7 +159,8 @@ module tb_bmc_fw;
         .host_rdata_i(host_rdata), .host_ready_i(host_ready)
     );
 
-    // OCC side tied off (this firmware only reads EMRI identity registers).
+    // OCC side tied off (this smoke TB only reads EMRI identity registers;
+    // the daemon's OCC path is exercised by tb_bmc_daemon).
     emri_regfile #(
         .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0)
     ) u_emri (
@@ -169,13 +179,35 @@ module tb_bmc_fw;
     initial clk = 1'b0;
     always #(CLK_PERIOD_NS / 2) clk = ~clk;
 
-    // -- IMEM image preload (backdoor into the generated netlist ROM) -----------
-    localparam string IMAGE = "generated/bmc/bmc_fw.hex";
-    // Path matches tb_bmc_hello; ROM array renamed n6830 -> n6964 on XBUS regen.
+    // -- Firmware preload (DMEM-exec bootstrap, see header BOOTSTRAP note) ------
+    // ROM: 1 KiB boot stub. DMEM: full firmware, 4 byte-lane sprams.
+    localparam string BOOT_IMAGE = "generated/bmc/bmc_boot.hex";
+    localparam string DMEM_LANE0 = "generated/bmc/bmc_dmem_lane0.hex";
+    localparam string DMEM_LANE1 = "generated/bmc/bmc_dmem_lane1.hex";
+    localparam string DMEM_LANE2 = "generated/bmc/bmc_dmem_lane2.hex";
+    localparam string DMEM_LANE3 = "generated/bmc/bmc_dmem_lane3.hex";
     initial begin
-        $readmemh(IMAGE, dut.u_core.neorv32_top_inst
+        // #1: the netlist's imem_rom has its OWN time-0 initial block that
+        // fills n6964 with the (9-word) GHDL-conversion default image; the
+        // simulator may run it AFTER a time-0 TB initial and clobber the
+        // preload. Deferring past time 0 makes the preload win determinically
+        // (the core is still in reset; reset releases at 200 ns).
+        #1;
+        $readmemh(BOOT_IMAGE, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_imem_enabled_neorv32_imem_inst
                   .imem_rom_imem_rom_inst.n6964);
+        $readmemh(DMEM_LANE0, dut.u_core.neorv32_top_inst
+                  .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
+                  .dmem_ram_inst.\ram_gen[0]_ram_inst .spram);
+        $readmemh(DMEM_LANE1, dut.u_core.neorv32_top_inst
+                  .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
+                  .dmem_ram_inst.\ram_gen[1]_ram_inst .spram);
+        $readmemh(DMEM_LANE2, dut.u_core.neorv32_top_inst
+                  .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
+                  .dmem_ram_inst.\ram_gen[2]_ram_inst .spram);
+        $readmemh(DMEM_LANE3, dut.u_core.neorv32_top_inst
+                  .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
+                  .dmem_ram_inst.\ram_gen[3]_ram_inst .spram);
     end
 
     // -- UART 8N1 receive (idle-high, start bit low, LSB first) -----------------
@@ -211,27 +243,24 @@ module tb_bmc_fw;
     endtask
 
     // -- Stimulus + check ---------------------------------------------------------
-    // Expected: "bmc-fw v0 skeleton boot OK\nEMRI MAGIC=0x45544852 lifecycle:
-    // LRS done state=00000000\nbmc-fw v0 idle spin\n" (104 bytes). iverilog has
-    // limited `string` method support, so the expected bytes are a byte array
-    // (generated from the message; matches main.c exactly).
-    localparam int NEXP = 115;
+    // Expected: "bmc-fw v0.2 daemon boot\ned25519 selftest OK\nEMRI
+    // MAGIC=45544852 CAP=00000001\ndaemon ready\n" (90 bytes). The expected
+    // bytes are a byte array (generated from the message; matches main.c
+    // exactly).
+    localparam int NEXP = 90;
     byte unsigned expected [0:NEXP-1] = '{
         8'h62, 8'h6d, 8'h63, 8'h2d, 8'h66, 8'h77, 8'h20, 8'h76,
-        8'h30, 8'h20, 8'h73, 8'h6b, 8'h65, 8'h6c, 8'h65, 8'h74,
-        8'h6f, 8'h6e, 8'h20, 8'h62, 8'h6f, 8'h6f, 8'h74, 8'h20,
-        8'h4f, 8'h4b, 8'h0a, 8'h45, 8'h4d, 8'h52, 8'h49, 8'h20,
-        8'h4d, 8'h41, 8'h47, 8'h49, 8'h43, 8'h3d, 8'h34, 8'h35,
-        8'h35, 8'h34, 8'h34, 8'h38, 8'h35, 8'h32, 8'h20, 8'h43,
-        8'h41, 8'h50, 8'h3d, 8'h30, 8'h30, 8'h30, 8'h30, 8'h30,
-        8'h30, 8'h30, 8'h31, 8'h20, 8'h6c, 8'h69, 8'h66, 8'h65,
-        8'h63, 8'h79, 8'h63, 8'h6c, 8'h65, 8'h3a, 8'h20, 8'h4c,
-        8'h52, 8'h53, 8'h20, 8'h64, 8'h6f, 8'h6e, 8'h65, 8'h20,
-        8'h73, 8'h74, 8'h61, 8'h74, 8'h65, 8'h3d, 8'h30, 8'h30,
-        8'h30, 8'h30, 8'h30, 8'h30, 8'h30, 8'h30, 8'h0a, 8'h62,
-        8'h6d, 8'h63, 8'h2d, 8'h66, 8'h77, 8'h20, 8'h76, 8'h30,
-        8'h20, 8'h69, 8'h64, 8'h6c, 8'h65, 8'h20, 8'h73, 8'h70,
-        8'h69, 8'h6e, 8'h0a
+        8'h30, 8'h2e, 8'h32, 8'h20, 8'h64, 8'h61, 8'h65, 8'h6d,
+        8'h6f, 8'h6e, 8'h20, 8'h62, 8'h6f, 8'h6f, 8'h74, 8'h0a,
+        8'h65, 8'h64, 8'h32, 8'h35, 8'h35, 8'h31, 8'h39, 8'h20,
+        8'h73, 8'h65, 8'h6c, 8'h66, 8'h74, 8'h65, 8'h73, 8'h74,
+        8'h20, 8'h4f, 8'h4b, 8'h0a, 8'h45, 8'h4d, 8'h52, 8'h49,
+        8'h20, 8'h4d, 8'h41, 8'h47, 8'h49, 8'h43, 8'h3d, 8'h34,
+        8'h35, 8'h35, 8'h34, 8'h34, 8'h38, 8'h35, 8'h32, 8'h20,
+        8'h43, 8'h41, 8'h50, 8'h3d, 8'h30, 8'h30, 8'h30, 8'h30,
+        8'h30, 8'h30, 8'h30, 8'h31, 8'h0a, 8'h64, 8'h61, 8'h65,
+        8'h6d, 8'h6f, 8'h6e, 8'h20, 8'h72, 8'h65, 8'h61, 8'h64,
+        8'h79, 8'h0a
     };
 
     integer errors = 0;
@@ -261,14 +290,17 @@ module tb_bmc_fw;
         end
 
         if (errors == 0) begin
-            $display("TEST PASSED: C bmc-fw framework booted on NEORV32, lifecycle skeleton ran, printed full banner");
+            $display("TEST PASSED: bmc-fw v0.2 daemon firmware booted on NEORV32 (DMEM-exec), Ed25519 selftest OK, EMRI probe OK, daemon polling");
         end
         $finish;
     end
 
     // -- Watchdog ------------------------------------------------------------------
     initial begin
-        #120000000;  // 120 ms (ample; boot + ~90 UART bytes @ 20ns/bit + CPU)
+        // The boot Ed25519 selftest is ~166M cycles (~1.7 s sim) on the
+        // iterative-mul NEORV32 netlist (sim-only slowness; ~3.3 s @50 MHz
+        // real silicon for 2 verifies). Ample margin + banner UART time.
+        #4000000000;  // 4 s
         $display("TEST FAILED: watchdog timeout (got %0d/%0d bytes)", rxn, NEXP);
         $finish;
     end

@@ -1,8 +1,8 @@
-# EMRI — Ethereal Management Register Interface (v0, draft)
+# EMRI — Ethereal Management Register Interface (v0.2, draft)
 
-> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0**
+> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.2** (v0.2 adds the EFP command block §3.2)
 > Plan-Ref: `ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.3`, `ethereal-plan/components/C05-BMC组件.md §3/§4`
-> Date: 2026-07-29 · Implements: ADR-013/014/015/016
+> Date: 2026-07-29 · v0.2: 2026-09-01 · Implements: ADR-013/014/015/016
 
 The **unified management register ABI** exposed to the host by **both** the BMC
 (NEORV32 soft-core) and the **mFSM** (register-based small-device fallback).
@@ -71,14 +71,23 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x10` | `SESSION_CMD` | RW | 8 | mFSM session FSM control. `0=nop, 1=begin_rx, 2=verify(host-done), 3=occ_go, 4=abort`. BMC mode: ignored (BMC drives OCC directly). |
 | `0x11` | `SESSION_STATUS` | R | 8 | `{state[3:0], done[4], err[7:4]}`. See §5. |
 | `0x12` | `RX_BUF_CTRL` | RW | 32 | `{wr_ptr[31:16], depth[15:0]}`. Image-staging buffer (mFSM rx_buf). v0: depth ≤ 16KB. |
+| `0x13` | `EFP_CMD` | W | 8 | **Daemon doorbell (v0.2, BMC mode)**. `0=nop, 1=run, 2=stop, 3=restart, 4=abort`. See §3.2. |
+| `0x14` | `EFP_REGION` | RW | 8 | Target region for the next `EFP_CMD`. `0xFF` = auto-allocate first free (run only). |
+| `0x15` | `EFP_IMG_WORDS` | RW | 16 | Frame-word count of the image being deployed (incl. CRC tail words). |
+| `0x16` | `EFP_STATUS` | R | 8 | Daemon lifecycle: `{state[3:0], busy[4], done[5]}`. States: `0=IDLE,1=VERIFY,2=ALLOC,3=BLANK,4=LOAD,5=READBACK,6=RUNNING,7=ERROR,8=STOPPED`. |
+| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch`. Cleared on next `EFP_CMD` write. |
+| `0x18-0x1F` | `IMG_DIGEST[0..7]` | RW | 8×32 | 32-byte manifest digest (SHA-256). Word `i` holds digest bytes `[4i+3:4i]` (little-endian in-word). |
+| `0x50-0x5F` | `IMG_SIG[0..15]` | RW | 16×32 | 64-byte Ed25519 signature over the digest. Same in-word byte order as `IMG_DIGEST`. |
 | `0x20` | `HEALTH_STATUS` | R | 32 | bit-per-region health: bit0=region0 ok, bit8=region1 ok, … v0: all-ok = `0x0000_0101`. |
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
 
-**Reserved ranges** (`0x06-0x07`, `0x0E-0x0F`, `0x13-0x1F`, `0x22-0x2F`, `0x32+`):
-read-as-0, write-ignored. Reserved for v0.1/v1 (event-log ring @ `0x38`,
-telemetry block @ `0x40+`, scheduler @ `0x60+`). (`0x0D` repurposed for
-`OCC_DECODE` in v0.1 — see §3.1.)
+**Reserved ranges** after v0.2 allocations: `0x07`, `0x0E-0x0F`, `0x22-0x2F`,
+`0x32-0x37`, `0x39-0x3F`, `0x60+` — read-as-0, write-ignored. Allocation map:
+event-log ring @ `0x38` (planned), telemetry @ `0x40-0x4F` (planned),
+`IMG_SIG` @ `0x50-0x5F` (v0.2), scheduler @ `0x60+` (planned).
+History: `0x06`=`REGION_SEL` (v0.1, §6), `0x0D`=`OCC_DECODE` (v0.1, §3.1),
+`0x13-0x1F`/`0x50-0x5F`=EFP block (v0.2, §3.2).
 
 ---
 
@@ -146,6 +155,57 @@ would have to poll decoder status or guess a delay.
 3. Write `OCC_CMD = {region_id, cmd=BLANK|WRITE, start=1}` (+ stream `OCC_WDATA` for WRITE).
 4. Decoder auto-decodes once `column_data_words(col)` DATA words are captured;
    the next `OCC_DECODE` write self-times against decode completion.
+
+---
+## 3.2 EFP command block (offsets `0x13-0x1F` + `0x50-0x5F`, v0.2, BMC mode)
+
+The **host↔BMC-daemon mailbox**: the host (ethctl) stages image metadata in
+the window registers, rings `EFP_CMD`, and polls `EFP_STATUS`/`EFP_ERR`.
+The BMC firmware polls `EFP_CMD` (doorbell; the daemon clears it back to `0=nop` with a write once it accepts the command — reads never auto-clear, since host and BMC share one AXI port) and drives the
+OCC lifecycle. Single outstanding command: the host MUST wait for
+`EFP_STATUS.busy=0` before writing a new `EFP_CMD`; a doorbell write while
+busy sets `EFP_ERR=bad_cmd` and is otherwise ignored.
+
+**Write roles (software convention, v0 accident-prevention only):** the host
+writes `EFP_CMD`/`EFP_REGION`/`EFP_IMG_WORDS`/`IMG_DIGEST`/`IMG_SIG` and
+treats `EFP_STATUS`/`EFP_ERR` as read-only; the daemon writes
+`EFP_STATUS`/`EFP_ERR` (and clears `EFP_CMD`). The regfile implements all
+EFP-block registers as plain RW storage — it has no port-role distinction.
+
+**run sequence:**
+
+1. Host writes `IMG_DIGEST[0..7]` (32 B manifest digest) + `IMG_SIG[0..15]`
+   (64 B Ed25519 signature) + `EFP_IMG_WORDS` + `EFP_REGION` (or `0xFF` = auto).
+2. Host writes `EFP_CMD=run` → daemon: `VERIFY` → `ALLOC` → `BLANK` →
+   `LOAD` → `READBACK` → `RUNNING` (visible in `EFP_STATUS.state`).
+3. **VERIFY:** daemon hex-encodes the 32-byte digest to 64 lowercase-hex
+   chars (matching `ethimg`, which signs the hex-UTF-8 digest) and runs
+   `eth_ed25519_verify(sig, trusted_pk, hex_digest, 64)`. Failure →
+   `EFP_ERR=bad_sig`, state `ERROR`. v0 keyring: a single trusted public key
+   compiled into the firmware (`keyring.h`); real key management is E2-SEC1.
+4. **ALLOC:** `EFP_REGION=0xFF` → first FREE region; explicit index → that
+   region if FREE/STOPPED. None available → `region_full`. Locked region
+   (OCC lock) → `region_locked`.
+5. **BLANK/LOAD:** daemon programs `OCC_FRAME_ADDR`+`OCC_WORD_COUNT`, issues
+   BLANK (mandatory per blank-before-write), then arms WRITE; the **host
+   streams the frame words** through `OCC_WDATA` (same passthrough as mFSM
+   mode) while the daemon supervises `OCC_STATUS`. Dirty-region WRITE reject
+   surfaces as `occ_reject`.
+6. **READBACK:** daemon issues READBACK; `crc_error`/ERROR → `occ_crc`,
+   state `ERROR` (region stays non-RUNNING). Success → `RUNNING`,
+   `done=1`.
+
+**stop** → daemon BLANKs the region, state `STOPPED`, region FREE.
+**restart** → stop + re-run with the last staged metadata (digest/sig/words
+retained until overwritten). **abort** → best-effort BLANK, state `IDLE`.
+**ps** is a pure read: the host reads `EFP_STATUS` (+ per-region detail via
+`REGION_SEL`/`REGION_INFO`); no `EFP_CMD` needed.
+
+**Byte order:** all multi-byte blobs are stored little-endian within each
+32-bit word and in ascending word order (word `i` = bytes `[4i+3:4i]`) —
+identical to a C `memcpy` of the byte array into the window on a
+little-endian host. In mFSM mode these registers are plain host-visible
+storage (the mFSM has no daemon; `EFP_CMD` writes are ignored).
 
 ---
 

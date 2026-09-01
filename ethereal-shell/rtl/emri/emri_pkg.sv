@@ -45,6 +45,22 @@ package emri_pkg;
   localparam logic [15:0] R_MON_VCCINT     = 16'h31;
 
   // ------------------------------------------------------------------
+  // EFP command block (spec §3.2, v0.2) — host<->BMC-daemon mailbox.
+  // All plain RW storage in the regfile (no port-role distinction); the
+  // doorbell/clear convention is software (the daemon clears EFP_CMD on
+  // accept). IMG_DIGEST[0..7] occupy 0x18-0x1F, IMG_SIG[0..15] 0x50-0x5F.
+  // ------------------------------------------------------------------
+  localparam logic [15:0] R_EFP_CMD        = 16'h13;  // daemon doorbell
+  localparam logic [15:0] R_EFP_REGION     = 16'h14;  // 0xFF = auto-alloc
+  localparam logic [15:0] R_EFP_IMG_WORDS  = 16'h15;
+  localparam logic [15:0] R_EFP_STATUS     = 16'h16;  // {state[3:0],busy,done}
+  localparam logic [15:0] R_EFP_ERR        = 16'h17;  // sticky last-error
+  localparam logic [15:0] R_IMG_DIGEST     = 16'h18;  // base; +0..7
+  localparam logic [15:0] R_IMG_SIG        = 16'h50;  // base; +0..15
+  localparam int          IMG_DIGEST_WORDS = 8;       // 32 B manifest digest
+  localparam int          IMG_SIG_WORDS    = 16;      // 64 B Ed25519 sig
+
+  // ------------------------------------------------------------------
   // CAPABILITIES bits (spec §2)
   // ------------------------------------------------------------------
   // The following capability-bit + opcode/status constants are the spec ABI
@@ -94,6 +110,37 @@ package emri_pkg;
   localparam logic [7:0] SPI_STAT_BAD_OP  = 8'h01;
   localparam logic [7:0] SPI_STAT_BAD_ADDR= 8'h02;
   localparam logic [7:0] SPI_STAT_BUSY    = 8'h03;
+
+  // ------------------------------------------------------------------
+  // EFP doorbell command codes (spec §3.2; EFP_CMD[7:0])
+  // ------------------------------------------------------------------
+  localparam logic [7:0] EFP_CMD_NOP     = 8'd0;
+  localparam logic [7:0] EFP_CMD_RUN     = 8'd1;
+  localparam logic [7:0] EFP_CMD_STOP    = 8'd2;
+  localparam logic [7:0] EFP_CMD_RESTART = 8'd3;
+  localparam logic [7:0] EFP_CMD_ABORT   = 8'd4;
+  localparam logic [7:0] EFP_REGION_AUTO = 8'hFF;  // auto first-free (run only)
+
+  // EFP daemon lifecycle states (spec §3.2; EFP_STATUS.state[3:0])
+  localparam logic [3:0] EFP_S_IDLE     = 4'd0;
+  localparam logic [3:0] EFP_S_VERIFY   = 4'd1;
+  localparam logic [3:0] EFP_S_ALLOC    = 4'd2;
+  localparam logic [3:0] EFP_S_BLANK    = 4'd3;
+  localparam logic [3:0] EFP_S_LOAD     = 4'd4;
+  localparam logic [3:0] EFP_S_READBACK = 4'd5;
+  localparam logic [3:0] EFP_S_RUNNING  = 4'd6;
+  localparam logic [3:0] EFP_S_ERROR    = 4'd7;
+  localparam logic [3:0] EFP_S_STOPPED  = 4'd8;
+
+  // EFP sticky error codes (spec §3.2; EFP_ERR[7:0])
+  localparam logic [7:0] EFP_ERR_NONE             = 8'd0;
+  localparam logic [7:0] EFP_ERR_BAD_SIG          = 8'd1;
+  localparam logic [7:0] EFP_ERR_REGION_FULL      = 8'd2;
+  localparam logic [7:0] EFP_ERR_REGION_LOCKED    = 8'd3;
+  localparam logic [7:0] EFP_ERR_OCC_CRC          = 8'd4;
+  localparam logic [7:0] EFP_ERR_OCC_REJECT       = 8'd5;
+  localparam logic [7:0] EFP_ERR_BAD_CMD          = 8'd6;
+  localparam logic [7:0] EFP_ERR_IMG_LEN_MISMATCH = 8'd7;
   /* verilator lint_on UNUSEDPARAM */
 
 endpackage : emri_pkg

@@ -35,3 +35,18 @@ void uart_puthex32(uint32_t v)
         uart_putc(hexdig[(v >> i) & 0xFu]);
     }
 }
+
+void uart_puthex16(uint32_t v)
+{
+    static const char hexdig[] = "0123456789ABCDEF";
+    for (int i = 12; i >= 0; i -= 4) {
+        uart_putc(hexdig[(v >> i) & 0xFu]);
+    }
+}
+
+void uart_puthex8(uint32_t v)
+{
+    static const char hexdig[] = "0123456789ABCDEF";
+    uart_putc(hexdig[(v >> 4) & 0xFu]);
+    uart_putc(hexdig[v & 0xFu]);
+}

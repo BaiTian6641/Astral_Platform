@@ -12,6 +12,12 @@
 //                  backpressure propagated to the host as a stalled ready;
 //                * OCC_STATUS assembled from occ_status_i / occ_crc_error_i.
 //
+//              v0.2 (spec §3.2): the EFP command block (EFP_CMD/EFP_REGION/
+//              EFP_IMG_WORDS/EFP_STATUS/EFP_ERR + IMG_DIGEST[0..7] +
+//              IMG_SIG[0..15]) is implemented as PLAIN RW storage — the
+//              regfile has no port-role distinction; the host/daemon
+//              doorbell-and-clear discipline is a software convention.
+//
 //              v0 scoping (see spec §1 + report): in mFSM mode the HOST drives OCC
 //              directly through these registers (the host is the session FSM; it
 //              holds the image and streams OCC_WDATA). The device-side rx_buf +
@@ -95,6 +101,15 @@ module emri_regfile #(
   localparam logic [15:0] R_HEALTH_STATUS  = emri_pkg::R_HEALTH_STATUS;
   localparam logic [15:0] R_MON_TEMP       = emri_pkg::R_MON_TEMP;
   localparam logic [15:0] R_MON_VCCINT     = emri_pkg::R_MON_VCCINT;
+  localparam logic [15:0] R_EFP_CMD        = emri_pkg::R_EFP_CMD;
+  localparam logic [15:0] R_EFP_REGION     = emri_pkg::R_EFP_REGION;
+  localparam logic [15:0] R_EFP_IMG_WORDS  = emri_pkg::R_EFP_IMG_WORDS;
+  localparam logic [15:0] R_EFP_STATUS     = emri_pkg::R_EFP_STATUS;
+  localparam logic [15:0] R_EFP_ERR        = emri_pkg::R_EFP_ERR;
+  localparam logic [15:0] R_IMG_DIGEST     = emri_pkg::R_IMG_DIGEST;
+  localparam logic [15:0] R_IMG_SIG        = emri_pkg::R_IMG_SIG;
+  localparam int          IMG_DIGEST_WORDS = emri_pkg::IMG_DIGEST_WORDS;
+  localparam int          IMG_SIG_WORDS    = emri_pkg::IMG_SIG_WORDS;
   localparam int          OCC_CMD_START    = emri_pkg::OCC_CMD_START;
   localparam logic [2:0]  OCC_S_DONE       = emri_pkg::OCC_S_DONE;
   localparam logic [2:0]  OCC_S_ERROR      = emri_pkg::OCC_S_ERROR;
@@ -136,6 +151,20 @@ module emri_regfile #(
   logic [7:0]  session_status_r;
   // RX_BUF_CTRL (v0: host-readable placeholder; depth fixed)
   logic [15:0] rx_buf_depth_w = 16'h4000;  // 16 KB
+
+  // ------------------------------------------------------------------
+  // EFP command block storage (v0.2, spec §3.2). All PLAIN RW storage —
+  // the regfile has no port-role distinction; the doorbell protocol
+  // (host writes EFP_CMD, the BMC daemon clears it to NOP on accept and
+  // owns EFP_STATUS/EFP_ERR) is a software convention only.
+  // ------------------------------------------------------------------
+  logic [7:0]  efp_cmd_r;
+  logic [7:0]  efp_region_r;
+  logic [15:0] efp_img_words_r;
+  logic [7:0]  efp_status_r;
+  logic [7:0]  efp_err_r;
+  logic [31:0] img_digest_r [IMG_DIGEST_WORDS];  // 32 B manifest digest
+  logic [31:0] img_sig_r   [IMG_SIG_WORDS];      // 64 B Ed25519 signature
 
   // ------------------------------------------------------------------
   // Decode helpers
@@ -211,16 +240,55 @@ module emri_regfile #(
       region_sel_r     <= 8'h0;
       session_cmd_r    <= 8'h0;
       session_status_r <= 8'h0;
+      efp_cmd_r        <= 8'h0;
+      efp_region_r     <= 8'h0;
+      efp_img_words_r  <= 16'h0;
+      efp_status_r     <= 8'h0;
+      efp_err_r        <= 8'h0;
     end else if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR)) begin
       case (host_addr_i)
         R_OCC_FRAME_ADDR: occ_frame_addr_r <= host_wdata_i[15:0];
         R_OCC_WORD_COUNT: occ_word_count_r <= host_wdata_i[15:0];
         R_REGION_SEL:     region_sel_r     <= host_wdata_i[7:0];
         R_SESSION_CMD:    session_cmd_r    <= host_wdata_i[7:0];
-        default: ; // others RO or handled above
+        R_EFP_CMD:        efp_cmd_r        <= host_wdata_i[7:0];
+        R_EFP_REGION:     efp_region_r     <= host_wdata_i[7:0];
+        R_EFP_IMG_WORDS:  efp_img_words_r  <= host_wdata_i[15:0];
+        R_EFP_STATUS:     efp_status_r     <= host_wdata_i[7:0];
+        R_EFP_ERR:        efp_err_r        <= host_wdata_i[7:0];
+        default: ; // others RO or handled above/below
       endcase
     end
   end
+
+  // IMG_DIGEST / IMG_SIG word storage (one always_ff per word via genvar —
+  // G1: no procedural loops inside always_*). Word i holds bytes [4i+3:4i]
+  // (little-endian in-word), ascending word order (spec §3.2 byte order).
+  genvar gi;
+  generate
+    for (gi = 0; gi < IMG_DIGEST_WORDS; gi++) begin : g_img_digest
+      localparam logic [15:0] WORD_ADDR = R_IMG_DIGEST + 16'(gi);
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          img_digest_r[gi] <= 32'h0;
+        end else if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                     (host_addr_i == WORD_ADDR)) begin
+          img_digest_r[gi] <= host_wdata_i;
+        end
+      end
+    end
+    for (gi = 0; gi < IMG_SIG_WORDS; gi++) begin : g_img_sig
+      localparam logic [15:0] WORD_ADDR = R_IMG_SIG + 16'(gi);
+      always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+          img_sig_r[gi] <= 32'h0;
+        end else if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                     (host_addr_i == WORD_ADDR)) begin
+          img_sig_r[gi] <= host_wdata_i;
+        end
+      end
+    end
+  endgenerate
 
   // ------------------------------------------------------------------
   // OCC_DECODE start trigger (v0.1, spec §3.1): a write to R_OCC_DECODE
@@ -337,10 +405,27 @@ module emri_regfile #(
       R_SESSION_CMD:    host_rdata_o = {24'h0, session_cmd_r};
       R_SESSION_STATUS: host_rdata_o = {24'h0, session_status_r};
       R_RX_BUF_CTRL:    host_rdata_o = {16'h0, rx_buf_depth_w};
+      R_EFP_CMD:        host_rdata_o = {24'h0, efp_cmd_r};
+      R_EFP_REGION:     host_rdata_o = {24'h0, efp_region_r};
+      R_EFP_IMG_WORDS:  host_rdata_o = {16'h0, efp_img_words_r};
+      R_EFP_STATUS:     host_rdata_o = {24'h0, efp_status_r};
+      R_EFP_ERR:        host_rdata_o = {24'h0, efp_err_r};
       R_HEALTH_STATUS:  host_rdata_o = health_status_w;
       R_MON_TEMP:       host_rdata_o = {16'h0, MON_TEMP_SIM};
       R_MON_VCCINT:     host_rdata_o = {16'h0, MON_VCCINT_SIM};
-      default:          host_rdata_o = 32'h0;          // reserved read-as-0
+      default: begin
+        // IMG_DIGEST (0x18-0x1F) / IMG_SIG (0x50-0x5F) word windows; the
+        // remaining offsets are reserved and read as 0 (v0.2 map, spec §2).
+        if ((host_addr_i >= R_IMG_DIGEST) &&
+            (host_addr_i < (R_IMG_DIGEST + 16'(IMG_DIGEST_WORDS)))) begin
+          host_rdata_o = img_digest_r[3'(host_addr_i - R_IMG_DIGEST)];
+        end else if ((host_addr_i >= R_IMG_SIG) &&
+                     (host_addr_i < (R_IMG_SIG + 16'(IMG_SIG_WORDS)))) begin
+          host_rdata_o = img_sig_r[4'(host_addr_i - R_IMG_SIG)];
+        end else begin
+          host_rdata_o = 32'h0;  // reserved read-as-0
+        end
+      end
     endcase
   end
 

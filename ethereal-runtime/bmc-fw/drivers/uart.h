@@ -26,5 +26,7 @@ void uart_init(void);
 void uart_putc(char c);
 void uart_puts(const char *s);
 void uart_puthex32(uint32_t v);
+void uart_puthex16(uint32_t v);
+void uart_puthex8(uint32_t v);
 
 #endif /* BMC_FW_UART_H */

@@ -280,6 +280,44 @@ module tb_emri_regfile;
     // ---- 8. HEALTH + MON ----
     host_read(R_HEALTH_STATUS, rd); chk(rd[0]==1'b1 && rd[8]==1'b1, "HEALTH all-ok");
     host_read(R_MON_TEMP, rd);      chk(rd[15:0] == 16'h0019, "MON_TEMP 25C");
+    // ---- 9. EFP command block (v0.2, spec §3.2): plain RW storage ----
+    host_write(R_EFP_CMD, 32'h0000_0001);       // host rings doorbell (run)
+    host_read(R_EFP_CMD, rd);  chk(rd == 32'h1, "EFP_CMD holds doorbell");
+    host_write(R_EFP_CMD, 32'h0);               // daemon clears on accept
+    host_read(R_EFP_CMD, rd);  chk(rd == 32'h0, "EFP_CMD daemon-clear");
+    host_write(R_EFP_REGION, 32'h0000_00FF);    // 0xFF = auto-alloc
+    host_read(R_EFP_REGION, rd); chk(rd == 32'hFF, "EFP_REGION RW");
+    host_write(R_EFP_IMG_WORDS, 32'h0000_0023); // 35 words
+    host_read(R_EFP_IMG_WORDS, rd); chk(rd == 32'h23, "EFP_IMG_WORDS RW");
+    host_write(R_EFP_STATUS, 32'h0000_0026);    // {done=1, state=RUNNING=6}
+    host_read(R_EFP_STATUS, rd); chk(rd == 32'h26, "EFP_STATUS RW");
+    host_write(R_EFP_ERR, 32'h0000_0001);       // bad_sig
+    host_read(R_EFP_ERR, rd);  chk(rd == 32'h1, "EFP_ERR RW");
+    host_write(R_EFP_ERR, 32'h0);
+
+    // IMG_DIGEST[0..7] @ 0x18-0x1F and IMG_SIG[0..15] @ 0x50-0x5F: full
+    // walk (every word stores independently; little-endian in-word bytes).
+    for (int i = 0; i < 8; i = i + 1)
+      host_write(R_IMG_DIGEST + 16'(i), 32'hD160_0000 + 32'(i));
+    for (int i = 0; i < 8; i = i + 1) begin
+      host_read(R_IMG_DIGEST + 16'(i), rd);
+      chk(rd == 32'hD160_0000 + 32'(i), "IMG_DIGEST word RW");
+    end
+    for (int i = 0; i < 16; i = i + 1)
+      host_write(R_IMG_SIG + 16'(i), 32'h5160_0000 + 32'(i));
+    for (int i = 0; i < 16; i = i + 1) begin
+      host_read(R_IMG_SIG + 16'(i), rd);
+      chk(rd == 32'h5160_0000 + 32'(i), "IMG_SIG word RW");
+    end
+
+    // ---- 10. Reserved map SHRANK (v0.2): 0x18-0x1F / 0x50-0x5F are now
+    //      storage; the rest of the old reserved ranges still read-as-0.
+    host_read(16'h22, rd); chk(rd == 32'h0, "reserved 0x22 read-as-0");
+    host_read(16'h37, rd); chk(rd == 32'h0, "reserved 0x37 read-as-0");
+    host_read(16'h39, rd); chk(rd == 32'h0, "reserved 0x39 read-as-0");
+    host_read(16'h60, rd); chk(rd == 32'h0, "reserved 0x60 read-as-0");
+    host_read(16'h1F, rd); chk(rd == 32'hD160_0007, "0x1F = IMG_DIGEST[7] (not reserved)");
+    host_read(16'h5F, rd); chk(rd == 32'h5160_000F, "0x5F = IMG_SIG[15] (not reserved)");
 
     // ---- report ----
     if (errors == 0) $display("TEST PASSED: emri_regfile (EMRI v0 register ABI + OCC passthrough)");
