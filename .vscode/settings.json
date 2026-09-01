@@ -1,0 +1,17 @@
+{
+    "pendant.contextWindowAlignment": "right",
+    "pendant.thinkingLevel": "max",
+    "pendant.autoGenerateSessionNames": true,
+    "pendant.sessionNameGeneration": {
+        "model": "kimi-coding/kimi-for-coding"
+    },
+    "pendant.restoreLastSessionOnStartup": true,
+    "pendant.customTools": [],
+    "pendant.showThinking": true,
+    "pendant.thinkingDisplayMode": "collapseWhenDone",
+    "pendant.toolPreset": "default",
+    "pendant.subagents.enabled": true,
+    "pendant.extensionStatus.surface": "statusBar",
+    "pendant.runtimeSource": "external",
+    "pendant.binaryPath": "omp"
+}
