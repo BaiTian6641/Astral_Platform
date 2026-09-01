@@ -48,6 +48,8 @@ Directory.icloud
 !.vscode/launch.json
 !.vscode/extensions.json
 !.vscode/*.code-snippets
+# AI-agent session state (pi/omp harness task logs) — machine-local, never commit
+.pi/
 .idea/
 *.iml
 *.ipr
