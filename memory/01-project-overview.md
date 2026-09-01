@@ -4,9 +4,12 @@
 > Synced from `/memories/repo/project-overview.md`.
 
 ## Repo nature
-**Pure planning/spec repository — NO source code, build scripts, tests, or CI exist yet.**
-- 30+ Markdown docs + 1 YAML task list (`ethereal-tasks.yaml`).
-- All "build/run/test" descriptions are PLANS; first implementation lands in Phase 0 tasks `E0-INF1..3`.
+**Active implementation repository (since 2026-07-24).** The plan docs remain authoritative, but real code exists and grows:
+- RTL: `ethereal-fabric/rtl/` (elut4/clb_t/switch_box/connection_block/fabric_top/occ_top/mem_t/dsp_t/inf), `ethereal-shell/rtl/` (axi/emri/bmc/mailbox/interface).
+- Tools (Python 3.12): `ethereal-tools/tools/` (fabric_gen, frame_map, mapper/{yosys,vpr,bitgen}, ethimg, ethctl, perf_model).
+- Firmware (C, rv32imc): `ethereal-runtime/bmc-fw/` (boot, drivers, crypto/Ed25519, daemon).
+- Gates (local, OSS-CAD): `make lint` / `make test-sv` (iverilog TBs) / `make test-model` (pytest golden models) / `make formal` (SymbiYosys) / `make lint-mailbox` (advisory, interface/ only).
+- Open Gowin build chain proven (yosys synth_gowin → nextpnr-himbaechel → gowin_pack → .fs).
 
 ## Document structure (3 tiers + 4 top-level)
 ```

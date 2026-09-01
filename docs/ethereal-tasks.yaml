@@ -2,7 +2,7 @@
 # 与《Ethereal-平台实施蓝图-v2.md》及《Ethereal-蓝图v2.1-BMC与运行时修订.md》配套。
 # v2.1 变更：弃用 GW5 AE350 硬核（付费工具链）；管理单元改为 fabric 内 RISC-V 软核（BMC，
 # 主选 NEORV32），小器件降级为 mFSM（与 BMC 统一 EMRI 寄存器 ABI）。
-# 状态同步：2026-08-30 与 git 历史/验收报告对齐（status: done/in_progress 依据 docs/reports/ + 提交记录）。
+# 状态同步：2026-09-01 与 git 历史/验收报告对齐（status: done/in_progress 依据 docs/reports/ + 提交记录）。
 # 字段说明：
 #   id / title / phase / deps / est_days / deliverable / acceptance / status
 
@@ -217,6 +217,8 @@ tasks:
 
   - id: E0-SHL1
     title: EBI-Tiny 总线 RTL + 地址映射 decoder
+    # D1 (2026-09-01, report-phase0-closeout): Phase-0 Shell 主控路径已由 ADR-018 自研 AXI
+    # 链（EMRI-over-AXI）实现；EBI-Tiny 降为 ADR-006/018 的小器件降级 profile，随 mFSM（E2-BMC1）落地。
     phase: phase-0
     deps: []
     est_days: 1
@@ -231,7 +233,7 @@ tasks:
     est_days: 3
     deliverable: sim/tb_shell/
     acceptance: 仿真内完成完整容器部署周期：写配置→启动→读结果→blank→换镜像→再运行
-    status: in_progress
+    status: done   # 2026-09-01: tb_mgmt_hotswap + tb_bmc_axi_fabric 经 EMRI/OCC 驱动真实 fabric_top 完成双镜像热替换（host BFM 直驱；C 固件驱动版随 E1-RUN2）
 
   - id: E0-SHL3
     title: 性能建模（配置字节数/时延模型/虚拟 Fmax 初值）
@@ -240,7 +242,7 @@ tasks:
     est_days: 2
     deliverable: docs/performance-model.md
     acceptance: 给出 4x4 fabric 配置字节数与 Fmax 估算并归档
-    status: todo
+    status: done   # 2026-09-01: docs/performance-model.md + perf_model.py（数字可复现，含断言自检）；report-E0-SHL3-perfmodel-20260901
 
   # ================= PHASE 1 =================
   - id: E1-PLT1
@@ -250,10 +252,13 @@ tasks:
     est_days: 4
     deliverable: ethereal-fabric/hal/gowin_gw5/
     acceptance: 4x4 fabric 综合后物理 LUT 开销 ≤45:1 并报告实际值
-    status: in_progress
+    status: done   # 2026-09-01: hal/gowin_gw5 交付（glue+stub+probe）；实测 308:1 @4x4 —— ≤45:1 未达（互联占 91%：CB 47%/IIB 34%/SB 10%，无摊薄渐近 ~310-350:1），偏差转入 E2-FAB5 并待维护者签收；report-E1-PLT1-hal-gowin-20260901
 
   - id: E1-PLT2
     title: Base image 构建流（Gowin EDA 工程模板 + 脚本化）
+    # 2026-09-01 评估：开源链（yosys+nextpnr-himbaechel+gowin_pack，E1-PLT4）可替代 Gowin EDA 出 .fs；
+    # openFPGALoader 支持 tangmega138k。真正阻塞 = ① GW5 SoC 顶层（BMC+EMRI+fabric+SPI/I2C 板级集成，
+    # 待 E1-BMC1/E1-IO1 落地）② 实体板卡在维护者处（烧写+SPI 读出 magic 无法仿真替代）。
     phase: phase-1
     deps: [E1-PLT1]
     est_days: 3
@@ -268,7 +273,7 @@ tasks:
     est_days: 3
     deliverable: 评估笔记
     acceptance: 可行性结论（CI 构建通道是否可用）
-    status: todo
+    status: done   # 2026-09-01: 全链打通 yosys synth_gowin→nextpnr-himbaechel(GW5AST-138C chipdb)→gowin_pack→.fs；Fmax 115.61MHz@4x4 fabric；LUT 开销实测 ~308:1（vs E1-PLT1 目标 45:1，转入 E2-FAB5 优化输入）；report-E1-PLT4-nextpnr-spike-20260901
 
   - id: E1-BMC1
     title: BMC SoC 集成（NEORV32 + Boot ROM + 128KB FW SRAM + UART + EBI 桥）
@@ -539,6 +544,61 @@ tasks:
     est_days: 3
     deliverable: ethereal-spec/ v1.0 tags
     acceptance: 四份规范语义化版本发布
+    status: todo
+
+  # ---- ADR-018 执行线（2026-07-30 决议：全自研 AXI + eth_rv RV64 + wrapped DRAM + 自研 DMA）----
+  - id: E2-AXI1
+    title: 自研 AXI fabric（eth_axi：Lite/Stream/xbar + skidbuf + wb2axi，形式化验证）
+    phase: phase-2
+    deps: []
+    est_days: 30
+    deliverable: ethereal-shell/rtl/axi/ + formal/*.sby
+    acceptance: AXI4-Lite/Stream/xbar 过 SymbiYosys 性质证明；iverilog/verilator 双仿真兼容
+    status: done   # 2026-08-30: 4 项 k-induction 证明 PASS（make formal）；见 report-P1-formal-*-20260830
+
+  - id: E2-RV1
+    title: eth_rv Stage RV-B（RV64IMC 顺序 5-6 级，bare-metal/FreeRTOS，DiffTest vs Spike）
+    phase: phase-2
+    deps: [E2-AXI1]
+    est_days: 180
+    deliverable: ethereal-shell/rtl/eth_rv/ + AXI4 socket wrapper + core.yaml 描述符
+    acceptance: spike 锁步比对零分歧跑 bare-metal hello；iverilog/verilator 可仿真
+    status: todo
+
+  - id: E2-RV2
+    title: eth_rv Stage RV-C（RV64GC + Sv39 MMU → GW5 单核验证 profile，boot Linux）
+    phase: phase-2
+    deps: [E2-RV1]
+    est_days: 180
+    deliverable: eth_rv MMU/FPU 扩展 + OpenSBI/Linux 启动链
+    acceptance: GW5AST-138 仿真/实板 boot Linux（DDR-less rootfs 允许）
+    status: todo
+
+  - id: E2-DMA1
+    title: eth_dma_mc 多通道 scatter-gather DMA（AXI4 主，BMC 热替换帧 DMA 复用）
+    phase: phase-2
+    deps: [E2-AXI1]
+    est_days: 45
+    deliverable: ethereal-shell/rtl/dma/eth_dma_mc.sv + formal
+    acceptance: 描述符链表 SG 传输 TB 通过；形式化 VALID/READY 性质
+    status: todo
+
+  - id: E2-DMA2
+    title: eth_dma_2d 图形 DMA（ND-strided + blit/fill/ROP，Service-Tile 级）
+    phase: phase-2
+    deps: [E2-DMA1]
+    est_days: 45
+    deliverable: ethereal-shell/rtl/dma/eth_dma_2d.sv
+    acceptance: 2D block move + blit/fill TB 通过（VDMA 风格寄存器模型）
+    status: todo
+
+  - id: E2-DRAM1
+    title: eth_dram_ctrl 封装件（AXI4 从接口 + Zynq-PS/GW5-hard-DDR3 glue + Verilator stub）
+    phase: phase-2
+    deps: [E2-AXI1]
+    est_days: 20
+    deliverable: ethereal-shell/rtl/dram/ + hal/*/glue/
+    acceptance: 行为 stub 上全 SoC 可仿真；GW5 glue 留待实板 bring-up
     status: todo
 
   # ================= PHASE 3+（里程碑级） =================
