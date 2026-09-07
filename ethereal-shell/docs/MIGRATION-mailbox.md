@@ -5,9 +5,16 @@
 > Licensing decision authority: `ethereal-plan/README.md §4` (finalized 2026-07)
 >
 > **Update 2026-09-01 (S04-P0#2, G1 lint cleanup):** §4 lint status and §5 backlog revised —
-> `rtl/mailbox/` is now `verilator --lint-only -Wall` **CLEAN**; `rtl/interface/` retains 2
-> documented design-judgment warnings. Design verdict on the B channel: §5.4. Full evidence:
-> `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
+> `rtl/mailbox/` is now `verilator --lint-only -Wall` **CLEAN**. Design verdict on the B
+> channel: §5.4. Full evidence: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
+>
+> **Update 2026-09-02 (S04 interface cleanup):** the last 2 `rtl/interface/` design-judgment
+> warnings (§5.2 #7-8) are **RESOLVED** — #8 was a real functional bug (TX FIFO never
+> drained; root cause: `tx_finished` variable-initialization trap + duplicate `tx_rptr`
+> driver), fixed by a consume-on-load single-owner redesign with directed TB proof; #7 was a
+> behavior-preserving hoist with old-vs-new equivalence proof. The **entire imported tree**
+> (`rtl/mailbox/` + `rtl/interface/`) is now `-Wall` clean. Evidence:
+> `docs/reports/report-S04-interface-cleanup-20260901.md`.
 
 This document records the one-way migration of the self-owned **AXI-MailboxFabric**
 Network-on-Chip (the EBI backbone, subsystem S04) plus its SPI/UART host adapters
@@ -132,16 +139,17 @@ block as an HTML comment at its top.
 
 | Check | Status | Why |
 |---|---|---|
-| `verilator --lint-only -Wall` | ✅ **DONE (mailbox/) · ⚠️ 2 documented warnings (interface/)** | **S04-P0#2 (2026-09-01):** all 10 `rtl/mailbox/` files pass `verilator --lint-only -Wall` per-module with **zero warnings and zero waivers**. `rtl/interface/` passes except 2 documented design-judgment warnings (`BLKSEQ` in `spi_sat`, `MULTIDRIVEN tx_rptr` in `uart_mailboxfabric` — see §5.2 items 7–8). Equivalence smoke (old vs cleaned RTL, 20k random cycles each on `mailbox_switch_2x1` + `mailbox_endpoint`) passed — cleanup is behavior-preserving. Evidence: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`. |
+| `verilator --lint-only -Wall` | ✅ **DONE (whole tree)** | **S04-P0#2 (2026-09-01):** all 10 `rtl/mailbox/` files pass per-module with zero warnings/waivers (behavior-preserving equivalence smoke on `mailbox_switch_2x1` + `mailbox_endpoint`). **S04 interface cleanup (2026-09-02):** all 4 `rtl/interface/` files clean too (§5.2 #7-8 resolved); equivalence smoke on `spi_sat` (50k cycles, bit-identical) + RX/config paths of `uart_mailboxfabric`, directed TX-drain proof for the #8 bug fix. Evidence: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`, `docs/reports/report-S04-interface-cleanup-20260901.md`. |
 | `cocotb` mailbox testbench | ⏳ **PENDING** | No testbench was migrated in this task (the `TinyGPU-FPGA/testbench/mailbox_tb.sv` exists upstream but is **out of scope** for S04-P0#1, which is RTL-export-only). A dedicated Ethereal EBI-level cocotb test is a later task. |
 | Header presence (SPDX + Provenance + nettype) | ✅ **DONE** | All 14 files — see §6 self-check output. |
 | Body integrity (verbatim copy) | ✅ **DONE** | Copy was via `cp`; only the header block was inserted. Module names, signal names, line counts unchanged vs source. |
 
-> **G6 note:** **resolved 2026-09-01 (S04-P0#2):** `rtl/mailbox/` is `verilator --lint-only -Wall` clean
-> (per-module, zero warnings/waivers) and may graduate into the main `make lint` gate —
-> the exact integration edit is proposed in `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
-> `rtl/interface/{spi,uart}/` keeps 2 documented design-judgment warnings (§5.2 items 7–8)
-> and stays on the advisory `make lint-mailbox` gate until they are resolved.
+> **G6 note:** **resolved 2026-09-01 (S04-P0#2) / 2026-09-02 (interface cleanup):** the whole
+> imported tree — `rtl/mailbox/` **and** `rtl/interface/{spi,uart}/` — is
+> `verilator --lint-only -Wall` clean (per-module, zero warnings/waivers) and may graduate
+> into the main `make lint` gate — the exact integration edit is proposed in
+> `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md` (extendable to the interface
+> files now that §5.2 #7-8 are closed).
 
 ---
 
@@ -185,8 +193,8 @@ flowchart LR
 | 4 | **Incomplete G2 header fields** | all RTL files | G2 header has `Maintainer / Created / Modified / Tags` | **STATUS (2026-09-01):** partially improved — the stale "lint PENDING" `Notes:` lines were replaced with the actual lint verdicts during S04-P0#2. `Maintainer/Created/Tags` still to add. |
 | 5 | **`` `timescale 1ns/1ps `` present** | all 14 files | not forbidden by G1; harmless and aids sim reproducibility | Keep as-is. No action. |
 | 6 | **Width-cast / literal-width spot checks** | needs `-Wall` run to enumerate | "literals carry width+base (e.g. `8'hFF`)" | **STATUS (2026-09-01): ✅ DONE.** Enumerated 88 findings (59 `UNUSEDSIGNAL`, 21 `WIDTHEXPAND`, 5 `WIDTHTRUNC`, 1 `BLKSEQ`, 1 `MULTIDRIVEN`, 1 `MULTITOP`) plus 7 package-ordering errors; fixed all `rtl/mailbox/` items and all trivially behavior-preserving `rtl/interface/` items. Remainder = items 7–8 below + `MULTITOP` (an artifact of the single-command `lint-mailbox` invocation; per-module lint is clean — see report for the proposed Makefile restructure). |
-| 7 | **`BLKSEQ`: blocking temp `rx_shift_next` assigned inside `always_ff`** | `spi_sat.sv:143` | `-Wall` | **STATUS (2026-09-01): OPEN — design judgment required.** The temp is written blocking and read within the same clocked process (a common next-value idiom); hoisting it to a continuous assign is behavior-preserving but touches the SPI shift engine, which has no testbench. Defer to the interface cleanup task with a TB. |
-| 8 | **`MULTIDRIVEN`: `tx_rptr` written by two `always_ff` processes** | `uart_mailboxfabric.sv:182` (and the TX FIFO block) | `-Wall` | **STATUS (2026-09-01): OPEN — likely a real bug.** The main FIFO block increments `tx_rptr` on `tx_r_en`, and a second process increments it again on `tx_finished && !tx_empty` (same condition) — the read pointer advances **twice per consumed byte**. Needs a design decision (single-process FIFO) + testbench; recorded here, NOT masked by a waiver. |
+| 7 | **`BLKSEQ`: blocking temp `rx_shift_next` assigned inside `always_ff`** | `spi_sat.sv:143` | `-Wall` | **STATUS (2026-09-02): ✅ RESOLVED.** Root cause: blocking next-value temp written then read inside the clocked process. Fix: hoisted to a continuous `assign rx_shift_next = {rx_shift[62:0], SPI_MISO};` — identical evaluation point (pre-edge values), strictly behavior-preserving. Proof: old-vs-new equivalence smoke, 50 000 random cycles, 413 transfers, 0 mismatches (`EQUIV-PASS`). |
+| 8 | **`MULTIDRIVEN`: `tx_rptr` written by two `always_ff` processes** | `uart_mailboxfabric.sv` (TX FIFO block + duplicate edge-detect process) | `-Wall` | **STATUS (2026-09-02): ✅ RESOLVED — was a REAL functional bug (deeper than the double driver).** Root cause: `logic tx_finished = (tx_busy_q && !tx_busy);` is a one-time static initialization (IEEE 1800-2023 §6.8), **not** a continuous assign (verified constant-0 in Verilator AND iverilog) — so *both* `tx_rptr` increments were dead code, the TX FIFO never drained, and the transmitter re-sent byte 0 forever; the second `always_ff` was a redundant duplicate of the same dead increment. Fix: consume-on-load redesign — `tx_r_en =` frame-start condition, `tx_rptr` solely owned by the TX-FIFO block (IEEE 1800-2023 9.2.2.2), `tx_busy_q`/`tx_finished` detector deleted. Proof: directed TB — old RTL emits `11 11 11 11 11 11` (byte 0 repeated), new RTL emits exactly `11 22 33 44 55 66` and drains the FIFO; RX/config paths old-vs-new bit-identical over 50 000 cycles (`EQUIV-PASS`). |
 
 ### 5.3 Integration TODOs for later phases (S04 / S06 / S08)
 
@@ -234,11 +242,17 @@ No rewiring was required; no functional bug existed on the B path.
 
 **Cleanup result:** `rtl/mailbox/` — 10/10 files `-Wall` clean, zero lint_off
 waivers (all findings fixed by restructuring: width casts, argument narrowing,
-dead-field sinks). `rtl/interface/` — trivial fixes applied; 2 design-judgment
-warnings remain open (§5.2 items 7–8). Behavior preserved: old-vs-new equivalence
-smoke (20 000 random cycles each on `mailbox_switch_2x1` and `mailbox_endpoint`)
-showed bit-identical outputs. Evidence and the proposed `lint-mailbox`/`lint`
-integration diff: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`.
+dead-field sinks). `rtl/interface/` — 4/4 files `-Wall` clean as of 2026-09-02
+(§5.2 items 7–8 resolved; see above). Behavior preserved where the cleanup was a
+refactor (mailbox equivalence smoke 20 000 cycles; `spi_sat` 50 000 cycles) and
+demonstrably repaired where it was a bug (`uart_mailboxfabric` TX drain, item 8).
+Evidence: `docs/reports/report-S04-P0#2-mailbox-cleanup-20260901.md`,
+`docs/reports/report-S04-interface-cleanup-20260901.md`.
+
+**Graduation status (2026-09-02):** the **whole imported tree is `-Wall` clean**.
+`make lint-mailbox` remains advisory by construction; graduating `rtl/interface/`
+into the main `make lint` gate alongside `rtl/mailbox/` is now unblocked (Makefile
+edit owned by the integrator, not this task).
 
 ---
 

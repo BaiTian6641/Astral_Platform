@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      uart_mailboxfabric
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       UART fabric adapter (host<->MailboxFabric bridge); 1 documented backlog warning remains (MULTIDRIVEN tx_rptr, design-judgment item, MIGRATION-mailbox.md §5).
+// Notes:       UART fabric adapter (host<->MailboxFabric bridge). verilator -Wall CLEAN (2026-09-02: #8 resolved — tx_finished declaration-assignment trap made both tx_rptr drivers dead; redesigned to consume-on-load, tx_rptr single-owner; MIGRATION-mailbox.md §5.2 #8).
 `timescale 1ns/1ps
 
 // UART peripheral as an AXI‑MailboxFabric Leaf (Endpoint)
@@ -104,7 +104,12 @@ module uart_mailboxfabric #(
 
   // Simple write pointer driven by CSR0 writes
   assign tx_w_en = wr_fire && (rx_csr_idx == 4'd0) && !tx_full;
-  assign tx_r_en = tx_finished && !tx_empty;
+  // Consume-on-load: a FIFO slot is popped when the transmitter LOADS it
+  // (frame start), not when the frame finishes. At that same edge tx_shift
+  // captures tx_fifo[tx_rptr] (pre-increment value, NBA semantics), so each
+  // byte is transmitted exactly once. See the NOTE at the transmitter below
+  // for the root-cause history (MIGRATION-mailbox.md §5.2 #8).
+  assign tx_r_en = !tx_busy && !tx_empty && !UART_CTS;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -147,8 +152,9 @@ module uart_mailboxfabric #(
       tx_shift <= 10'h3FF; // idle high
       tx_bits <= 4'h0;
     end else begin
-      if (!tx_busy && !tx_empty && !UART_CTS) begin
-        // start new byte
+      if (tx_r_en) begin
+        // start new byte (consumes the FIFO slot: tx_rptr/tx_count update
+        // on this same edge in the FIFO block above)
         tx_shift <= {1'b1, tx_fifo[tx_rptr], 1'b0}; // {stop, data[7:0], start(0)} -> LSB first
         tx_bits  <= 4'd0;
         tx_busy  <= 1'b1;
@@ -161,7 +167,6 @@ module uart_mailboxfabric #(
           tx_bits <= tx_bits + 1'b1;
           if (tx_bits == 4'd9) begin
             tx_busy <= 1'b0;
-            // consume FIFO slot after frame done (handled by tx_finished below)
           end
         end else begin
           tx_baud_cnt <= tx_baud_cnt + 1'b1;
@@ -172,15 +177,20 @@ module uart_mailboxfabric #(
 
 
 
-  // Detect frame completion by watching tx_busy falling edge
-  logic tx_busy_q;
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) tx_busy_q <= 1'b0; else tx_busy_q <= tx_busy;
-  end
-  logic tx_finished = (tx_busy_q && !tx_busy);
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) tx_rptr <= '0; else if (tx_finished && !tx_empty) tx_rptr <= tx_rptr + 1'b1;
-  end
+  // NOTE (S04 interface cleanup, 2026-09-02 — MIGRATION-mailbox.md §5.2 #8):
+  // This adapter previously detected frame completion with
+  //     logic tx_busy_q; ... logic tx_finished = (tx_busy_q && !tx_busy);
+  // and popped the TX FIFO on tx_finished from TWO always_ff processes
+  // (Verilator MULTIDRIVEN on tx_rptr). Root-cause analysis showed the bug
+  // was deeper than the double driver: the variable declaration assignment
+  // `logic tx_finished = (…)` is a one-time static INITIALIZATION
+  // (IEEE 1800-2023 §6.8), not a continuous assign — verified constant-0 in
+  // both Verilator and iverilog — so BOTH tx_rptr increments were dead code,
+  // the TX FIFO never drained, and the transmitter reloaded byte 0 forever.
+  // Fix: consume-on-load (tx_r_en = frame-start condition, above); tx_rptr
+  // has exactly one owner process (the FIFO block, IEEE 1800-2023 9.2.2.2);
+  // the tx_busy_q/tx_finished edge detector and the duplicate driver are
+  // deleted. Directed TB evidence: docs/reports/report-S04-interface-cleanup-20260901.md.
 
   // Drive UART_TX pin: LSB of shift register
   // When idle, TX line is high

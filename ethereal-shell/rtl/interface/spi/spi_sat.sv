@@ -6,7 +6,7 @@
 //             Migration date: 2026-07-24. Task: S04-P0#1.
 // Module:      spi_sat
 // Plan-Ref:    ethereal-plan/subsystems/S04-EBI总线与Mailbox-NoC集成.md
-// Notes:       SPI satellite adapter (MailboxFabric endpoint side); 1 documented backlog warning remains (BLKSEQ rx_shift_next, design-judgment item, MIGRATION-mailbox.md §5).
+// Notes:       SPI satellite adapter (MailboxFabric endpoint side). verilator -Wall CLEAN (2026-09-02: BLKSEQ rx_shift_next resolved — blocking temp hoisted to continuous assign; MIGRATION-mailbox.md §5.2 #7).
 `timescale 1ns/1ps
 
 // Simple SPI SAT-IP (master, mode 0):
@@ -52,7 +52,6 @@ module spi_sat #(
   logic [63:0] rx_shift;
   logic [CNT_W-1:0] bit_cnt;
   logic [DIV_W-1:0] div_cnt;
-  logic [63:0] rx_shift_next;
   logic busy;
   logic sclk_reg;
   logic [7:0] tx_bits_lat;
@@ -74,6 +73,13 @@ module spi_sat #(
     rx_bits_eff = (rx_bits == 0) ? RX_BITS[7:0] : (rx_bits > RX_BITS[7:0] ? RX_BITS[7:0] : rx_bits);
     total_bits_eff = (tx_bits_eff > rx_bits_eff) ? tx_bits_eff : rx_bits_eff;
   end
+
+  // MISO sample next-value: hoisted from a blocking temp inside the transfer
+  // engine's always_ff (BLKSEQ, MIGRATION-mailbox.md §5.2 #7) to a continuous
+  // assign. Identical evaluation point: the always_ff reads the pre-edge
+  // rx_shift/SPI_MISO, exactly as the old blocking temp did.
+  logic [63:0] rx_shift_next;
+  assign rx_shift_next = {rx_shift[62:0], SPI_MISO};
 
   // Chip select (active low)
   always_comb begin
@@ -140,7 +146,6 @@ module spi_sat #(
           // rising edge: sample MISO and count bits
           if (!sclk_reg) begin
             if (bit_cnt != 0) begin
-              rx_shift_next = {rx_shift[62:0], SPI_MISO};
               rx_shift <= rx_shift_next;
               bit_cnt  <= bit_cnt - 1'b1;
 
