@@ -1,0 +1,24 @@
+Elapsed clock time [H:MM:SS (secs)]: 0:00:02 (2)
+Elapsed process time [H:MM:SS (secs)]: 0:00:04 (4)
+engine_0 (smtbmc) returned pass
+cover trace: engine_0/trace0.vcd
+cover trace: engine_0/trace0.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_863_1553 at eth_axi_xbar.sv:863.13-863.50 step 4
+cover trace: engine_0/trace1.vcd
+cover trace: engine_0/trace1.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_861_1547 at eth_axi_xbar.sv:861.13-861.44 step 4
+cover trace: engine_0/trace2.vcd
+cover trace: engine_0/trace2.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_859_1543 at eth_axi_xbar.sv:859.13-859.44 step 4
+cover trace: engine_0/trace3.vcd
+cover trace: engine_0/trace3.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_860_1545 at eth_axi_xbar.sv:860.13-860.48 step 4
+cover trace: engine_0/trace4.vcd
+cover trace: engine_0/trace4.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_862_1551 at eth_axi_xbar.sv:862.13-862.50 step 4
+cover trace: engine_0/trace5.vcd
+cover trace: engine_0/trace5.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_865_1557 at eth_axi_xbar.sv:865.13-865.29 step 6
+cover trace: engine_0/trace6.vcd
+cover trace: engine_0/trace6.yw
+  reached cover statement eth_axi_xbar._witness_.check_cover_eth_axi_xbar_sv_864_1555 at eth_axi_xbar.sv:864.13-864.29 step 7

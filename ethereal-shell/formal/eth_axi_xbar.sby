@@ -1,0 +1,37 @@
+# eth_axi_xbar formal proof (SymbiYosys).
+# Proves the per-destination lock-step discipline — regression guard for the
+# 2026-09-01 cross-master same-destination B/R/W response-aliasing bug
+# (report-E1-RUN3): (U) per-destination in-flight uniqueness, (C) busy<->
+# in-flight consistency (wr_busy/rd_busy == the in-flight set), (O) B/R owner
+# routing (a response routes ONLY to the master that issued the transaction),
+# plus AXI response VALID stability. Assumptions constrain the attached
+# masters/slaves to the AXI handshake + A3.4.1 response-ordering contracts.
+# The cover task witnesses concurrent multi-master traffic (incl. the DECERR
+# slave) so the safety proof is non-vacuous. Liveness is out of scope for
+# prove-mode k-induction (needs fairness) — see the FORMAL block in the RTL.
+# Run:  sby -f eth_axi_xbar.sby
+# Config: 2 masters x 2 slaves (+ DECERR slave); ADDR_MAP: slave0 @ 0x000-xx,
+# slave1 @ 0x100-xx (mask 0xFFFFFF00), everything else -> DECERR.
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 40
+cover: mode cover
+cover: depth 40
+
+[engines]
+prove: smtbmc
+cover: smtbmc
+
+[script]
+read -formal eth_axi_skidbuf.sv
+read -formal eth_axi_xbar.sv
+chparam -set N_MST 2 -set N_SLV 2 -set ADDR_MAP 128'hFFFFFF00FFFFFF000000010000000000 eth_axi_xbar
+prep -top eth_axi_xbar
+
+[files]
+ethereal-shell/rtl/axi/eth_axi_skidbuf.sv
+ethereal-shell/rtl/axi/eth_axi_xbar.sv
