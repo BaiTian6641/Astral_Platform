@@ -282,7 +282,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-shell/bmc/（bmc_core wrapper，核可替换）
     acceptance: 仿真与 GW5 双平台 hello-world + Shell CSR 读写；BMC 总开销报告（LUT+BSRAM）
-    status: in_progress
+    status: in_progress   # 2026-09-02: IMEM 1KiB 硬件级发现已解决 —— 重生成 16KiB 物理 ROM netlist 已换入（tb_bmc_hello 字节级等价 + >1KiB 执行探针；report-E1-BMC1-imem-regen-20260901）；GW5 平台半待 E1-PLT2
 
   - id: E1-BMC2
     title: BMC 固件框架（boot 双分区 + 驱动层 + lifecycle 状态机骨架）
@@ -318,7 +318,7 @@ tasks:
     est_days: 2
     deliverable: bmc-fw/efp-spi/ + spec EFP-SPI
     acceptance: 上位机经 SPI 完成完整 logic image 部署；CRC 错误注入通过
-    status: todo
+    status: done   # 2026-09-02（仿真范围）: SDI netlist 换入（16KiB IMEM + SDI，hello 字节级等价）+ bmc_core SDI 端口 + 10 TB 后门换名 + bmc-fw/efp-spi 固件栈 + §7.1 CRC16 附录 + tb_bmc_spi 全链通过（SPI 帧驱动完整 packed 部署 + CRC 注入拒绝）；report-E1-IO1-efp-spi-20260902；实板 Raspberry Pi 联调待 E1-PLT2
 
   - id: E1-IO2
     title: I2C 监控通道 v1（NEORV32 TWD + PMBus 风格命令固件）
@@ -363,16 +363,19 @@ tasks:
     est_days: 4
     deliverable: bmc-fw/daemon/
     acceptance: run/stop/ps/restart 全通；坏签名/满 region/写冲突优雅报错
-    status: in_progress
+    status: done   # 2026-09-01: EMRI v0.2 EFP 命令块 + C daemon（Ed25519 验签→分配→OCC→生命周期）+ tb_bmc_daemon 7 阶段全过（41 ok 检查，主 Agent 独立复跑）；region_locked 路径待 E1-RUN3 锁矩阵（待确认#3）；report-E1-RUN2-daemon-20260901 **v0.3 增量（2026-09-02）**：run_packed 生产帧部署（EFP_IMG_COLS@0x21 + 逐列 OCC_DECODE 循环）+ tb_bmc_daemon_packed 26 检查全过（真实 fabric TFF 翻转 + 篡改签名拒绝 + stop 逐列 blank）；report-E1-RUN2-packed-deploy-20260902
 
   - id: E1-RUN3
     title: ethctl CLI（Docker 风格命令集）
+    # 2026-09-01 范围注记：sim v0 = EFP 客户端 + 会话脚本回放（v0 cfg-addr 帧格式）。
+    # 生产 bit-packed .eth（bitgen_pack 全帧）部署需 daemon 增加 packed-deploy 模式
+    # （按列 OCC_DECODE 循环，spec §3.1）——列为本任务的后续增量，验收以实板 30s 为准。
     phase: phase-1
     deps: [E1-RUN2, E1-BMC4]
     est_days: 3
     deliverable: tools/ethctl/
     acceptance: ethctl run aes128.eth --region 0 在 30s 内完成部署
-    status: in_progress
+    status: done   # 2026-09-02(sim 范围): efp_client.py + ethctl --transport efp/--emit-session + tb_ethctl_replay（ethctl 会话回放驱动真实 daemon 链 run/stop 全过）；修出 eth_axi_xbar 跨主同目的响应路由混叠真 bug；27 pytest 全过；packed-deploy 后续增量见上方注记；report-E1-RUN3-ethctl-efp-20260901
 
   - id: E1-RUN4
     title: region 看门狗 v1（心跳+超时 blank+事件日志）
@@ -454,7 +457,7 @@ tasks:
     est_days: 5
     deliverable: rtl/interconnect v2
     acceptance: 同规模 fabric 物理 LUT 降 ≥20%
-    status: todo
+    status: done   # 2026-09-02: v2c 实装完成（spec §7 FROZEN → RTL + 模型 + frame_map + bitgen + VPR arch + 全部 TB/生成器迁移）；实测真实 RTL 4×4 = 29,869 LUT = 233:1 = **-24.3%**（≥20% 达标，yosys synth_gowin 同口径）；c432 全帧路径 32/32 bit-true，present_round 翻转 xfail→PASS；reports: v2c-rtl/v2c-tools-20260902
 
   - id: E2-MAP1
     title: 异构映射（Yosys mem/dsp 推断 + VPR 异构 arch + bitgen v2）
