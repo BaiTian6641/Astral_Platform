@@ -36,8 +36,10 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 # pi-lens-ignore: E402
+import efp_client
 import ethimg
 from emri_constants import (
+    EFP_REGION_AUTO,
     OCC_BLANK,
     OCC_CMD_START,
     OCC_DONE_DONE,
@@ -433,6 +435,107 @@ def _extract_frames(eth_path: Path, target: str) -> bytes:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _parse_region(s: str) -> int:
+    """Parse a --region argument: an integer index or 'auto' (0xFF, run only)."""
+    if s == "auto":
+        return EFP_REGION_AUTO
+    try:
+        return int(s, 0)
+    except ValueError:
+        raise DaemonError(f"bad --region {s!r} (integer or 'auto')") from None
+
+
+def _cli_efp(args: Any) -> int:
+    """EFP transport path (emri-v0.md sec 3.2, BMC-mode daemon mailbox).
+
+    Builds the session with efp_client, executes it against the functional
+    daemon model (sim scope), and optionally dumps the op list as a session
+    JSON (``--emit-session``) for SV testbench replay (tb_ethctl_replay).
+    """
+    client = efp_client.EfpClient()
+    # Trusted key for the sim model's VERIFY: with --pubkey the model enforces
+    # Ed25519 against it (raw 32-byte key); without, the device keyring is
+    # unmodelled and only zero-signature (unsigned) images are rejected.
+    trusted_pk: bytes | None = None
+    if getattr(args, "pubkey", None):
+        from cryptography.hazmat.primitives import serialization
+
+        pub = serialization.load_pem_public_key(Path(args.pubkey[0]).read_bytes())
+        trusted_pk = pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    model = efp_client.EfpDaemonModel(trusted_pk=trusted_pk)
+
+    ops: list[efp_client.Op]
+    image: efp_client.StagedImage | None = None
+    region: int | None = None
+    name = args.cmd
+    if args.cmd == "run":
+        region = _parse_region(args.region)
+        ops, image = client.run_image(Path(args.eth), region)
+        name = f"run {args.eth} region={'auto' if region == EFP_REGION_AUTO else region}"
+    elif args.cmd == "restart":
+        ops, image = client.restart(Path(args.eth))
+        name = f"restart {args.eth}"
+    elif args.cmd == "stop":
+        region = _parse_region(args.region)
+        if region == EFP_REGION_AUTO:
+            raise DaemonError("stop needs an explicit --region (not 'auto')")
+        ops = client.stop(region)
+        name = f"stop region={region}"
+    elif args.cmd == "abort":
+        ops = client.abort()
+    elif args.cmd == "ps":
+        ops = client.ps()
+    else:
+        raise DaemonError(f"--transport efp does not support '{args.cmd}'")
+
+    if args.emit_session:
+        efp_client.write_session(ops, Path(args.emit_session), name=name,
+                                 image=image, region=region)
+        print(f"wrote EFP session -> {args.emit_session} ({len(ops)} ops)")
+
+    try:
+        reads = efp_client.execute_ops(ops, model)
+    except efp_client.EfpError as e:
+        # surface the device-side status/error alongside the host-side failure
+        st = model.read(efp_client.R_EFP_STATUS)
+        er = model.read(efp_client.R_EFP_ERR) & 0xFF
+        raise DaemonError(
+            f"{e} (daemon state={efp_client.decode_state(st & 0xF)} "
+            f"err={efp_client.decode_err(er)})"
+        ) from e
+    status = model.read(efp_client.R_EFP_STATUS)
+    err = model.read(efp_client.R_EFP_ERR)
+    state = efp_client.decode_state(status & 0xF)
+    if args.cmd == "ps":
+        print(
+            f"daemon: state={state} busy={(status >> 4) & 1} done={(status >> 5) & 1} "
+            f"err={efp_client.decode_err(err)}"
+        )
+        for i in range(model.num_regions):
+            geom = reads[2 + i]
+            print(
+                f"region{i:2d} geometry "
+                f"{(geom >> 24) & 0xFF}x{(geom >> 16) & 0xFF} ({geom & 0xFFFF} tiles)"
+            )
+    elif args.cmd in ("run", "restart"):
+        print(
+            f"efp {args.cmd}: {image.name if image else '?'} "
+            f"({len(image.frame_words) if image else 0} words, {len(ops)} ops) -> "
+            f"{state} r{model._last_region}"
+            f"{' done' if status & 0x20 else ''} err={efp_client.decode_err(err)}"
+        )
+    else:
+        print(f"efp {args.cmd}: -> {state} err={efp_client.decode_err(err)}")
+    if err != 0 or state == "ERROR":
+        raise DaemonError(
+            f"daemon reported {efp_client.decode_err(err)} (state {state})"
+        )
+    return 0
+
+
 def _cli(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="ethctl", description="Ethereal host control")
     p.add_argument(
@@ -442,19 +545,69 @@ def _cli(argv: list[str] | None = None) -> int:
         help="sim-model: drive the in-Python EMRI model; plan: emit a replay JSON",
     )
     p.add_argument("--plan-out", default=None, help="deploy-plan JSON path (mode=plan)")
+    p.add_argument(
+        "--transport",
+        choices=("mfsm", "efp"),
+        default="mfsm",
+        help="mfsm: host-driven OCC flow (default, v0); efp: BMC-daemon EFP "
+        "command block (emri-v0.md sec 3.2, v0.2)",
+    )
+    p.add_argument(
+        "--emit-session",
+        default=None,
+        help="EFP session JSON output path (transport=efp; TB replay artifact)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("run", help="verify + deploy a .eth to a region")
-    sp.add_argument("eth")
-    sp.add_argument("--region", type=int, default=0)
-    sp.add_argument("--frame-addr", type=int, default=0)
-    sp.add_argument("--allow-unsigned", action="store_true")
-    sp.add_argument("--pubkey", action="append", default=[])
+    sp_run = sub.add_parser("run", help="verify + deploy a .eth to a region")
+    sp_run.add_argument("eth")
+    sp_run.add_argument("--region", default="0", help="region index or 'auto' (efp)")
+    sp_run.add_argument("--frame-addr", type=int, default=0)
+    sp_run.add_argument("--allow-unsigned", action="store_true")
+    sp_run.add_argument("--pubkey", action="append", default=[])
 
     sub.add_parser("inspect", help="read EMRI identity/capabilities")
-    sub.add_parser("ps", help="list regions")
+    sp_ps = sub.add_parser("ps", help="list regions / daemon status")
+    sp_stop = sub.add_parser("stop", help="stop a region (efp: BLANK -> STOPPED)")
+    sp_stop.add_argument("--region", default="0")
+    sp_restart = sub.add_parser("restart", help="re-run last staged image (efp)")
+    sp_restart.add_argument("eth", help=".eth supplying the frame words to re-stream")
+    sp_abort = sub.add_parser("abort", help="best-effort BLANK -> IDLE (efp)")
+
+    # allow the transport flags AFTER the subcommand too
+    # (`ethctl run img.eth --transport efp --emit-session s.json`)
+    for spx in (sp_run, sp_ps, sp_stop, sp_restart, sp_abort):
+        spx.add_argument("--transport", choices=("mfsm", "efp"),
+                         default=argparse.SUPPRESS)
+        spx.add_argument("--emit-session", default=argparse.SUPPRESS)
 
     args = p.parse_args(argv)
+    if args.transport == "efp":
+        try:
+            return _cli_efp(args)
+        except (DaemonError, efp_client.EfpError, ethimg.EthimgError) as e:
+            print(f"ethctl: error: {e}", file=sys.stderr)
+            return 1
+    if args.emit_session:
+        print("ethctl: error: --emit-session needs --transport efp", file=sys.stderr)
+        return 1
+    if args.cmd in ("stop", "restart", "abort"):
+        print(
+            f"ethctl: error: '{args.cmd}' needs --transport efp "
+            "(mFSM mode is host-driven; there is no device-side lifecycle)",
+            file=sys.stderr,
+        )
+        return 1
+    if args.cmd == "run":
+        try:
+            args.region = _parse_region(args.region)
+        except DaemonError as e:
+            print(f"ethctl: error: {e}", file=sys.stderr)
+            return 1
+        if args.region == EFP_REGION_AUTO:
+            print("ethctl: error: --region auto needs --transport efp "
+                  "(mFSM mode deploys to an explicit region)", file=sys.stderr)
+            return 1
     # build transport
     if args.mode == "plan":
         transport: Transport = RecordTransport()
