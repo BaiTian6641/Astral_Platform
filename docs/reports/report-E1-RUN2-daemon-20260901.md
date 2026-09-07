@@ -138,18 +138,22 @@ Py↔SV parity 交叉检查（本次新增 33 个常量对，全绿）。
 
 （tb_bmc_daemon 完整 7 阶段场景：run A(TFF)→toggle→restart→toggle→stop→run B(const1)→篡改签名
 bad_sig→RUNNING 区域冲突 region_full→abort；UART 日志逐字节精确比对 + fabric 真实输出观测。
-详细输出与 wall time 见下表。）
+**2026-09-01 主 Agent 独立复跑（Verilator 5.051，wall 1016 s，6 s sim）：TEST PASSED，41 项
+`ok:` 检查全过，0 errors。** 逐阶段结果：）
 
 | 阶段 | 期望 | 结果 |
 |---|---|---|
-| 0 boot | banner + selftest OK + MAGIC/CAP 探测 | （见最终运行日志） |
-| 1 run A 自动分配 | RUNNING r0，clb_out[0] 翻转 | 同上 |
-| 2 restart | 重验签+重载，再次翻转 | 同上 |
-| 3 stop r0 | STOPPED，输出归零 | 同上 |
-| 4 run B 自动分配 | RUNNING，clb_out[0] 恒 1 | 同上 |
-| 5 篡改签名 | EFP_ERR=bad_sig(1)，ERROR，fabric 不变 | 同上 |
-| 6 RUNNING 区域冲突 | EFP_ERR=region_full(2)，fabric 不变 | 同上 |
-| 7 abort | IDLE，区域 blank | 同上 |
+| 0 boot | banner + selftest OK + MAGIC/CAP 探测 + daemon ready | ✅ 4/4 ok |
+| 1 run A 自动分配 | RUNNING r0，clb_out[0] 翻转 | ✅ 6/6 ok（含 EFP_STATUS=RUNNING+done、真实 fabric 翻转观测） |
+| 2 restart | 重验签+重载，再次翻转 | ✅ 5/5 ok |
+| 3 stop r0 | STOPPED，输出归零 | ✅ 5/5 ok（blank 后恒定 0） |
+| 4 run B 自动分配 | RUNNING，clb_out[0] 恒 1 | ✅ 5/5 ok |
+| 5 篡改签名 | EFP_ERR=bad_sig(1)，ERROR，fabric 不变 | ✅ 6/6 ok（B 仍恒 1，未被破坏） |
+| 6 RUNNING 区域冲突 | EFP_ERR=region_full(2)，fabric 不变 | ✅ 4/4 ok |
+| 7 abort | IDLE，区域 blank | ✅ 4/4 ok（恒定 0） |
+
+（注：本表由主 Agent 在子 Agent 因限流中断后补跑验证；子 Agent 报告的"LOAD 卡住"为陈旧构建
+产物——以其最终提交代码重建后全流程通过，无需代码改动。）
 
 ## 待确认 / ASSUMPTION 汇总（G6）
 
