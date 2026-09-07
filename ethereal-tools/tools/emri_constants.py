@@ -44,6 +44,7 @@ R_EFP_REGION = 0x14  # target region; 0xFF = auto-alloc first free (run only)
 R_EFP_IMG_WORDS = 0x15
 R_EFP_STATUS = 0x16  # {state[3:0], busy[4], done[5]}
 R_EFP_ERR = 0x17  # sticky last-error, cleared on next EFP_CMD
+R_EFP_IMG_COLS = 0x21  # v0.3 (spec sec 3.3): fabric columns a run_packed image spans
 R_IMG_DIGEST = 0x18  # base; +0..7 (32-byte manifest digest)
 R_IMG_SIG = 0x50  # base; +0..15 (64-byte Ed25519 signature)
 IMG_DIGEST_WORDS = 8
@@ -55,6 +56,7 @@ EFP_CMD_RUN = 1
 EFP_CMD_STOP = 2
 EFP_CMD_RESTART = 3
 EFP_CMD_ABORT = 4
+EFP_CMD_RUN_PACKED = 5  # v0.3: bit-packed production-frame deploy (spec sec 3.3)
 EFP_REGION_AUTO = 0xFF
 
 # EFP daemon lifecycle states (EFP_STATUS.state)
@@ -77,6 +79,7 @@ EFP_ERR_OCC_CRC = 4
 EFP_ERR_OCC_REJECT = 5
 EFP_ERR_BAD_CMD = 6
 EFP_ERR_IMG_LEN_MISMATCH = 7
+EFP_ERR_CRC_TRANSPORT = 8  # v0.3 (spec sec 7.1): EFP-SPI OCC_PUSH CRC16 mismatch
 
 # ---- CAPABILITIES bits ----
 CAPB_HAS_BMC = 0
@@ -129,3 +132,9 @@ SPI_STAT_OK = 0x00
 SPI_STAT_BAD_OP = 0x01
 SPI_STAT_BAD_ADDR = 0x02
 SPI_STAT_BUSY = 0x03
+SPI_STAT_CRC_ERR = 0x04  # v0.3 (spec sec 7.1): transport CRC16 mismatch
+SPI_STAT_NOT_READY = 0xFF  # wire fill: "no response ready — retry" (sec 7.1)
+
+# SPI_CRC latch offset (spec sec 7.1, v0.3): intercepted by the SPI front-end
+# (not a regfile storage word).
+R_SPI_CRC = 0x3F

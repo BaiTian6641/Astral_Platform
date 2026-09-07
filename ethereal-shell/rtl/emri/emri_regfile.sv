@@ -14,7 +14,8 @@
 //
 //              v0.2 (spec §3.2): the EFP command block (EFP_CMD/EFP_REGION/
 //              EFP_IMG_WORDS/EFP_STATUS/EFP_ERR + IMG_DIGEST[0..7] +
-//              IMG_SIG[0..15]) is implemented as PLAIN RW storage — the
+//              IMG_SIG[0..15]; v0.3 §3.3 adds EFP_IMG_COLS @ 0x21) is
+//              implemented as PLAIN RW storage — the
 //              regfile has no port-role distinction; the host/daemon
 //              doorbell-and-clear discipline is a software convention.
 //
@@ -106,6 +107,7 @@ module emri_regfile #(
   localparam logic [15:0] R_EFP_IMG_WORDS  = emri_pkg::R_EFP_IMG_WORDS;
   localparam logic [15:0] R_EFP_STATUS     = emri_pkg::R_EFP_STATUS;
   localparam logic [15:0] R_EFP_ERR        = emri_pkg::R_EFP_ERR;
+  localparam logic [15:0] R_EFP_IMG_COLS   = emri_pkg::R_EFP_IMG_COLS;
   localparam logic [15:0] R_IMG_DIGEST     = emri_pkg::R_IMG_DIGEST;
   localparam logic [15:0] R_IMG_SIG        = emri_pkg::R_IMG_SIG;
   localparam int          IMG_DIGEST_WORDS = emri_pkg::IMG_DIGEST_WORDS;
@@ -163,6 +165,7 @@ module emri_regfile #(
   logic [15:0] efp_img_words_r;
   logic [7:0]  efp_status_r;
   logic [7:0]  efp_err_r;
+  logic [7:0]  efp_img_cols_r;  // v0.3 (spec §3.3): run_packed column count
   logic [31:0] img_digest_r [IMG_DIGEST_WORDS];  // 32 B manifest digest
   logic [31:0] img_sig_r   [IMG_SIG_WORDS];      // 64 B Ed25519 signature
 
@@ -245,6 +248,7 @@ module emri_regfile #(
       efp_img_words_r  <= 16'h0;
       efp_status_r     <= 8'h0;
       efp_err_r        <= 8'h0;
+      efp_img_cols_r   <= 8'h0;
     end else if (host_req_i && host_we_i && (host_op_i == SPI_OP_WR)) begin
       case (host_addr_i)
         R_OCC_FRAME_ADDR: occ_frame_addr_r <= host_wdata_i[15:0];
@@ -256,6 +260,7 @@ module emri_regfile #(
         R_EFP_IMG_WORDS:  efp_img_words_r  <= host_wdata_i[15:0];
         R_EFP_STATUS:     efp_status_r     <= host_wdata_i[7:0];
         R_EFP_ERR:        efp_err_r        <= host_wdata_i[7:0];
+        R_EFP_IMG_COLS:   efp_img_cols_r   <= host_wdata_i[7:0];
         default: ; // others RO or handled above/below
       endcase
     end
@@ -410,6 +415,7 @@ module emri_regfile #(
       R_EFP_IMG_WORDS:  host_rdata_o = {16'h0, efp_img_words_r};
       R_EFP_STATUS:     host_rdata_o = {24'h0, efp_status_r};
       R_EFP_ERR:        host_rdata_o = {24'h0, efp_err_r};
+      R_EFP_IMG_COLS:   host_rdata_o = {24'h0, efp_img_cols_r};
       R_HEALTH_STATUS:  host_rdata_o = health_status_w;
       R_MON_TEMP:       host_rdata_o = {16'h0, MON_TEMP_SIM};
       R_MON_VCCINT:     host_rdata_o = {16'h0, MON_VCCINT_SIM};

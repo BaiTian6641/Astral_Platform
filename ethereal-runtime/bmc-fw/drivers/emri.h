@@ -31,14 +31,19 @@
 #define EMRI_OCC_STATUS_WORD   0x0Au  /* R_OCC_STATUS   (sec 4) */
 #define EMRI_OCC_FRAME_ADDR_WORD  0x0Bu  /* R_OCC_FRAME_ADDR */
 #define EMRI_OCC_WORD_COUNT_WORD  0x0Cu  /* R_OCC_WORD_COUNT */
+#define EMRI_OCC_DECODE_WORD   0x0Du  /* R_OCC_DECODE   (sec 3.1, frame_decoder trigger) */
 /* EFP command block (v0.2, spec sec 3.2): host<->daemon mailbox. */
 #define EMRI_EFP_CMD_WORD      0x13u  /* R_EFP_CMD      doorbell */
 #define EMRI_EFP_REGION_WORD   0x14u  /* R_EFP_REGION   0xFF = auto */
 #define EMRI_EFP_IMG_WORDS_WORD 0x15u /* R_EFP_IMG_WORDS */
 #define EMRI_EFP_STATUS_WORD   0x16u  /* R_EFP_STATUS   {state,busy,done} */
 #define EMRI_EFP_ERR_WORD      0x17u  /* R_EFP_ERR      sticky error */
+#define EMRI_EFP_IMG_COLS_WORD 0x21u  /* R_EFP_IMG_COLS (v0.3, sec 3.3: run_packed column count) */
 #define EMRI_IMG_DIGEST_WORD   0x18u  /* R_IMG_DIGEST   base, +0..7 */
 #define EMRI_IMG_SIG_WORD      0x50u  /* R_IMG_SIG      base, +0..15 */
+/* SPI_CRC @ 0x3F (v0.3, spec sec 7.1): EFP-SPI transport-CRC16 latch. NOT a
+ * regfile storage word — intercepted by the efp-spi front-end (efp-spi/). */
+#define EMRI_SPI_CRC_WORD      0x3Fu
 
 /* OCC_CMD bitfield (spec sec 3; emri_pkg OCC_CMD_*). */
 #define EMRI_OCC_CMD_START     (1u << 8)

@@ -294,6 +294,10 @@ module tb_emri_regfile;
     host_write(R_EFP_ERR, 32'h0000_0001);       // bad_sig
     host_read(R_EFP_ERR, rd);  chk(rd == 32'h1, "EFP_ERR RW");
     host_write(R_EFP_ERR, 32'h0);
+    host_write(R_EFP_IMG_COLS, 32'h0000_0002);  // v0.3: 2-column packed image
+    host_read(R_EFP_IMG_COLS, rd); chk(rd == 32'h2, "EFP_IMG_COLS RW");
+    host_write(R_EFP_IMG_COLS, 32'h0);
+    host_read(R_EFP_IMG_COLS, rd); chk(rd == 32'h0, "EFP_IMG_COLS clears");
 
     // IMG_DIGEST[0..7] @ 0x18-0x1F and IMG_SIG[0..15] @ 0x50-0x5F: full
     // walk (every word stores independently; little-endian in-word bytes).

@@ -27,6 +27,7 @@
 #define EFP_CMD_STOP    2u
 #define EFP_CMD_RESTART 3u
 #define EFP_CMD_ABORT   4u
+#define EFP_CMD_RUN_PACKED 5u /* v0.3: bit-packed production-frame deploy (sec 3.3) */
 #define EFP_REGION_AUTO 0xFFu /* auto-allocate first free (run only) */
 
 /* EFP daemon lifecycle states (EFP_STATUS.state[3:0]). */
@@ -53,9 +54,14 @@
 #define EFP_ERR_OCC_REJECT       5u
 #define EFP_ERR_BAD_CMD          6u
 #define EFP_ERR_IMG_LEN_MISMATCH 7u
+#define EFP_ERR_CRC_TRANSPORT    8u /* v0.3 sec 7.1: EFP-SPI OCC_PUSH CRC16 mismatch */
 
 /* Region count: v0 fixed at 2 (ADR-004 build-time; NUM_REGIONS reg = 2). */
 #define DAEMON_NUM_REGIONS 2u
+/* Fabric column count: v0 sim fabric is 2x2 -> 2 columns. v0 region->column
+ * mapping ASSUMPTION (emri-v0.md sec 3.3): region r covers the columns
+ * starting at column r. */
+#define DAEMON_FAB_COLS 2u
 
 /* Reset the region table and EFP status registers; call once at boot. */
 void daemon_init(void);

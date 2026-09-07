@@ -56,6 +56,9 @@ package emri_pkg;
   localparam logic [15:0] R_EFP_STATUS     = 16'h16;  // {state[3:0],busy,done}
   localparam logic [15:0] R_EFP_ERR        = 16'h17;  // sticky last-error
   localparam logic [15:0] R_IMG_DIGEST     = 16'h18;  // base; +0..7
+  // R_EFP_IMG_COLS @ 0x21 — fabric-column count of a run_packed image
+  // (v0.3, emri-v0.md §3.3). Plain RW storage like the other EFP regs.
+  localparam logic [15:0] R_EFP_IMG_COLS   = 16'h21;
   localparam logic [15:0] R_IMG_SIG        = 16'h50;  // base; +0..15
   localparam int          IMG_DIGEST_WORDS = 8;       // 32 B manifest digest
   localparam int          IMG_SIG_WORDS    = 16;      // 64 B Ed25519 sig
@@ -110,6 +113,12 @@ package emri_pkg;
   localparam logic [7:0] SPI_STAT_BAD_OP  = 8'h01;
   localparam logic [7:0] SPI_STAT_BAD_ADDR= 8'h02;
   localparam logic [7:0] SPI_STAT_BUSY    = 8'h03;
+  localparam logic [7:0] SPI_STAT_CRC_ERR = 8'h04;  // §7.1 transport CRC16 mismatch
+  localparam logic [7:0] SPI_STAT_NOT_READY = 8'hFF;  // wire fill "retry" (§7.1)
+
+  // SPI_CRC latch offset (spec §7.1, v0.3): intercepted by the SPI front-end
+  // (no regfile storage word; 0x3F stays reserved in the regfile itself).
+  localparam logic [15:0] R_SPI_CRC       = 16'h3F;
 
   // ------------------------------------------------------------------
   // EFP doorbell command codes (spec §3.2; EFP_CMD[7:0])
@@ -119,6 +128,7 @@ package emri_pkg;
   localparam logic [7:0] EFP_CMD_STOP    = 8'd2;
   localparam logic [7:0] EFP_CMD_RESTART = 8'd3;
   localparam logic [7:0] EFP_CMD_ABORT   = 8'd4;
+  localparam logic [7:0] EFP_CMD_RUN_PACKED = 8'd5;  // v0.3 bit-packed deploy (§3.3)
   localparam logic [7:0] EFP_REGION_AUTO = 8'hFF;  // auto first-free (run only)
 
   // EFP daemon lifecycle states (spec §3.2; EFP_STATUS.state[3:0])
@@ -141,6 +151,7 @@ package emri_pkg;
   localparam logic [7:0] EFP_ERR_OCC_REJECT       = 8'd5;
   localparam logic [7:0] EFP_ERR_BAD_CMD          = 8'd6;
   localparam logic [7:0] EFP_ERR_IMG_LEN_MISMATCH = 8'd7;
+  localparam logic [7:0] EFP_ERR_CRC_TRANSPORT    = 8'd8;  // §7.1 SPI CRC16 gate
   /* verilator lint_on UNUSEDPARAM */
 
 endpackage : emri_pkg
