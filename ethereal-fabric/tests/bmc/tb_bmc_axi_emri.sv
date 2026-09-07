@@ -22,7 +22,7 @@
 //              docs/adr/ADR-018-axi-noc-riscv-cluster.md (BMC=AXI master)
 // Notes:       iverilog -g2012. Self-checking; prints "TEST PASSED".
 //              IMEM preload backdoor path matches tb_bmc_hello (ROM array
-//              n6964, renamed on the 2026-08-08 XBUS regen — update on regen).
+//              n7280, renamed n7280 -> n7280 on the 2026-09-02 SDI regen).
 //              UART bit time = 2 clk (NEORV32 reset defaults PRSC=0/BAUD=0).
 `timescale 1ns/1ps
 
@@ -79,6 +79,11 @@ module tb_bmc_axi_emri;
         .m_axi_rdata   (rdata),
         .m_axi_rresp   (rresp),
         .dbg_en_i      (1'b0),
+        // SDI tied off (CS high = idle): this TB drives no EFP-SPI traffic.
+        .sdi_clk_i     (1'b0),
+        .sdi_csn_i     (1'b1),
+        .sdi_dat_i     (1'b1),
+        .sdi_dat_o     (),
         .heartbeat_o   ()
     );
 
@@ -176,11 +181,11 @@ module tb_bmc_axi_emri;
 
     // -- IMEM image preload (backdoor into the generated netlist ROM) -----------
     localparam string IMAGE = "generated/bmc/bmc_emri.hex";
-    // Path matches tb_bmc_hello; ROM array renamed n6830 -> n6964 on XBUS regen.
+    // Path matches tb_bmc_hello; ROM array renamed n6830 -> n7280 (2026-08-08 XBUS regen) -> n7280 (2026-09-02 SDI regen).
     initial begin
         $readmemh(IMAGE, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_imem_enabled_neorv32_imem_inst
-                  .imem_rom_imem_rom_inst.n6964);
+                  .imem_rom_imem_rom_inst.n7280);
     end
 
     // -- Observe EMRI host-port activity ------------------------------------------

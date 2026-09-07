@@ -66,6 +66,11 @@ module tb_bmc_hello;
         .m_axi_rdata   (32'h0),
         .m_axi_rresp   (2'b00),
         .dbg_en_i      (1'b0),
+        // SDI tied off (CS high = idle): this TB drives no EFP-SPI traffic.
+        .sdi_clk_i     (1'b0),
+        .sdi_csn_i     (1'b1),
+        .sdi_dat_i     (1'b1),
+        .sdi_dat_o     (),
         .heartbeat_o   ()
     );
 
@@ -77,11 +82,11 @@ module tb_bmc_hello;
     // Hierarchical path: bmc_core.u_core -> neorv32_top -> imem -> imem_rom ROM.
     localparam string IMAGE = "generated/bmc/bmc_hello.hex";
     // NOTE (2026-08-08): regenerating the netlist for XBUS renamed the ROM array
-    // n6830 -> n6964 (GHDL node renumbering). Update this path on any regen.
+    // n6830 -> n7280 (GHDL node renumbering). Update this path on any regen.
     initial begin
         $readmemh(IMAGE, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_imem_enabled_neorv32_imem_inst
-                  .imem_rom_imem_rom_inst.n6964);
+                  .imem_rom_imem_rom_inst.n7280);
     end
 
     // -- UART 8N1 receive (idle-high, start bit low, LSB first) --------------

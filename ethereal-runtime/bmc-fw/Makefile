@@ -35,7 +35,8 @@ LDFLAGS := $(CROSS_FLAGS) -T link.ld -Wl,--no-warn-rwx-segments
 
 BUILD := build
 OBJS  := $(BUILD)/crt0.o $(BUILD)/main.o $(BUILD)/uart.o \
-         $(BUILD)/sha512.o $(BUILD)/ed25519.o $(BUILD)/daemon.o
+         $(BUILD)/sha512.o $(BUILD)/ed25519.o $(BUILD)/daemon.o \
+         $(BUILD)/sdi.o $(BUILD)/efp_spi.o
 
 .PHONY: all clean check-tool vectors
 all: $(BUILD)/bmc_boot.hex $(BUILD)/bmc_dmem_lane0.hex
@@ -52,7 +53,7 @@ $(BUILD):
 $(BUILD)/crt0.o: boot/crt0.S link.ld | $(BUILD)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-$(BUILD)/main.o: main.c drivers/uart.h drivers/emri.h crypto/ed25519.h daemon/daemon.h | $(BUILD)
+$(BUILD)/main.o: main.c drivers/uart.h drivers/emri.h crypto/ed25519.h daemon/daemon.h efp-spi/efp_spi.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/uart.o: drivers/uart.c drivers/uart.h | $(BUILD)
@@ -65,7 +66,15 @@ $(BUILD)/ed25519.o: crypto/ed25519.c crypto/ed25519.h crypto/sha512.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/daemon.o: daemon/daemon.c daemon/daemon.h daemon/keyring.h \
-                   drivers/emri.h drivers/uart.h crypto/ed25519.h | $(BUILD)
+                   drivers/emri.h drivers/uart.h crypto/ed25519.h \
+                   efp-spi/efp_spi.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/sdi.o: efp-spi/sdi.c efp-spi/sdi.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/efp_spi.o: efp-spi/efp_spi.c efp-spi/efp_spi.h efp-spi/sdi.h \
+                    drivers/emri.h daemon/daemon.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/bmc_fw.elf: $(OBJS) link.ld

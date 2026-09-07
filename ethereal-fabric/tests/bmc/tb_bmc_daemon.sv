@@ -113,6 +113,11 @@ module tb_bmc_daemon;
       .m_axi_rdata   (rdata),
       .m_axi_rresp   (rresp),
       .dbg_en_i      (1'b0),
+      // SDI tied off (CS high = idle): this TB drives no EFP-SPI traffic.
+      .sdi_clk_i     (1'b0),
+      .sdi_csn_i     (1'b1),
+      .sdi_dat_i     (1'b1),
+      .sdi_dat_o     (),
       .heartbeat_o   ()
   );
 
@@ -272,13 +277,13 @@ module tb_bmc_daemon;
   // -- Firmware preload (DMEM-exec bootstrap; see tb_bmc_fw BOOTSTRAP note) ------
   initial begin
       // #1: the netlist's imem_rom has its OWN time-0 initial block filling
-      // n6964 with the GHDL-conversion default image; the simulator may run it
+      // n7280 with the GHDL-conversion default image; the simulator may run it
       // AFTER a time-0 TB initial and clobber the preload. Defer past time 0
       // (the core is still in reset; reset releases at 200 ns).
       #1;
       $readmemh("generated/bmc/bmc_boot.hex", dut.u_core.neorv32_top_inst
                 .memory_system_neorv32_imem_enabled_neorv32_imem_inst
-                .imem_rom_imem_rom_inst.n6964);
+                .imem_rom_imem_rom_inst.n7280);
       $readmemh("generated/bmc/bmc_dmem_lane0.hex", dut.u_core.neorv32_top_inst
                 .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
                 .dmem_ram_inst.\ram_gen[0]_ram_inst .spram);
@@ -536,6 +541,10 @@ module tb_bmc_daemon;
       expect_uart("bmc-fw v0.2 daemon boot\n", "boot banner");
       expect_uart("ed25519 selftest OK\n", "boot Ed25519 selftest");
       expect_uart("EMRI MAGIC=45544852 CAP=00000001\n", "EMRI MAGIC/CAP probe");
+      // E1-IO1 (2026-09-02): main.c inits the EFP-SPI front-end after the
+      // EMRI probe and before daemon_init — exact-match the new boot line so
+      // the expect_uart cursor stays aligned.
+      expect_uart("efp-spi ready\n", "EFP-SPI front-end initialized");
       expect_uart("daemon ready\n", "daemon poll loop entered");
 
       // ---- 1. run image A (TFF), auto-alloc ---------------------------------

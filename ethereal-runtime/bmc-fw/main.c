@@ -7,7 +7,9 @@
  * xbar -> emri_axi_adapter -> emri_regfile), then the EFP daemon poll loop
  * (daemon/daemon.c, emri-v0.md sec 3.2): the host stages image metadata in
  * the EMRI window and rings EFP_CMD; the daemon verifies/allocates/loads and
- * reports via EFP_STATUS/EFP_ERR.
+ * reports via EFP_STATUS/EFP_ERR. The EFP-SPI front-end (efp-spi/, E1-IO1,
+ * spec sec 7/7.1) is initialized here and serviced from the daemon's poll
+ * loops — SPI host frames drive the SAME EMRI window an AXI host would.
  *
  * G1: no dynamic memory (static state only). Bare-metal rv32imc.
  *
@@ -18,6 +20,7 @@
 #include "drivers/emri.h"
 #include "crypto/ed25519.h"
 #include "daemon/daemon.h"
+#include "efp-spi/efp_spi.h"
 
 int main(void)
 {
@@ -36,6 +39,9 @@ int main(void)
     uart_puts(" CAP=");
     uart_puthex32(cap);
     uart_puts("\n");
+
+    efp_spi_init();
+    uart_puts("efp-spi ready\n");
 
     daemon_init();
     uart_puts("daemon ready\n");

@@ -10,7 +10,12 @@
 //              by VexRiscv (fallback) without touching the rest of the Shell.
 //
 //              The vendored core is rv32imc + IMEM(16KB ROM-boot) + DMEM(16KB) +
-//              UART0 + **XBUS (Wishbone master)**. This wrapper instantiates the
+//              UART0 + **XBUS (Wishbone master)** + **SDI (SPI device, mode 0)**
+//              — the E1-IO1 EFP-SPI host channel (emri-v0.md §7); the 4 SDI pins
+//              are exposed on this port set for the SoC/host to drive. The
+//              vendored core's SDI CSRs sit at 0xFFF70000 (CTRL) / 0xFFF70004
+//              (DATA) in the NEORV32 IO region (byte-level, MSB-first). This
+//              wrapper instantiates the
 //              in-house `eth_wb2axi` bridge (Wishbone -> AXI4-Lite master) so the
 //              BMC drives the in-house `eth_axi` fabric as a first-class AXI
 //              master (ADR-018 BMC integration). The AXI master channels are
@@ -22,6 +27,8 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-30
 // Modified:    2026-08-08 - enable XBUS, add eth_wb2axi AXI master bridge
+//              2026-09-02 - SDI-enabled netlist swap (IO_SDI_EN=true,
+//              IO_SDI_FIFO=1; ROM array n6964 -> n7280), expose 4 SDI pins
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C05-BMC组件.md §1 (ADR-016 swappable core);
 //              docs/adr/ADR-018-axi-noc-riscv-cluster.md (BMC = AXI master)
@@ -38,6 +45,12 @@ module bmc_core #(
     // UART0 (host console / hello path) --
     output logic      uart0_txd_o,  // UART0 transmit data
     input  wire logic uart0_rxd_i,  // UART0 receive data
+    // SDI (SPI device — EFP-SPI host channel, emri-v0.md §7; mode 0, MSB-first) --
+    input  wire logic sdi_clk_i,  // SPI serial clock (driven by the host)
+    input  wire logic sdi_csn_i,  // chip select, low-active (early release
+                                  // discards the partial byte)
+    input  wire logic sdi_dat_i,  // serial data in  (SPI MOSI)
+    output logic      sdi_dat_o,  // serial data out (SPI MISO)
     // AXI4 master (to the eth_axi fabric / xbar) --
     // AW
     output logic                  m_axi_awvalid,
@@ -114,7 +127,11 @@ module bmc_core #(
         .xbus_cyc_o  (xbus_cyc),
         .xbus_dat_i  (xbus_dat_i),
         .xbus_ack_i  (xbus_ack),
-        .xbus_err_i  (xbus_err)
+        .xbus_err_i  (xbus_err),
+        .sdi_clk_i   (sdi_clk_i),
+        .sdi_csn_i   (sdi_csn_i),
+        .sdi_dat_i   (sdi_dat_i),
+        .sdi_dat_o   (sdi_dat_o)
     );
 
     // ------------------------------------------------------------------

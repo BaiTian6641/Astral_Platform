@@ -18,8 +18,8 @@
 //              The TB exact-matches the full byte stream (90 bytes).
 //
 //              BOOTSTRAP: the vendored netlist IMEM ROM is physically 1 KiB
-//              (imem_rom reads addr_i[9:2]), so the firmware DMEM-execs: the
-//              TB preloads bmc_boot.hex into the ROM array (n6964) and
+//              (imem_rom reads addr_i[13:2] = 16 KiB), so the firmware DMEM-execs: the
+//              TB preloads bmc_boot.hex into the ROM array (n7280) and
 //              bmc_dmem_lane{0..3}.hex into the 4 dmem_ram byte-lane sprams
 //              (see bmc-fw/boot/crt0.S BOOTSTRAP NOTE).
 // Maintainer:  BaiTian6641
@@ -91,6 +91,11 @@ module tb_bmc_fw;
         .m_axi_rdata   (rdata),
         .m_axi_rresp   (rresp),
         .dbg_en_i      (1'b0),
+        // SDI tied off (CS high = idle): this TB drives no EFP-SPI traffic.
+        .sdi_clk_i     (1'b0),
+        .sdi_csn_i     (1'b1),
+        .sdi_dat_i     (1'b1),
+        .sdi_dat_o     (),
         .heartbeat_o   ()
     );
 
@@ -188,14 +193,14 @@ module tb_bmc_fw;
     localparam string DMEM_LANE3 = "generated/bmc/bmc_dmem_lane3.hex";
     initial begin
         // #1: the netlist's imem_rom has its OWN time-0 initial block that
-        // fills n6964 with the (9-word) GHDL-conversion default image; the
+        // fills n7280 with the (9-word) GHDL-conversion default image; the
         // simulator may run it AFTER a time-0 TB initial and clobber the
         // preload. Deferring past time 0 makes the preload win determinically
         // (the core is still in reset; reset releases at 200 ns).
         #1;
         $readmemh(BOOT_IMAGE, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_imem_enabled_neorv32_imem_inst
-                  .imem_rom_imem_rom_inst.n6964);
+                  .imem_rom_imem_rom_inst.n7280);
         $readmemh(DMEM_LANE0, dut.u_core.neorv32_top_inst
                   .memory_system_neorv32_dmem_enabled_neorv32_dmem_inst
                   .dmem_ram_inst.\ram_gen[0]_ram_inst .spram);
@@ -244,10 +249,11 @@ module tb_bmc_fw;
 
     // -- Stimulus + check ---------------------------------------------------------
     // Expected: "bmc-fw v0.2 daemon boot\ned25519 selftest OK\nEMRI
-    // MAGIC=45544852 CAP=00000001\ndaemon ready\n" (90 bytes). The expected
-    // bytes are a byte array (generated from the message; matches main.c
-    // exactly).
-    localparam int NEXP = 90;
+    // MAGIC=45544852 CAP=00000001\nefp-spi ready\ndaemon ready\n"
+    // (104 bytes; "efp-spi ready\n" added 2026-09-02 for the E1-IO1
+    // EFP-SPI front-end init in main.c). The expected bytes are a byte array
+    // (generated from the message; matches main.c exactly).
+    localparam int NEXP = 104;
     byte unsigned expected [0:NEXP-1] = '{
         8'h62, 8'h6d, 8'h63, 8'h2d, 8'h66, 8'h77, 8'h20, 8'h76,
         8'h30, 8'h2e, 8'h32, 8'h20, 8'h64, 8'h61, 8'h65, 8'h6d,
@@ -258,9 +264,10 @@ module tb_bmc_fw;
         8'h20, 8'h4d, 8'h41, 8'h47, 8'h49, 8'h43, 8'h3d, 8'h34,
         8'h35, 8'h35, 8'h34, 8'h34, 8'h38, 8'h35, 8'h32, 8'h20,
         8'h43, 8'h41, 8'h50, 8'h3d, 8'h30, 8'h30, 8'h30, 8'h30,
-        8'h30, 8'h30, 8'h30, 8'h31, 8'h0a, 8'h64, 8'h61, 8'h65,
-        8'h6d, 8'h6f, 8'h6e, 8'h20, 8'h72, 8'h65, 8'h61, 8'h64,
-        8'h79, 8'h0a
+        8'h30, 8'h30, 8'h30, 8'h31, 8'h0a, 8'h65, 8'h66, 8'h70,
+        8'h2d, 8'h73, 8'h70, 8'h69, 8'h20, 8'h72, 8'h65, 8'h61,
+        8'h64, 8'h79, 8'h0a, 8'h64, 8'h61, 8'h65, 8'h6d, 8'h6f,
+        8'h6e, 8'h20, 8'h72, 8'h65, 8'h61, 8'h64, 8'h79, 8'h0a
     };
 
     integer errors = 0;

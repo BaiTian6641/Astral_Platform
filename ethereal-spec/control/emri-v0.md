@@ -1,8 +1,8 @@
-# EMRI — Ethereal Management Register Interface (v0.2, draft)
+# EMRI — Ethereal Management Register Interface (v0.3, draft)
 
-> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.2** (v0.2 adds the EFP command block §3.2)
+> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.3** (v0.3 adds `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3; plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
 > Plan-Ref: `ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.3`, `ethereal-plan/components/C05-BMC组件.md §3/§4`
-> Date: 2026-07-29 · v0.2: 2026-09-01 · Implements: ADR-013/014/015/016
+> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · Implements: ADR-013/014/015/016
 
 The **unified management register ABI** exposed to the host by **both** the BMC
 (NEORV32 soft-core) and the **mFSM** (register-based small-device fallback).
@@ -71,23 +71,26 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x10` | `SESSION_CMD` | RW | 8 | mFSM session FSM control. `0=nop, 1=begin_rx, 2=verify(host-done), 3=occ_go, 4=abort`. BMC mode: ignored (BMC drives OCC directly). |
 | `0x11` | `SESSION_STATUS` | R | 8 | `{state[3:0], done[4], err[7:4]}`. See §5. |
 | `0x12` | `RX_BUF_CTRL` | RW | 32 | `{wr_ptr[31:16], depth[15:0]}`. Image-staging buffer (mFSM rx_buf). v0: depth ≤ 16KB. |
-| `0x13` | `EFP_CMD` | W | 8 | **Daemon doorbell (v0.2, BMC mode)**. `0=nop, 1=run, 2=stop, 3=restart, 4=abort`. See §3.2. |
+| `0x13` | `EFP_CMD` | W | 8 | **Daemon doorbell (v0.2, BMC mode)**. `0=nop, 1=run, 2=stop, 3=restart, 4=abort, 5=run_packed` (v0.3, §3.3). See §3.2. |
 | `0x14` | `EFP_REGION` | RW | 8 | Target region for the next `EFP_CMD`. `0xFF` = auto-allocate first free (run only). |
 | `0x15` | `EFP_IMG_WORDS` | RW | 16 | Frame-word count of the image being deployed (incl. CRC tail words). |
 | `0x16` | `EFP_STATUS` | R | 8 | Daemon lifecycle: `{state[3:0], busy[4], done[5]}`. States: `0=IDLE,1=VERIFY,2=ALLOC,3=BLANK,4=LOAD,5=READBACK,6=RUNNING,7=ERROR,8=STOPPED`. |
-| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch`. Cleared on next `EFP_CMD` write. |
+| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch,8=crc_transport` (§7.1, SPI-transport CRC16 mismatch). Cleared on next `EFP_CMD` write. |
 | `0x18-0x1F` | `IMG_DIGEST[0..7]` | RW | 8×32 | 32-byte manifest digest (SHA-256). Word `i` holds digest bytes `[4i+3:4i]` (little-endian in-word). |
 | `0x50-0x5F` | `IMG_SIG[0..15]` | RW | 16×32 | 64-byte Ed25519 signature over the digest. Same in-word byte order as `IMG_DIGEST`. |
 | `0x20` | `HEALTH_STATUS` | R | 32 | bit-per-region health: bit0=region0 ok, bit8=region1 ok, … v0: all-ok = `0x0000_0101`. |
+| `0x21` | `EFP_IMG_COLS` | RW | 8 | Number of fabric columns the staged image spans (`run_packed` only, v0.3 §3.3). Plain RW storage like the other EFP regs. **v0 region→column mapping ASSUMPTION:** in the v0 sim fabric (2×2, one column per region slot) region `r` covers the columns starting at column `r`. |
+| `0x3F` | `SPI_CRC` | W | 16 | **EFP-SPI transport-CRC16 latch** (§7.1, v0.3): `DATA[15:0]` = expected CRC16 of the session's OCC_PUSH stream. Intercepted by the SPI front-end; not a regfile storage word. RD returns front-end debug `{state[17:16], crc_acc[15:0]}`. |
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
 
-**Reserved ranges** after v0.2 allocations: `0x07`, `0x0E-0x0F`, `0x22-0x2F`,
-`0x32-0x37`, `0x39-0x3F`, `0x60+` — read-as-0, write-ignored. Allocation map:
+**Reserved ranges** after v0.3 allocations: `0x07`, `0x0E-0x0F`, `0x22-0x2F`,
+`0x32-0x37`, `0x39-0x3E`, `0x60+` — read-as-0, write-ignored. Allocation map:
 event-log ring @ `0x38` (planned), telemetry @ `0x40-0x4F` (planned),
 `IMG_SIG` @ `0x50-0x5F` (v0.2), scheduler @ `0x60+` (planned).
 History: `0x06`=`REGION_SEL` (v0.1, §6), `0x0D`=`OCC_DECODE` (v0.1, §3.1),
-`0x13-0x1F`/`0x50-0x5F`=EFP block (v0.2, §3.2).
+`0x13-0x1F`/`0x50-0x5F`=EFP block (v0.2, §3.2),
+`0x21`=`EFP_IMG_COLS` (v0.3, §3.3), `0x3F`=`SPI_CRC` (v0.3, §7.1).
 
 ---
 
@@ -209,6 +212,57 @@ storage (the mFSM has no daemon; `EFP_CMD` writes are ignored).
 
 ---
 
+## 3.3 `run_packed` — bit-packed production-frame deploy (v0.3, BMC mode)
+
+`EFP_CMD=5` deploys **BIT-PACKED production frames** (the `frame_map.py` /
+interconnect-config-v0.md §7 format — a column of tiles' config bits packed
+into 32-bit DATA words + a CRC16 transport tail) through the per-column
+`OCC_DECODE` loop of §3.1. `run` keeps the legacy v0 cfg-addr-addressed
+semantics unchanged; `run_packed` is the production frame path.
+
+**Staged metadata:** as `run` (§3.2 step 1), plus `EFP_IMG_COLS` (`0x21`) =
+the number of fabric columns the image spans, and with `EFP_IMG_WORDS`
+reinterpreted as the **per-column DATA word count** (CRC16 tail excluded —
+the tail is a transport trailer the OCC never consumes, §3.1 step 1). v0 is
+**homogeneous**: every column of the image has the same DATA word count.
+`EFP_IMG_WORDS=0` or `EFP_IMG_COLS=0` fails `img_len_mismatch`; a column
+range exceeding the fabric (`region + cols >` fabric columns) fails
+`img_len_mismatch` too.
+
+**Sequence (VERIFY/ALLOC identical to §3.2, then per column):**
+
+1. **VERIFY / ALLOC:** unchanged from §3.2 (same Ed25519 gate, same region
+   table). Region→column mapping per the §2 `EFP_IMG_COLS` ASSUMPTION.
+2. **BLANK each covered column** (`EFP_STATUS.state=BLANK`): for each column
+   `c` in `[region, region+cols)` the daemon programs
+   `OCC_FRAME_ADDR={region,col}` + `OCC_WORD_COUNT=EFP_IMG_WORDS`, pulses
+   `OCC_DECODE=c` (so the zero stream is decoded into fabric cfg writes),
+   and issues BLANK.
+3. **LOAD per column** (`state=LOAD`): for each column `c` the daemon
+   reprograms `OCC_FRAME_ADDR`/`OCC_WORD_COUNT`, pulses `OCC_DECODE=c`, arms
+   WRITE, and the **host streams that column's DATA words** via `OCC_WDATA`
+   while the daemon polls `OCC_STATUS`. The host detects "WRITE for column
+   `c` armed" as `EFP_STATUS.state==LOAD` **and** `OCC_STATUS.done_flag==0`,
+   bounded by the previous column's `done_flag==1` (the daemon guarantees a
+   ≥decode-latency `done_flag==1` window because the `OCC_DECODE(c+1)` write
+   self-times against the busy frame decoder, §3.1 backpressure). After
+   streaming exactly `EFP_IMG_WORDS` words the host polls `done_flag==1`
+   before starting the next column — streaming early can stall the shared
+   register port behind a full wdata skid with the OCC unarmed.
+4. **READBACK per column** (`state=READBACK`): per-column READBACK with the
+   OCC streaming-CRC check; `crc_error`/ERROR → `occ_crc`, state `ERROR`
+   (region stays non-RUNNING). Success → `RUNNING`, `done=1`.
+
+`EFP_STATUS` reuses the v0.2 state codes; the BLANK/LOAD/READBACK
+transitions **repeat per column** (the state value alone does not identify
+the column — hosts track the loop by the `done_flag` handshake above).
+Error mapping is identical to `run` (`occ_reject`/`occ_crc`/... per §3.2).
+`restart` of a packed image re-runs the **packed** flow with the retained
+metadata (`EFP_IMG_COLS` included); `stop`/`abort` BLANK a packed region
+per column.
+
+---
+
 ## 4. OCC_STATUS register (offset `0x0A`)
 
 | Bits | Field | Meaning |
@@ -289,7 +343,7 @@ ABI; chosen over a variable mailbox stream for sim-provability):
 
 | Byte | Field | Meaning |
 | --- | --- | --- |
-| 0 | `STATUS` | `0x00=OK, 0x01=BAD_OP, 0x02=BAD_ADDR, 0x03=BUSY`. |
+| 0 | `STATUS` | `0x00=OK, 0x01=BAD_OP, 0x02=BAD_ADDR, 0x03=BUSY, 0x04=CRC_ERR` (§7.1). `0xFF` on the wire = "no response ready yet — retry" (§7.1 link convention). |
 | 1-2 | `ADDR` | Echo of request ADDR. |
 | 3-6 | `DATA` | Read data (RD) or 0 (WR). |
 
@@ -310,6 +364,86 @@ SPI clock (host SCK) is async to the fabric clock. The SPI slave deserializes
 into a fabric-clock-domain register; the mFSM/EMRI block reads it there. No
 2FF needed on the SPI→fabric path (it's already registered by the slave); 2FF is
 on the EMRI-register **read** path back to the SPI master (C05 §3.2).
+
+### 7.1 CRC16 transport integrity for OCC_PUSH streams (v0.3)
+
+**Realization note.** The v0 SPI device is the BMC's NEORV32 **SDI** peripheral
+(SPI device, mode 0, byte-level MSB-first, CSR base `0xFFF70000`) plus a
+polled firmware front-end (`bmc-fw/efp-spi/`). The front-end assembles 7-byte
+frames (CS-low delimited) and translates them into the **same EMRI window
+accesses** an AXI host would make — the daemon picks up `EFP_CMD` from the
+shared regfile unchanged (§3.2 write-roles: the SPI front-end is "host").
+
+**Link convention (v0 BMC-SDI realization).** The SDI FIFOs are depth-1 and the
+serial engine reloads the TX shift register 3 fabric clocks after each byte
+completes — far faster than any polled/IRQ CPU refill — so the host pulses CS
+**per byte**: a §7 "frame" is 7 CS-delimited 8-bit pulses. The firmware re-arms
+the TX FIFO whenever it empties: response bytes in order while a response is
+delivering, else `0xFF` fill. Responses are **pipelined at byte granularity**:
+the 7 pulses of request frame N return the response to frame N-1 (MISO), or
+`0xFF` bytes (**"not ready — retry"**, never a real status; real codes are
+`0x00-0x04`) if none is pending. TX-empty hardware fill is `0x00`, so the host
+treats both `0xFF` and any wrong ADDR echo as retry/resync. Frame boundaries
+are additionally delimited Modbus-RTU-style: the host keeps inter-byte CS gaps
+short and leaves one **long inter-frame gap** (≫ the firmware's idle counter,
+v0: 50 µs); the firmware resets its assembler after ~25 serviced idle gaps
+and at every `EFP_CMD` accept. Host discipline (makes a polled depth-1 link
+safe): strictly one request in flight; all retry/poll frames are the all-zero
+RD-MAGIC frame, so a frame misassembled after a CPU-away window (Ed25519
+VERIFY) decodes as a harmless RD MAGIC; WR/OCC_PUSH requests are re-issued
+only when the device provably never saw them (responses are delivered in
+process order, so a response to a LATER poll arriving first proves the loss).
+The daemon **drains** any pending response before accepting an `EFP_CMD` (the
+polling host is clocking it out) so VERIFY cannot split a delivery.
+`BUSY (0x03)` is therefore unused on the BMC-SDI realization in v0.
+
+**CRC16 session semantics.** Transport integrity for the image word stream
+(the OCC CRC32 remains the per-frame integrity gate; this CRC16 covers the
+*transport*, host→device):
+
+1. The device maintains a CRC16-CCITT-FALSE accumulator (poly `0x1021`, init
+   `0xFFFF`, no final xor) over the payload words of all `OCC_PUSH` frames of
+   the current image session — byte-wise over the big-endian bytes of each
+   32-bit word (identical to `frame_map.crc16`, i.e. the same value as the
+   packed frame's own CRC16 tail word).
+2. **Session boundaries are the `EFP_CMD` doorbell writes**: a WR to `0x13`
+   resets the accumulator to `0xFFFF` and the push count to 0, and snapshots
+   the session's expected word total (`EFP_IMG_WORDS` × `EFP_IMG_COLS` for
+   `run_packed`, ×1 for `run`).
+3. The host latches the expected CRC **before** ringing the doorbell with a WR
+   to reserved offset **`0x3F` (`SPI_CRC`)**, `DATA[15:0]` = expected CRC16.
+   (The `0x3F` write is intercepted by the front-end; it is not regfile
+   storage.) Ordering: stage metadata → WR `SPI_CRC` → WR `EFP_CMD` →
+   OCC_PUSH stream (gated on `state=LOAD` per §3.3) → poll terminal state.
+4. The comparison completes the moment the push count reaches the session
+   total (strictly before the OCC signals the last column's completion, so
+   the daemon's gate below never waits). Result: `crc_ok` / `crc_err`.
+   **Pushes beyond the session total are answered `BUSY (0x03)` and NOT
+   forwarded** (the OCC was armed for exactly that many words; over-feeding
+   would corrupt the frame or hard-block the regfile skid) — this is the one
+   `BUSY` use on the BMC-SDI realization, and also what makes a resent push
+   frame safe. `OCC_WDATA` writes made via plain WR frames (op `0x01`, addr
+   `0x09`) do not accumulate — **v0 ASSUMPTION: SPI hosts stream image words
+   exclusively via OCC_PUSH** (mixing defeats the check).
+5. **Daemon gate (BMC mode):** on a CRC-armed session the daemon checks the
+   front-end flag when the LOAD of the *last* column completes, before
+   READBACK. On `crc_err` it re-BLANKs the covered columns (restoring the
+   pre-command blank state), sets `EFP_ERR=8=crc_transport`, enters `ERROR`
+   and never reaches `RUNNING`. On `crc_ok` (or a CRC-less session — AXI host
+   path) the flow is unchanged. (The check is at the LOAD→READBACK
+   transition, not at VERIFY, because the §3.3 stream happens *after* the
+   doorbell; VERIFY-time checking would require pre-armed buffering, deferred
+   to v0.1.)
+6. **SPI-visible error:** while `crc_err` is latched, every response carries
+   `STATUS=0x04 (CRC_ERR)`; RD frames still execute and return their data (so
+   the host can observe `EFP_STATUS=ERROR`/`EFP_ERR`); `EFP_CMD` writes still
+   execute (any code, incl. `nop` — this clears the latch for the next
+   session); **all other WR frames and OCC_PUSH frames are suppressed** (no
+   regfile/OCC side effect — a failed session's tail must not touch the
+   fabric after the gate has fired).
+
+`SPI_CRC` RD (debug): `DATA = {14'h0, state[1:0], crc_acc[15:0]}` with
+`state: 0=none (CRC-less session), 1=collecting, 2=ok, 3=err`.
 
 ---
 

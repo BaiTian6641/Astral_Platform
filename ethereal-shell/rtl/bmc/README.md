@@ -56,3 +56,21 @@ make convert            # GHDL -> verilog
 asserts the UART0 TX waveform decodes to "HI\n". The IMEM preload path is
 `dut.u_core.neorv32_top_inst...imem_rom_inst.n6830` — stable while the netlist
 is frozen; recompute it if the netlist is regenerated.
+
+## Notes (append-only)
+
+- **2026-09-01 — E1-BMC1 IMEM regen spike** (report:
+  `docs/reports/report-E1-BMC1-imem-regen-20260901.md`):
+  - ⚠️ The vendored netlist's IMEM ROM is **physically 1 KiB** (`imem_rom` reads
+    `addr_i[9:2]`, array `n6964[255:0]`), NOT the 16 KiB the config table above
+    implies. Root cause: upstream `neorv32_imem_rom.vhd` sizes the physical ROM
+    from `image_size_c` in `neorv32_imem_image.vhd` (default 796 B → 1 KiB);
+    `IMEM_SIZE` only sets the address-decode window + an overflow assert.
+  - The documented flow above was reproduced **byte-identically** on this machine
+    (GHDL 7.0.0-dev in `~/oss-cad-suite`, upstream commit `05f9896`); the exact
+    wrapper config was recovered (incl. `RISCV_ISA_U=true`, undocumented).
+  - A 16 KiB candidate netlist was generated and validated (lint + tb_bmc_hello
+    swap-test + >1 KiB exec probe): `generated/imem_regen/neorv32_verilog_wrapper_imem16k.v`.
+    Its ROM array is still named `n6964` (now `[4095:0]`, reads `addr_i[13:2]`),
+    so all existing TB backdoor paths stay valid. **Not yet integrated** —
+    swap-in is a maintainer decision (see the report's runbook + checklist).
