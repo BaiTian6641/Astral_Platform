@@ -81,8 +81,8 @@ _INTERCONNECT = os.path.normpath(os.path.join(
 if _INTERCONNECT not in sys.path:
     sys.path.insert(0, _INTERCONNECT)
 
-from bitgen_db import (EXT_IN, FB_BASE, K, N, ElutConfig,  # noqa: E402
-                       FabricConfigDB, TileLogic)
+from bitgen_db import (EXT_IN, K, N, ElutConfig,  # noqa: E402
+                       FabricConfigDB, TileLogic, iib_decode)
 from bitgen_route import RouteConfig  # noqa: E402
 from cb_model import ConnectionBlock  # noqa: E402
 from sb_model import SwitchBox  # noqa: E402
@@ -99,18 +99,19 @@ def clb_eval_bits(
 ) -> list[int]:
     """Evaluate a ``TileLogic`` -> ``clb_out[0..N-1]`` bit list.
 
-    Bit-level mirror of ``clb_t.sv`` + ``elut4.sv``::
+    Bit-level mirror of ``clb_t.sv`` + ``elut4.sv`` (interconnect **v2c**,
+    frozen spec section 7.2)::
 
-        pool[0..EXT_IN-1]   = clb_in_bits (external cluster inputs)
-        pool[EXT_IN..I-1]   = clb_out feedback (pool sel 18..25 -> eLUT4 (sel-18))
-        lut_in[gi][gk]      = pool[iib_mux.get((gi,gk), 0)]
+        lut_in[gi][gk]      = iib_decode(iib_mux.get((gi,gk), 0), gk):
+                              sel[4]=1 -> clb_in_bits[{sel[3:0], gk mod 2}]
+                              sel[4]=0 -> clb_out feedback j = sel[2:0]
         vin                 = {pin3,pin2,pin1,pin0}   (pin0 = LSB)
         comb                = (tt >> vin) & 1          (physical-pin-order TT)
         muxed               = ff_state[gi] if ff_en else comb
         vout                = muxed ^ out_inv
 
-    The eLUT-output feedback (pool 18..25 depends on clb_out, which depends on
-    the pool) is resolved by an inner fixpoint (N+2 iters, like
+    The eLUT-output feedback (the feedback selects read clb_out, which depends
+    on the selects) is resolved by an inner fixpoint (N+2 iters, like
     ``bitgen_sim.simulate_tile``). For combinational clusters (c432: ff_en=0
     everywhere, no intra-cluster feedback) one pass is enough; the loop is the
     general-case guard for legal virtual combinational loops (C01 §2.4).
@@ -126,15 +127,18 @@ def clb_eval_bits(
         if ec.ff_en and gi in ff_state:
             clb_out[gi] = ff_state[gi] & 1
 
-    def _pool_bit(sel: int) -> int:
-        if sel < EXT_IN:
-            return clb_in_bits[sel] & 1
-        return clb_out[sel - FB_BASE] & 1           # feedback eLUT4 (sel - 18)
+    def _pool_bit(gi: int, gk: int) -> int:
+        kind, idx = iib_decode(tile.iib_mux.get((gi, gk), 0), gk)
+        if kind == "clb.I":
+            # reserved sels (pin >= EXT_IN) are MUST-NOT-PROGRAM (section 7.2);
+            # guard to 0 like the pool padding reads.
+            return clb_in_bits[idx] & 1 if idx < EXT_IN else 0
+        return clb_out[idx] & 1                     # feedback eLUT4 j
 
     def _elut_out(gi: int, ec: ElutConfig) -> int:
         vin = 0
         for gk in range(K):
-            vin |= _pool_bit(tile.iib_mux.get((gi, gk), 0)) << gk
+            vin |= _pool_bit(gi, gk) << gk
         if ec.ff_en:
             muxed = ff_state.get(gi, 1 if ec.ff_rst_val else 0) & 1
         else:
@@ -218,8 +222,8 @@ class FabricSim:
                 tm.sb.route(dd, t, sel)
             for j, d in tr.inject.items():
                 tm.sb.inject(j, True, d)
-            for i, track in tr.cb_sel.items():
-                tm.cb.configure(i, track)
+            for i, k in tr.cb_sel.items():
+                tm.cb.configure(i, k)    # v2c: cb_sel holds the subset index k
         # attach the TileLogic (CLB) where a db tile exists (logic tiles); other
         # tiles stay logic=None (routing-only or empty).
         for (x, y), tile_logic in db.tiles.items():
@@ -228,13 +232,20 @@ class FabricSim:
                 self.tiles[r][c].logic = tile_logic
 
         # precompute PO taps: (r, c, gi, net) for every cluster_output net that
-        # is a primary output of the design.
+        # is a primary output of the design. POs renamed by VPR buffer
+        # absorption are tapped through db.po_aliases (the alias net carries
+        # the PO's value — see bitgen_db.build_db).
         self.po_taps: list[tuple[int, int, int, str]] = []
+        alias_of = {alias: po for po, alias in db.po_aliases.items()}
         for (x, y), tl in db.tiles.items():
             r, c = y - min_y, x - min_x
             for gi, net in tl.cluster_outputs.items():
-                if net is not None and net in db.primary_outputs:
+                if net is None:
+                    continue
+                if net in db.primary_outputs:
                     self.po_taps.append((r, c, gi, net))
+                elif net in alias_of:
+                    self.po_taps.append((r, c, gi, alias_of[net]))
 
         # diagnostics from the last evaluate()
         self.last_iters: int = 0

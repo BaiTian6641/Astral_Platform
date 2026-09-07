@@ -87,18 +87,20 @@ def test_route_extract_nets_c432():
 # =============================================================================
 
 def test_c432_routes_conflict_free():
-    """HEADLINE: c432 routes conflict-free on the v1.1 (Wilton) fabric.
+    """HEADLINE: c432 routes conflict-free on the v2c (Wilton + pruned CB) fabric.
 
     All 29 inter-cluster nets route with zero over-used nodes, and every
     driver->sink pair is ``route_exists`` True on the configured real
-    FabricGrid (the Option-B realizability proof). Under the prior disjoint SB
-    this test was ``xfail`` (Cause 2 track-locking); the 2026-07-26 Wilton SB
-    (Fs=3, track-permuting) resolves it. Convergence at seed=0 is ~46 iters
-    (deterministic); ``max_iters`` carries margin.
+    FabricGrid (the Option-B realizability proof). Under interconnect v2c
+    (frozen spec section 7.1) the CB possibility edges are pruned to the
+    stratified Fc=0.5 subset — 24 of 48 tracks per clb_in — and the sinks sit
+    on the class-aware solver's pins (bitgen_db). Convergence at seed=0 is
+    ~116 iters (deterministic, measured 2026-09-02); ``max_iters`` carries
+    margin (the E2-FAB5 spike's route_check used 300).
     """
     from bitgen_pack import db_grid_bounds
     db = _build_c432_db()
-    rc = route(db, max_iters=100, seed=0)
+    rc = route(db, max_iters=300, seed=0)
     print(f"\n[c432 route] n_nets={rc.n_nets} n_routed={rc.n_routed} "
           f"n_iters={rc.n_iters} n_overuse_final={rc.n_overuse_final} "
           f"converged={rc.converged} unrouted_count={len(rc.unrouted)}")
@@ -252,8 +254,8 @@ def test_synthetic_1x2_single_net():
     assert (0, 0) in rc.tiles and (0, 1) in rc.tiles
     assert 0 in rc.tiles[(0, 0)].inject, "driver tile must inject clb_out[0]"
     assert 0 in rc.tiles[(0, 1)].cb_sel, "sink tile must select clb_in[0]"
-    track = rc.tiles[(0, 1)].cb_sel[0]
-    assert 0 <= track < 4 * 12
+    k = rc.tiles[(0, 1)].cb_sel[0]
+    assert 0 <= k < 24, f"v2c CB subset index out of range: {k}"
 
     R, C, W, N_INJ, EXT_IN_v = rc.grid_dims
     assert (R, C) == (1, 2)

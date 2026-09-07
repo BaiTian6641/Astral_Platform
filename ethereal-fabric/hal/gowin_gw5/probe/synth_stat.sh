@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-SCRATCH="${1:-$REPO_ROOT/generated/hal_probe}"
+SCRATCH="$(realpath -m "${1:-$REPO_ROOT/generated/hal_probe}")"  # absolute: the reporting step runs after cd "$SCRATCH"
 RTL="$REPO_ROOT/ethereal-fabric/rtl"
 YOSYS="${YOSYS:-yosys}"
 

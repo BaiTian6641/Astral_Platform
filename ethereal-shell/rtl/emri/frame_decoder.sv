@@ -20,7 +20,7 @@
 //              bits into the fabric's per-register cfg writes.
 //
 //              FRAME FORMAT (frame_map.py, LSB-first within/across words):
-//                per tile(row): CB(108=18x6) -> SB(120=48x2 + 8x1 en + 8x2 dir)
+//                per tile(row): CB(90=18x5, v2c §7.1) -> SB(120=48x2 + 8x1 en + 8x2 dir)
 //                               -> logic(CLB 320=8x20+32x5 | MEM 70 | DSP 118)
 //                column = R tiles concatenated, padded to whole words, + CRC16 tail.
 //              The CRC16 tail word is streamed too but NOT decoded to the fabric
@@ -66,9 +66,12 @@ module frame_decoder #(
     // TILE layout: R*C-entry build-time map (matches fabric_top TILE_TYPE).
     //   0=CLB, 1=MEM, 2=DSP. Index r*C+c, 8-bit entries, entry 0 at the LSB end.
     parameter logic [R*C*8-1:0] TILE_TYPE = {(R*C*8){1'b0}},
+    // v2c §7.1 stratified CB depopulation divisor: CB sel width = clog2(4W/CB_DIV).
+    // CB_DIV=2 = frozen v2c (5-bit sels, CB 90 bits); CB_DIV=1 reproduces v1.1 (6-bit).
+    parameter int CB_DIV = 2,
     // Max DATA words the buffer holds = ceil(R * max_tile_bits / 32). The widest
-    // tile is CLB (548 bits); MEM=298, DSP=346. Use CLB as the (conservative) max.
-    parameter int MAX_WORDS = (R * 548 + 31) / 32
+    // tile is CLB (530 bits with CB_DIV=2); MEM=298, DSP=346. Use CLB as the (conservative) max.
+    parameter int MAX_WORDS = (R * 530 + 31) / 32
 ) (
     input  logic        clk_i,
     input  logic        rst_ni,
@@ -96,11 +99,11 @@ module frame_decoder #(
     localparam int NTILES = R * C;
     localparam int TIW    = (NTILES > 1) ? $clog2(NTILES) : 1;
     localparam int N_CB   = EXT_IN;              // 18 clb_in muxes
-    localparam int CB_SELW = (4*W > 1) ? $clog2(4*W) : 1;  // 6 for W=12
+    localparam int CB_SELW = (4*W > 1) ? $clog2(4*W/CB_DIV) : 1;  // 5 for W=12/CB_DIV=2 (v2c); 6 at CB_DIV=1 ≡ v1.1
     localparam int N_INJ  = N;                   // inject count (= clb_out count)
 
     // per-block bit widths (must match frame_map.py)
-    localparam int CB_BITS  = N_CB * CB_SELW;                 // 108
+    localparam int CB_BITS  = N_CB * CB_SELW;                 // 90 at CB_DIV=2 (108 in v1.1)
     localparam int SB_BITS  = 4*W*2 + N_INJ*1 + N_INJ*2;      // 120
     localparam int CLB_BITS = N*20 + N*K*SELW;                // 320
     localparam int MEM_BITS = 16 + 22 + 32;                   // 70
@@ -301,7 +304,7 @@ module frame_decoder #(
             0: begin  // CB: idx -> cb_sel_#idx (6b) at intra=idx
                 emit_unit  = U_CB;
                 emit_intra = 6'(idx_r);
-                emit_data  = {26'b0, gb_cb[CB_SELW-1:0]};
+                emit_data  = {27'b0, gb_cb[4:0]};  // zero-extend 5-bit k (v2c; CB_SELW=5)
             end
             1: begin  // SB Wilton mux: idx -> mux (2b) at intra=idx (0..47)
                 emit_unit  = U_SB;

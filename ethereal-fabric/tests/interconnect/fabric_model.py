@@ -127,6 +127,11 @@ class FabricGrid:
         clb_in nodes are 4-tuples ``(r, c, "clb_in", i)``; src out-track nodes
         are 5-tuples ``(r, c, "out", dir, t)`` (same shape as SB/channel out
         nodes). clb_in is a sink -> these edges cannot form a cycle.
+
+        Interconnect v2c (spec section 7.1): the per-tile CB decode
+        (``ConnectionBlock.pool_index(i, k) = (i mod CB_DIV) + CB_DIV*k``)
+        means the emitted edges only ever reference tracks of the clb_in's own
+        parity class — the graph-level form of the v2c Fc=0.5 pruning.
         """
         edges = []
         for r in range(self.R):

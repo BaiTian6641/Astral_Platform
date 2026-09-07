@@ -204,13 +204,13 @@ module tb_mgmt_hotswap;
 
     // ============================================================
     // IMAGE A: TFF on tile(0,0) eLUT4[0]  -> clb_out_obs[0] toggles
-    // tile0 CLB intra 0..11 = eLUT0(TFF) + eLUT1-7(0) + IIB mux0-3(sel18)
+    // tile0 CLB intra 0..11 = eLUT0(TFF) + eLUT1-7(0) + IIB mux0-3(sel0)
     // eLUT0 TFF: tt=0x5555, ff_en=1, ff_rst_en=1, ff_rst_val=0 -> 0x0005555C
-    // IIB mux sel=18 (clb_out[0] feedback) -> 0x12
+    // IIB mux sel=0 (v2c §7.2: fb j=0 = clb_out[0]; v1.1 wrote 0x12)
     // ============================================================
     for (i=0;i<16;i=i+1) cur_img[i]=32'h0;
     cur_img[0]=32'h0005555C;                       // eLUT0 TFF
-    for (i=8;i<=11;i=i+1) cur_img[i]=32'h00000012; // IIB mux0-3 = feedback sel18
+    for (i=8;i<=11;i=i+1) cur_img[i]=32'h00000000; // IIB mux0-3 = feedback sel0 (v2c)
     deploy(16'h0000, 12);
     do_reset();                                   // clb_out[0] -> 0 (ff_rst_val=0)
 

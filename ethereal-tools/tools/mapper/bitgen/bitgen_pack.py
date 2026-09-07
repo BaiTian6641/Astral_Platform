@@ -21,6 +21,13 @@ Scope:
     the bitgen emits OCC-loadable COMPLETE frames. CLB-only paths stay for
     backward compat / logic-only validation.
 
+Interconnect **v2c** (frozen spec interconnect-config-v0.md section 7): the CLB
+``iib_mux*`` points carry the section-7.2 select encoding (5 bits, unchanged
+width) and the CB ``cb_sel_*`` points carry the section-7.1 **subset index k**
+(5 bits, was a 6-bit absolute track). Both are produced upstream (bitgen_db
+class-aware IIB solver / bitgen_route pruned CB edges); this module only packs
+bits, so the round-trip is encoding-agnostic.
+
 ==============================================================================
 NET-NAME RE-ATTACHMENT (by design — DO NOT pack net names into frames)
 ==============================================================================
@@ -193,8 +200,9 @@ def tile_to_full_points(tile: TileLogic, rt: "TileRoute | None" = None,
 
     CLB points come from :func:`tile_to_config_points`; routing points from the
     tile's ``TileRoute`` (sb_sel -> ``mux_{dir}_{t}``; inject{j:dir} ->
-    ``inj_en_{j}`` + ``inj_dir_{j}``; cb_sel -> ``cb_sel_{i}``). ``rt=None`` ->
-    CLB-only (routing blank). ``rt`` is duck-typed (no import needed here).
+    ``inj_en_{j}`` + ``inj_dir_{j}``; cb_sel -> ``cb_sel_{i}``, the v2c subset
+    index k = 0..23). ``rt=None`` -> CLB-only (routing blank). ``rt`` is
+    duck-typed (no import needed here).
     """
     cfg = tile_to_config_points(tile, n, k)
     if rt is not None:
@@ -203,8 +211,8 @@ def tile_to_full_points(tile: TileLogic, rt: "TileRoute | None" = None,
         for j, d in rt.inject.items():
             cfg[f"inj_en_{j}"] = 1
             cfg[f"inj_dir_{j}"] = _DIR_IDX[d]
-        for i, track in rt.cb_sel.items():
-            cfg[f"cb_sel_{i}"] = track
+        for i, ksub in rt.cb_sel.items():
+            cfg[f"cb_sel_{i}"] = ksub       # v2c subset index (0..23, 5-bit)
     return cfg
 
 
@@ -262,8 +270,8 @@ def frames_to_route(frames: list[list[int]], fm: FrameMap) -> "RouteConfig":
                 if int(cfg.get(f"inj_en_{j}", 0)):
                     tr.inject[j] = _DIR_CHARS[int(cfg[f"inj_dir_{j}"])]
             for i in range(fm.EXT_IN):
-                track = int(cfg.get(f"cb_sel_{i}", 0))
-                if track != 0:
-                    tr.cb_sel[i] = track
+                k = int(cfg.get(f"cb_sel_{i}", 0))
+                if k != 0:
+                    tr.cb_sel[i] = k        # absent == k 0 (CB zero-init default)
             rc.tiles[(r, c)] = tr
     return rc

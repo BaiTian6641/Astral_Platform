@@ -6,8 +6,10 @@ Builds the bit-packed column frames (via :mod:`frame_map`, the SoT) consumed by
 ``$readmemh`` hex files plus a small ``*.mk``/JSON manifest of expected values.
 
 The frame format is the PRODUCTION bit-packed format (``frame_map.pack_column``),
-per-column, **CB(108) -> SB(120) -> logic(CLB 320 / MEM 70 / DSP 118)**, LSB-first,
-plus a CRC16 tail word. This is the bridge the frame_decoder RTL decodes.
+per-column, **CB(90) -> SB(120) -> logic(CLB 320 / MEM 70 / DSP 118)**, LSB-first,
+plus a CRC16 tail word (interconnect v2c: CB sel narrows 6 -> 5 bits, subset
+index k per spec section 7.1; IIB sel values use the section-7.2 encoding).
+This is the bridge the frame_decoder RTL decodes.
 
 Run (repo root, venv):
     .venv/bin/python ethereal-tools/tools/pack_tb_frames.py --out generated/tb_frames
@@ -55,16 +57,16 @@ def build(fm: FrameMap) -> dict[str, list[int]]:
     dec0 = {
         "elut0": 0x000A5A5A,            # 20-bit eLUT0 (tt=0xA5A5, ff_en=1...)
         "elut3": 0x0003C3C3,
-        "iib_mux0": 18,                 # feedback sel
-        "iib_mux7": 9,
-        "iib_mux31": 21,
+        "iib_mux0": 18,                 # v2c: sel[4]=1 -> ext pin {2, pi(m)}
+        "iib_mux7": 9,                  # v2c: sel[4]=0 -> feedback j=1
+        "iib_mux31": 21,                # v2c: sel[4]=1 -> ext pin {5, pi(m)}
         "mux_n_0": 1,                   # SB Wilton sel
         "mux_e_5": 2,
         "mux_w_11": 3,
         "inj_en_0": 1, "inj_dir_0": 2,  # inject j=0 onto E
         "inj_en_3": 1, "inj_dir_3": 0,  # inject j=3 onto N
-        "cb_sel_0": 5,
-        "cb_sel_17": 40,
+        "cb_sel_0": 5,                  # v2c subset index k (0..23)
+        "cb_sel_17": 20,
     }
     dec1 = {
         "cb_sel_2": 7,
@@ -74,9 +76,12 @@ def build(fm: FrameMap) -> dict[str, list[int]]:
     dec_col0 = fm.pack_column(0, [dec0, dec1])
 
     # --- capstone images (2x2 all-CLB, col 0) --------------------------------
+    # v2c: the TFF feedback taps use sel 0 (feedback j=0 — the v1.1 pool-sel-18
+    # encoding became the zero/blank default, section 7.7: the self-contained
+    # image pattern is now the hardware default).
     img_a = fm.pack_column(0, [
         {"elut0": TFF_WORD,
-         "iib_mux0": 18, "iib_mux1": 18, "iib_mux2": 18, "iib_mux3": 18},
+         "iib_mux0": 0, "iib_mux1": 0, "iib_mux2": 0, "iib_mux3": 0},
         {},
     ])
     img_b = fm.pack_column(0, [{"elut0": CONST1_WORD}, {}])
@@ -117,9 +122,9 @@ def build_het(fm: FrameMap) -> dict[str, list[int]]:
         # row0 = MEM_T: exercise the MEM demux (mode/vbus_ctrl/vd_i)
         {"mem_mode": MEM_MODE_BASIC, "mem_vbus_ctrl": MEM_VBUS_CTRL_DEMO,
          "mem_vd_i": 0xDEADBEEF},
-        # row1 = CLB_T (tile idx 2): TFF on eLUT0 + IIB feedback
+        # row1 = CLB_T (tile idx 2): TFF on eLUT0 + IIB feedback (v2c sel 0 = fb0)
         {"elut0": TFF_WORD,
-         "iib_mux0": 18, "iib_mux1": 18, "iib_mux2": 18, "iib_mux3": 18},
+         "iib_mux0": 0, "iib_mux1": 0, "iib_mux2": 0, "iib_mux3": 0},
     ])
     col0_b = fm.pack_column(0, [
         {"mem_mode": MEM_MODE_BASIC},   # MEM stays benign
@@ -180,7 +185,7 @@ def main() -> int:
             "iib_mux0": {"tile": 0, "unit": 0, "intra": 8,  "data": 18},
             "iib_mux31": {"tile": 0, "unit": 0, "intra": 39, "data": 21},
             "cb_sel_0": {"tile": 0, "unit": 2, "intra": 0,  "data": 5},
-            "cb_sel_17": {"tile": 0, "unit": 2, "intra": 17, "data": 40},
+            "cb_sel_17": {"tile": 0, "unit": 2, "intra": 17, "data": 20},
             "mux_n_0":  {"tile": 0, "unit": 1, "intra": 0,  "data": 1},
             "mux_e_5":  {"tile": 0, "unit": 1, "intra": 29, "data": 2},
             "inj_0":    {"tile": 0, "unit": 1, "intra": 48, "data": (2 << 1) | 1},

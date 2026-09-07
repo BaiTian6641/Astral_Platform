@@ -9,23 +9,31 @@ acceptance):
     -> FabricSim -> bit-true vs an iverilog golden (bench_golden.golden_comb)
 
 Routability is the orchestrator's parallel probe; this harness is responsible
-for being CORRECT on the benchmarks that fit the v1.1 fabric and for xfailing
-(with a precise reason) the ones that don't. Measured on 2026-07-28 (route W=12,
-``route(max_iters=200, seed=0)``):
+for being CORRECT on the benchmarks that fit the fabric and for xfailing
+(with a precise reason) the ones that don't. Measured on 2026-09-02 on the
+interconnect-v2c toolchain (route W=12, ``route(max_iters=200, seed=0)``;
+v1.1 numbers from 2026-07-28 in parentheses):
 
-    ============ ======= ============ ==========================================
-    benchmark    eLUT4   routes?      note
-    ============ ======= ============ ==========================================
-    pwm          11      YES          trivial (2 tiles)   -> bit-true PASS
-    crc32        42      YES          8 tiles, 6x6 grid   -> bit-true PASS
-    fir16        124     NO (200it)   18 tiles; adder tree congests track-locked SB
-    present_round 128    NO (200it)   16 tiles, 128 PI; pLayer permute is IO/route-dense
-    aes128_round 4779    n/a          S-box case -> huge under abc -lut 4 (too big)
-    ============ ======= ============ ==========================================
+    ============ ======= ================= ==========================================
+    benchmark    eLUT4   routes? (v2c)     note
+    ============ ======= ================= ==========================================
+    pwm          11      YES (YES)         trivial (2 tiles)   -> bit-true PASS
+    crc32        42      YES (YES)         8 tiles, 6x6 grid   -> bit-true PASS
+    fir16        124     NO (NO)           18 tiles; adder tree still congests the
+                                           pruned-CB Wilton fabric (23 over-used
+                                           nodes at 200 iters) -> stays xfail
+    present_round 128    YES (NO)          16 tiles, 128 PI; v2c's don't-care-drop
+                                           removes the fake routing demand — the
+                                           S-box layer is one LUT per PO, 0 inter
+                                           nets (vacuous route) -> bit-true PASS
+    aes128_round 4779    n/a (n/a)         S-box case -> huge under abc -lut 4 (too big)
+    ============ ======= ================= ==========================================
 
-So pwm + crc32 are asserted bit-true; fir16 / present_round / aes128_round are
-xfail with the measured reason (they may flip to PASS once the fabric / router
-grows — the harness then exercises them for real).
+So pwm + crc32 + present_round are asserted bit-true; fir16 / aes128_round are
+xfail with the measured reason. (present_round additionally exposed a LATENT
+VPR buffer-absorption alias bug in build_db — PO nets renamed to downstream
+buffer aliases — fixed 2026-09-02 via ``_buffer_classes`` + ``po_aliases``;
+v1.1 never exercised it because present_round xfailed before simulation.)
 
 Plan-Ref: ethereal-plan/components/C-soft-工具与固件组件.md §2 (E0-MAP5).
 """
@@ -75,17 +83,14 @@ BENCHMARKS: dict[str, dict] = {
         "file": "fir16.v", "top": "fir16",
         "inputs": [(f"x{i}", 8) for i in range(8)], "outputs": [("y", 16)],
         "expect_route": False,
-        "xfail_reason": "124 eLUT4 / 18 tiles; symmetric adder tree congests "
-                        "the track-locked Wilton SB (no route convergence at "
-                        "200 iters). Too big for v1.1 fabric.",
+        "xfail_reason": "124 eLUT4 / 18 tiles; the symmetric adder tree still "
+                        "congests the v2c pruned-CB Wilton fabric (23 over-used "
+                        "nodes at 200 iters, measured 2026-09-02).",
     },
     "present_round": {
         "file": "present_round.v", "top": "present_round",
         "inputs": [("state", 64), ("roundkey", 64)], "outputs": [("out", 64)],
-        "expect_route": False,
-        "xfail_reason": "128 eLUT4 / 16 tiles / 128 PI; the pLayer bit "
-                        "permutation is IO- and route-dense (no convergence at "
-                        "200 iters). Too big for v1.1 fabric.",
+        "expect_route": True,
     },
     "aes128_round": {
         "file": "aes128_round.v", "top": "aes128_round",
@@ -185,12 +190,12 @@ def test_bench_bittrue(bench: str):
         # eLUT4-count report exist; only the PathFinder route is skipped. The
         # routability probe itself is the orchestrator's parallel job.)
         _ensure_flow(bench)
-        reason = cfg.get("xfail_reason", "expected not to route on v1.1 fabric")
-        pytest.xfail(f"{bench} too big / not routing on the v1.1 fabric: {reason}")
+        reason = cfg.get("xfail_reason", "expected not to route on the fabric")
+        pytest.xfail(f"{bench} too big / not routing on the fabric: {reason}")
 
     db, rc = _build_and_route(bench)
     assert rc.converged, (
-        f"{bench} was expected to route on the v1.1 fabric but the Wilton "
+        f"{bench} was expected to route on the v2c fabric but the Wilton "
         f"router did not converge — a real regression (routability changed)")
 
     min_x, min_y, _mx, _my = db_grid_bounds(db)

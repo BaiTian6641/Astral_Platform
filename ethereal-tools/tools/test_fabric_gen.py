@@ -17,26 +17,26 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def test_2x2_geometry():
     fg = FabricGen.from_descriptor({"R": 2, "C": 2})
     assert fg.n_tiles == 4
-    assert fg.tile_config_bits == 548                       # CLB 320 + SB 120 + CB 108
-    assert fg.total_config_bits == 4 * 548
+    assert fg.tile_config_bits == 530                       # CLB 320 + SB 120 + CB 90 (v2c)
+    assert fg.total_config_bits == 4 * 530
     assert fg.frames_per_region == 2                        # one frame per column
     assert fg.total_frames == 2
-    assert fg.fm.data_words_per_frame == 35                 # ceil(2*548/32)
-    assert fg.fm.words_per_frame == 36                      # + CRC tail
-    assert fg.total_words == 2 * 36
-    assert fg.total_bytes == 2 * 36 * 4
+    assert fg.fm.data_words_per_frame == 34                 # ceil(2*530/32)
+    assert fg.fm.words_per_frame == 35                      # + CRC tail
+    assert fg.total_words == 2 * 35
+    assert fg.total_bytes == 2 * 35 * 4
 
 
 def test_4x4_geometry():
     fg = FabricGen.from_descriptor({"R": 4, "C": 4})
     assert fg.n_tiles == 16
-    assert fg.total_config_bits == 16 * 548
+    assert fg.total_config_bits == 16 * 530
     assert fg.frames_per_region == 4
     assert fg.total_frames == 4
-    assert fg.fm.data_words_per_frame == 69
-    assert fg.fm.words_per_frame == 70
-    assert fg.total_words == 4 * 70
-    assert fg.total_bytes == 4 * 70 * 4
+    assert fg.fm.data_words_per_frame == 67                 # ceil(4*530/32)
+    assert fg.fm.words_per_frame == 68
+    assert fg.total_words == 4 * 68
+    assert fg.total_bytes == 4 * 68 * 4                     # 1088 B (v2c section 7.4)
 
 
 def test_defaults_are_4x4():
@@ -94,7 +94,7 @@ def test_manifest_and_outputs(tmp_path):
         assert os.path.exists(paths[k])
     # frame_map.json is valid JSON and matches FrameMap.to_json
     jm = json.load(open(paths["frame_map"]))
-    assert jm["words_per_frame"] == 70
+    assert jm["words_per_frame"] == 68
     # blank.hex has words_per_frame lines
     nlines = sum(1 for _ in open(paths["blank"]))
     assert nlines == fg.fm.words_per_frame

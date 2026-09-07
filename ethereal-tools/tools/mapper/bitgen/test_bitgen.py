@@ -17,9 +17,10 @@ import subprocess
 
 import pytest
 
-from bitgen_db import (FB_BASE, N, ElutConfig, TileLogic,
+from bitgen_db import (EXT_IN, IIB_SEL_MAX, N, ElutConfig, TileLogic,
                        blif_names_to_logical_tt, build_db, elut_cfg_word,
-                       elut_from_word, iib_sel_for, parse_blif, permute_tt)
+                       elut_from_word, iib_decode, iib_sel_for, parse_blif,
+                       permute_tt)
 from bitgen_sim import simulate_tile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,12 +51,39 @@ def test_elut_cfg_word_uses_rtl_layout():
 
 
 def test_iib_sel_for():
-    assert iib_sel_for(0, 0, ("clb.I", 0)) == 0
-    assert iib_sel_for(0, 0, ("clb.I", 17)) == 17
-    assert iib_sel_for(0, 0, ("fle", 0)) == FB_BASE + 0
-    assert iib_sel_for(0, 0, ("fle", 7)) == FB_BASE + 7 == 25
+    # v2c section 7.2 encoding: feedback j -> sel j (R1: legal from any pin)
+    assert iib_sel_for(0, 0, ("fle", 0)) == 0
+    assert iib_sel_for(3, 2, ("fle", 7)) == 7
+    # external clb.I[i] -> sel 16 + i//2, LEGAL only on parity-matching pins
+    assert iib_sel_for(0, 0, ("clb.I", 0)) == 16       # even pin, even input
+    assert iib_sel_for(5, 1, ("clb.I", 17)) == 16 + 8  # odd pin, odd input
+    assert iib_sel_for(5, 3, ("clb.I", 17)) == 16 + 8
+    with pytest.raises(ValueError, match="R2 parity"):
+        iib_sel_for(0, 0, ("clb.I", 17))               # even pin, odd input
+    with pytest.raises(ValueError, match="R2 parity"):
+        iib_sel_for(0, 1, ("clb.I", 16))               # odd pin, even input
+    with pytest.raises(ValueError):
+        iib_sel_for(0, 0, ("clb.I", 18))               # out of range
+    with pytest.raises(ValueError):
+        iib_sel_for(0, 0, ("fle", 8))                  # out of range
     with pytest.raises(ValueError):
         iib_sel_for(0, 0, ("bogus", 1))   # type: ignore[arg-type]
+
+
+def test_iib_decode_roundtrip():
+    # iib_decode inverts iib_sel_for (bit-slicing, section 7.2)
+    for gk in range(4):
+        for j in range(N):
+            assert iib_decode(iib_sel_for(0, gk, ("fle", j)), gk) == ("fle", j)
+        for i in range(EXT_IN):
+            if i % 2 == gk % 2:
+                assert iib_decode(iib_sel_for(0, gk, ("clb.I", i)), gk) == ("clb.I", i)
+    # sel=0 (blank default) = feedback j=0 (v2c section 7.7)
+    assert iib_decode(0, 0) == ("fle", 0)
+    # sel[4]=0 sel[3] don't-care: 8+j decodes to feedback j
+    assert iib_decode(0b01011, 3) == ("fle", 3)
+    # reserved sel[4]=1 sel[3:0]>=9 decodes to pins >= EXT_IN (MUST NOT program)
+    assert iib_decode(0b11001, 0)[1] == 18 >= EXT_IN
 
 
 def test_blif_names_to_logical_tt_2input_and():
@@ -119,17 +147,96 @@ def test_c17_db_structure():
     assert set(tile.eluts.keys()) == {6, 7}              # fle[6]=N22, fle[7]=N23
     assert tile.cluster_outputs[6] == "N22"
     assert tile.cluster_outputs[7] == "N23"
-    # clb.I mapping from .net: N3 N2 N1 N6 N7 open ...
-    assert tile.cluster_inputs[0] == "N3"
-    assert tile.cluster_inputs[1] == "N2"
-    assert tile.cluster_inputs[2] == "N1"
-    assert tile.cluster_inputs[3] == "N6"
-    assert tile.cluster_inputs[4] == "N7"
-    assert tile.cluster_inputs[5] is None
+    # v2c: the class-aware IIB solver owns the clb.I pin assignment (VPR's
+    # order is NOT preserved; N3 is duplicated onto one pin per parity class
+    # because fle[6]/fle[7] consume it on opposite-parity pins).
+    used = {p: n for p, n in tile.cluster_inputs.items() if n is not None}
+    assert set(used.values()) == {"N1", "N2", "N3", "N6", "N7"}
+    assert sorted(used.values()) == ["N1", "N2", "N3", "N3", "N6", "N7"]
+    # every decoded ext sel lands on a pin carrying a net (R2 consistency)
+    for (gi, gk), sel in tile.iib_mux.items():
+        kind, idx = iib_decode(sel, gk)
+        if kind == "clb.I":
+            assert idx < EXT_IN and tile.cluster_inputs[idx] is not None
+        else:
+            assert 0 <= idx < N
     # every eLUT4 has a non-trivial TT (c17 is not constant)
     for gi, ec in tile.eluts.items():
         assert ec.tt not in (0x0000, 0xFFFF)
         assert ec.ff_en is False                                      # c17 is combinational
+
+
+def test_c432_iib_v2c_invariants():
+    """v2c section-7.2 contract on the built c432 DB (R1-R3 + net consistency).
+
+    R1: feedback j reaches every LUT input (sel j is always legal).
+    R2: every external select at (gi, gk) decodes to a pin of gk's parity class.
+    R3: per LUT, each parity class uses at most 2 pin slots (structural: the
+        solver only fills the 2 slots of each class).
+    Net consistency: the decoded external pin carries EXACTLY the net the LUT
+        logically consumes (the bit-truth of the class-aware re-assignment);
+        pins are class-distinct (no two nets share a cluster pin).
+    """
+    _require_c432()
+    db = build_db(os.path.join(MAPPER, "c432.net"),
+                  os.path.join(MAPPER, "c432.place"),
+                  os.path.join(MAPPER, "c432.blif"))
+    names, _, _ = parse_blif(os.path.join(MAPPER, "c432.blif"))
+    for tile in db.tiles.values():
+        for gi, ec in tile.eluts.items():
+            outnet = tile.cluster_outputs.get(gi)
+            logical = set(names[outnet][0]) if outnet in names else set()
+            class_use = {0: 0, 1: 0}
+            for gk in range(4):
+                sel = tile.iib_mux.get((gi, gk), 0)
+                kind, idx = iib_decode(sel, gk)
+                if kind == "clb.I":
+                    assert idx % 2 == gk % 2                     # R2
+                    class_use[gk % 2] += 1
+                    assert tile.cluster_inputs[idx] in logical, (
+                        f"LUT{gi} pin{gk}: clb_in[{idx}] carries "
+                        f"{tile.cluster_inputs[idx]!r}, not in {sorted(logical)}")
+                else:
+                    assert 0 <= idx < N                          # R1
+                    if sel != 0:      # nonzero fb sel = a real logical feedback
+                        assert tile.cluster_outputs.get(idx) in logical
+            assert class_use[0] <= 2 and class_use[1] <= 2       # R3
+
+
+def test_present_round_buffer_alias_resolution():
+    """VPR buffer absorption (present_round): PO-driving LUT outputs renamed to
+    downstream buffer aliases (``.names out[28] sboxed[49]``). build_db must
+    (a) record po_aliases so fabric_sim taps the PO through the alias, and
+    (b) look the LUT FUNCTION up by atom name (out[28] = 4-input S-box logic),
+    not by the renamed out-port net (sboxed[49] = 1-input identity buffer).
+    Latent in v1.1 (present_round never simulated); exposed + fixed 2026-09-02.
+    """
+    net_p = os.path.join(MAPPER, "present_round_w12_present_round.net")
+    place_p = os.path.join(MAPPER, "present_round_w12_present_round.place")
+    blif_p = os.path.join(MAPPER, "present_round.blif")
+    if not all(os.path.exists(p) for p in (net_p, place_p, blif_p)):
+        pytest.skip("present_round mapper fixtures missing")
+    db = build_db(net_p, place_p, blif_p)
+    # (a) every PO either driven under its own name or aliased to a driven net
+    driven = {n for t in db.tiles.values() for n in t.cluster_outputs.values() if n}
+    assert len(db.po_aliases) == 64, (
+        f"present_round has 64 absorbed PO aliases, got {len(db.po_aliases)}")
+    for po in db.primary_outputs:
+        assert po in driven or po in db.po_aliases, f"PO {po} untappable"
+        if po in db.po_aliases:
+            assert db.po_aliases[po] in driven
+    # (b) the aliased LUTs carry the REAL multi-input function, not the buffer
+    names, _, _ = parse_blif(blif_p)
+    for t in db.tiles.values():
+        for gi, net in t.cluster_outputs.items():
+            if net == "sboxed[49]":     # alias of out[28] (4-input LUT)
+                assert net not in names or len(names[net][0]) == 1
+                ec = t.eluts[gi]
+                assert ec.tt not in (0x0000, 0xFFFF, 0xCCCC), (
+                    "LUT packed with the buffer identity function — atom-name "
+                    "lookup regressed")
+                return
+    raise AssertionError("sboxed[49] not found in any tile's cluster_outputs")
 
 
 def test_c432_db_structure():
@@ -146,8 +253,13 @@ def test_c432_db_structure():
             assert 0 <= ec.tt <= 0xFFFF
             assert ec.tt not in (0x0000, 0xFFFF), f"tile eLUT {gi} has trivial TT"
         for (gi, gk), sel in tile.iib_mux.items():
-            assert 0 <= sel <= FB_BASE + N - 1, f"({gi},{gk}) sel {sel} out of range"
+            assert 0 <= sel <= IIB_SEL_MAX, f"({gi},{gk}) sel {sel} out of range"
             assert (gi, gk) in tile.iib_mux
+            kind, idx = iib_decode(sel, gk)                # R2: legal decode
+            if kind == "clb.I":
+                assert idx < EXT_IN and tile.cluster_inputs[idx] is not None
+            else:
+                assert 0 <= idx < N
 
 
 # =============================================================================
@@ -318,9 +430,9 @@ def test_tile_points_roundtrip():
             7: ElutConfig(tt=0xAAAA, ff_rst_en=True, ff_rst_val=True),
         },
         iib_mux={
-            (0, 0): 5, (0, 3): 18,        # mix of external (clb_in[5]) + feedback
+            (0, 0): 5, (0, 3): 18,        # mix of feedback (fb5) + ext (v2c sels)
             (3, 0): 0, (3, 1): 1,          # sel 0/1 preserved semantically via .get
-            (7, 2): 25,
+            (7, 2): IIB_SEL_MAX,           # max legal v2c sel (16+8)
         },
     )
     cfg = tile_to_config_points(tile)

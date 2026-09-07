@@ -26,8 +26,8 @@ module tb_frame_decoder;
 
   // ---- fabric/frame params (2x2 all-CLB, matches the helper) ----
   localparam int R = 2, C = 2, W = 12, N = 8, K = 4, EXT_IN = 18, SELW = 5;
-  localparam int MAX_WORDS = (R*548 + 31)/32;    // 35
-  localparam int NWORDS    = 35;                 // column_data_words(0)
+  localparam int MAX_WORDS = (R*530 + 31)/32;    // 34 (v2c: 530b/tile)
+  localparam int NWORDS    = 34;                 // column_data_words(0): 2x530=1060b -> 34 (v2c; was 35 at 548b/tile)
   localparam int FRAME_WORDS = NWORDS + 1;       // + CRC16 tail word in the .hex
 
   // ---- clock / reset ----
@@ -157,9 +157,9 @@ module tb_frame_decoder;
     // CB cb_sel_0 = 5 (CB unit2 intra0)
     d = find_data(mkaddr(0,2,0));
     chk(found && d == 32'd5, "cb_sel_0 decoded");
-    // CB cb_sel_17 = 40 (CB unit2 intra17)
+    // CB cb_sel_17 = 20 (v2c subset index k; CB unit2 intra17)
     d = find_data(mkaddr(0,2,17));
-    chk(found && d == 32'd40, "cb_sel_17 decoded");
+    chk(found && d == 32'd20, "cb_sel_17 decoded");
     // SB mux_n_0 = 1 (SB unit1 intra0)
     d = find_data(mkaddr(0,1,0));
     chk(found && d == 32'd1, "mux_n_0 Wilton sel decoded");

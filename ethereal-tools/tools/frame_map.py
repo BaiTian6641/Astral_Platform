@@ -11,11 +11,14 @@ Frame organization (C03 §1):
   * **blank frame** = explicit safe config (all-zero: tt=0, mux sel=0=disconnect,
     IO-T oe=0) — NOT "no config"; a deliberate electrical-quiescent pattern.
 
-Per-tile bitfields (frozen v1, match the RTL + spec notes):
+Per-tile bitfields (interconnect **v2c**, frozen spec interconnect-config-v0.md
+section 7.4; match the RTL + spec notes):
   * CLB-T : N eLUT4 x 20 bits  +  N*K IIB-mux x SELW bits    (8*20 + 32*5 = 320)
+            (IIB count unchanged; sel VALUES use the v2c section-7.2 encoding —
+            frame_map is semantics-agnostic)
   * SB    : 4 dirs x W x 2-bit sel  +  N_INJ inj_en x1 + N_INJ inj_dir x2  (4*12*2 + 8 + 16 = 120)
-  * CB    : N_CB clb_in mux x $clog2(4*W)-bit sel           (18*6 = 108)
-  * tile  = CLB + SB + CB                                     (548 bits)
+  * CB    : N_CB clb_in mux x $clog2(4*W/CB_DIV)-bit sel    (18*5 = 90, v2c)
+  * tile  = CLB + SB + CB                                     (530 bits, was 548)
 
 This module is pure Python (no simulator) -> unit-testable locally with pytest.
 Run:  make test-model   (root) once the find covers ethereal-tools.
@@ -80,10 +83,13 @@ def sb_tile_type(W: int = 12, N_INJ: int = 8) -> TileType:
     return TileType("switch_box", mux + inj_en + inj_dir)
 
 
-def cb_tile_type(W: int = 12, N_CB: int = 18) -> TileType:
-    """Input connection_block (routable CB Step 2): each clb_in[i] mux-selects
-    one of the 4*W local SB output tracks. sel width = $clog2(4*W) (=6 for W=12)."""
-    sel_w = max(1, (4 * W - 1).bit_length())   # $clog2(4*W): 6 for W=12
+def cb_tile_type(W: int = 12, N_CB: int = 18, CB_DIV: int = 2) -> TileType:
+    """Input connection_block (interconnect v2c, spec section 7.1): each
+    clb_in[i] mux-selects one of its stratified 4*W/CB_DIV-track subset of the
+    local SB output tracks. sel width = $clog2(4*W/CB_DIV) (=5 for
+    W=12/CB_DIV=2); the value is the **subset index k** (point names unchanged
+    from v1.1; value semantics per spec section 7.1)."""
+    sel_w = max(1, (4 * W // CB_DIV - 1).bit_length())  # $clog2(4*W/CB_DIV): 5
     pts = tuple(ConfigPoint(f"cb_sel_{i}", sel_w) for i in range(N_CB))
     return TileType("connection_block", pts)
 
@@ -148,6 +154,7 @@ class FrameMap:
     sel_w: int = 5
     n_regions: int = 1
     MEM_AW: int = 11
+    CB_DIV: int = 2                 # v2c CB stratification divisor (Fc=0.5)
     # TILE_LAYOUT[col][row] -> TILE_TYPE code. None = all-CLB (homogeneous v1).
     TILE_LAYOUT: list[list[int]] | None = None
     clb: TileType = field(init=False)
@@ -159,7 +166,7 @@ class FrameMap:
     def __post_init__(self) -> None:
         self.clb = clb_tile_type(self.N, self.K, self.sel_w)
         self.sb = sb_tile_type(self.W, self.N)            # N_INJ = N (clb_out count)
-        self.cblock = cb_tile_type(self.W, self.EXT_IN)   # N_CB = EXT_IN
+        self.cblock = cb_tile_type(self.W, self.EXT_IN, self.CB_DIV)  # N_CB = EXT_IN
         self.mem = mem_tile_type(self.MEM_AW)
         self.dsp = dsp_tile_type()
         if self.TILE_LAYOUT is not None:
@@ -326,10 +333,11 @@ class FrameMap:
     def to_json(self) -> dict:
         pts = self._tile_points()
         j = {
-            "version": "0.1",
+            "version": "0.2",
             "params": {"R": self.R, "C": self.C, "W": self.W, "N": self.N,
                        "K": self.K, "EXT_IN": self.EXT_IN, "sel_w": self.sel_w,
-                       "n_regions": self.n_regions, "MEM_AW": self.MEM_AW},
+                       "n_regions": self.n_regions, "MEM_AW": self.MEM_AW,
+                       "CB_DIV": self.CB_DIV},
             "tile_width_bits": self.tile_width,
             "column_bits": self.column_bits,
             "data_words_per_frame": self.data_words_per_frame,

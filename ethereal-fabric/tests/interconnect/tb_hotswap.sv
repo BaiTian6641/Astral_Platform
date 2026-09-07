@@ -14,13 +14,16 @@
 // Created:     2026-07-26
 // Tags:        RTL, TESTBENCH
 // Plan-Ref:    ethereal-plan/phases/phase-0-*.md (dual-image hot-swap demo)
-// Notes:       cfg layout (fabric_top v1.1, 2x2 grid TIW=2):
+// Notes:       cfg layout (fabric_top v2c, 2x2 grid TIW=2):
 //                cfg_addr = {tile_idx[9:8], unit[7:6], intra[5:0]}
 //                unit 2'b00=CLB. intra 0..7 = eLUT4 #(intra); 8..39 = IIB mux #(intra-8).
 //              eLUT4 cfg_data[19:0] = {tt[19:4], ff_en[3], ff_rst_en[2], ff_rst_val[1], out_inv[0]}.
 //              Image A eLUT4[0]: tt=0x5555 (NOT pin0), ff_en=1, ff_rst_en=1, ff_rst_val=0
-//                -> registered ~clb_out[0] -> TOGGLE. IIB pin0 sel=18 (clb_out[0] feedback).
+//                -> registered ~clb_out[0] -> TOGGLE. IIB pins sel=0 = fb j=0 (clb_out[0]
+//                feedback; v2c §7.2 translation of v1.1 sel=18: fb p=18+j -> sel=j).
 //              Image B eLUT4[0]: tt=0xFFFF (const 1), ff_en=1, ff_rst_en=1, ff_rst_val=1 -> const 1.
+//              v2c note (§7.7): blank sel=0 now reads fb j=0, so this self-contained
+//              TFF pattern is the hardware default after a blank (was clb_in[0] in v1.1).
 `timescale 1ns/1ps
 
 module tb_hotswap;
@@ -71,13 +74,14 @@ module tb_hotswap;
         // ============================================================
         // eLUT4[0] @ tile0: addr {2'b00,2'b00,6'd0}=0x0000 ; data tt=0x5555,ff_en,ff_rst_en
         cfg_write(16'h0000, 32'h0005555C);   // tt=0x5555, ff_en=1, ff_rst_en=1, ff_rst_val=0
-        // IIB mux0..3 (eLUT4[0] pins 0-3) @ tile0: ALL sel=18 (clb_out[0] feedback).
+        // IIB mux0..3 (eLUT4[0] pins 0-3) @ tile0: ALL sel=0 (v2c: fb j=0 =
+        // clb_out[0] feedback, §7.2; v1.1 wrote sel=18 for the same pool entry).
         // Makes eLUT4[0] self-contained — vin depends only on its own clean FF
         // output, not on X reset-less clb_in/CB/SB (iverilog X-propagation guard).
-        cfg_write(16'h0008, 32'h00000012);   // intra 8  = mux(gi0,gk0)
-        cfg_write(16'h0009, 32'h00000012);   // intra 9  = mux(gi0,gk1)
-        cfg_write(16'h000A, 32'h00000012);   // intra 10 = mux(gi0,gk2)
-        cfg_write(16'h000B, 32'h00000012);   // intra 11 = mux(gi0,gk3)
+        cfg_write(16'h0008, 32'h00000000);   // intra 8  = mux(gi0,gk0): sel=0 = fb j=0
+        cfg_write(16'h0009, 32'h00000000);   // intra 9  = mux(gi0,gk1): sel=0 = fb j=0
+        cfg_write(16'h000A, 32'h00000000);   // intra 10 = mux(gi0,gk2): sel=0 = fb j=0
+        cfg_write(16'h000B, 32'h00000000);   // intra 11 = mux(gi0,gk3): sel=0 = fb j=0
 
         do_reset();                          // clb_out[0] -> 0 (ff_rst_val)
 
@@ -108,10 +112,10 @@ module tb_hotswap;
         // IMAGE B: constant-1 on tile(0,0) eLUT4[0] -> clb_out_obs[0] = 1
         // ============================================================
         cfg_write(16'h0000, 32'h000FFFFE);   // tt=0xFFFF, ff_en=1, ff_rst_en=1, ff_rst_val=1
-        cfg_write(16'h0008, 32'h00000012);   // mux0..3 = 18 (re-set after blank; self-contained)
-        cfg_write(16'h0009, 32'h00000012);
-        cfg_write(16'h000A, 32'h00000012);
-        cfg_write(16'h000B, 32'h00000012);
+        cfg_write(16'h0008, 32'h00000000);   // mux0..3 = 0 (fb j=0; re-set after blank, self-contained)
+        cfg_write(16'h0009, 32'h00000000);
+        cfg_write(16'h000A, 32'h00000000);
+        cfg_write(16'h000B, 32'h00000000);
 
         do_reset();                          // clb_out[0] -> 1 (ff_rst_val=1)
 

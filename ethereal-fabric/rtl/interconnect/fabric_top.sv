@@ -25,6 +25,11 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB3)
+//              2026-09-02 - interconnect v2c (E2-FAB5, FROZEN spec §7): CB cfg
+//                            data payload narrows 6->5 bits (subset index k,
+//                            §7.1/§7.4). SB + CLB(IIB) cfg addressing unchanged;
+//                            het tile paths (mem_t/dsp_t) do not touch CB/IIB
+//                            config encoding and are unaffected.
 //              2026-07-25 - routable CB Step 2: connection_block integrated
 //              2026-07-26 - bidirectional inject + Wilton SB (v1.1)
 //              2026-07-28 - HETEROGENEOUS: TILE_TYPE map + mem_t/dsp_t + cfg
@@ -33,13 +38,16 @@
 //                            (hard-block output -> SB inject) + vbus-IN mux (CB
 //                            tracks -> operand inputs) via cfg unit 11 intra 6/7.
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §3 §5 ·
+// Plan-Ref:    ethereal-spec/fabric/interconnect-config-v0.md §7 (v2c FROZEN) ·
+//              ethereal-plan/components/C01-fabric-核心单元.md §3 §5 ·
 //              ethereal-plan/components/C02-fabric-异构tile.md §0 §5
 // Notes:       config addressing (v1.1 + het):
 //   cfg_addr_i = {tile_idx[TIW-1:0] @ bits [7+TIW:8], unit[1:0] @ [7:6],
 //                 intra[5:0] @ [5:0]}
 //   unit: 2'b00=CLB (clb_t), 2'b01=SB (switch_box), 2'b10=CB (connection_block),
 //         2'b11=TILE-MODE / vbus-control (heterogeneous tiles; CLB ignores it).
+//   v2c (§7.4): only the CB unit's data payload narrows — cfg_data_i[4:0] is the
+//   subset index k (was [5:0] absolute track index); all addressing unchanged.
 //   TILE-MODE intra (per TILE_TYPE):
 //     MEM_T (TILE_TYPE=1): intra=0 -> mem mode_r[15:0]; intra=1 -> vbus-ctrl
 //         word A (va_i[13:0] @ [13:0], ven_i @ [16], vwe_i[3:0] @ [21:18]);
@@ -84,7 +92,8 @@ module fabric_top #(
     localparam int TIW    = $clog2(NTILES);
     localparam int AW_SB  = $clog2(4*W+N);
     localparam int AW_CB  = $clog2(EXT_IN);
-    localparam int TW_CB  = $clog2(4*W);
+    localparam int CB_DIV = 2;                 // v2c CB stratified depopulation (§7.1)
+    localparam int TW_CB  = $clog2(4*W/CB_DIV); // v2c: 5-bit CB subset index k (§7.4)
     localparam int ADDR_USED = 8 + TIW;
 
     // TILE_TYPE extraction helper (8-bit entry at index idx, LSB-first).
@@ -285,8 +294,8 @@ module fabric_top #(
                     .out_w      (sb_out_w[r][c])
                 );
 
-                // ---- input connection_block ----
-                connection_block #(.W(W), .N_CB(EXT_IN)) u_cb (
+                // ---- input connection_block (v2c: 5-bit subset index k, §7.1/§7.4) ----
+                connection_block #(.W(W), .N_CB(EXT_IN), .CB_DIV(CB_DIV)) u_cb (
                     .clk_i      (clk_i),
                     .cfg_we_i   (cb_cfg_we),
                     .cfg_addr_i (intra[AW_CB-1:0]),

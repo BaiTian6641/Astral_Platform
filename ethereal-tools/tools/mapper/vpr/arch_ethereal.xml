@@ -30,17 +30,18 @@
                                                 (Our Option-B router on the hand-built
                                                 fabric is authoritative; this arch is
                                                 kept consistent for VPR pack/place parity.)
-    Connection block       <-> connection_block (input CB = full mux of 4*W tracks;
-                                                output = clb_out -> out_e inject).
+    Connection block       <-> connection_block (input CB = v2c stratified mux:
+                                                each clb_in reads 24 of 4*W
+                                                tracks; output = clb_out inject).
     Segment                : length-1 unidir (per-tile SB hop), R/Cmetal ~0 (sim arch).
 
   === ASSUMPTIONs (G6, TBD 2026-07-25) ===
-  A. fc in/out = 0.25/0.25 is a ROUTABILITY approximation, NOT an exact match to
-     the implemented CB connectivity (input CB is a full 4*W mux → in_val=1.0 is
-     the faithful value; output injects onto out_e only). Exact rr_graph -> mux
-     mapping is performed by bitgen (E0-MAP3) using the SB-topology table from
-     fabric_gen; this arch only needs to be routable for E0-MAP2's acceptance
-     ("VPR pack/place/route on c432, timing report readable").
+  A. fc in/out = 0.5/0.25 (clb tile; v2c spec section 7.6, 2026-09-01). Under
+     interconnect v1.1 the input CB was a full 4*W mux and in_val=1.0 was the
+     faithful value; v2c (section 7.1) is Fc=0.5 stratified depopulation, so
+     in_val=0.5 is now faithful. VPR applies its own Fc pattern; the exact
+     parity mapping (t mod 2 == clb_in i mod 2) is performed by bitgen
+     (E0-MAP3) — same convention as before.
   B. Timing values are inherited verbatim from VTR's k4_N4_90nm.xml (90nm PTM) so
      the timing report is readable; they are NOT the real Ethereal-fabric delays
      (no silicon/timing-characterization yet — Phase 1+).
@@ -272,8 +273,15 @@
         </mode>
       </pb_type>
 
-      <!-- flat full-input crossbar: clb.I + all fle.out -> every fle.in
-           (mirrors clb_t IIB: 18 ext + 8 feedback = 26 sources) -->
+      <!-- flat full-input crossbar: clb.I + all fle.out -> every fle.in.
+           v2c (spec interconnect-config-v0.md section 7.6): this complete
+           crossbar is deliberately KEPT as a connectivity SUPERSET — pack/
+           place stays valid and unchanged. The v2c IIB (section 7.2) keeps
+           all 8 feedback entries on every mux but restricts ext pin i to the
+           two LUT pins of its parity class; that restriction is enforced at
+           bitgen by the class-aware pin-assignment solver (bitgen_db,
+           section 7.2 R1-R3), not here. Exact arch modeling (splitting clb.I
+           into I_EVEN/I_ODD ports) is a future refinement, NOT part of v2c. -->
       <interconnect>
         <complete name="crossbar" input="clb.I fle[7:0].out" output="fle[7:0].in">
           <delay_constant max="5.735000e-11" in_port="clb.I"      out_port="fle[7:0].in"/>
@@ -283,11 +291,13 @@
         <direct  name="clbouts1" input="fle[7:0].out" output="clb.O"/>
       </interconnect>
 
-      <!-- fc in_val=1.0 = FAITHFUL to the implemented connection_block: each
-           clb_in is a full mux over all 4*W local tracks (any input reads any
-           track). out_val=0.25 approximates clb_out injecting onto out_e only
-           (1 of 4 dirs). Exact rr_graph->mux mapping is bitgen's job (E0-MAP3). -->
-      <fc in_type="frac" in_val="1.0" out_type="frac" out_val="0.25"/>
+      <!-- v2c (spec section 7.6): fc in_val 1.0 -> 0.5. The v2c connection
+           block (section 7.1) is Fc=0.5 stratified depopulation: each clb_in
+           reads 24 of the 48 local tracks (t mod 2 == i mod 2). VPR applies
+           its own Fc pattern; the exact parity mapping is bitgen's job (same
+           convention as the previous "Exact rr_graph->mux mapping is bitgen's
+           job" note). out_val=0.25 unchanged (clb_out injects onto one dir). -->
+      <fc in_type="frac" in_val="0.5" out_type="frac" out_val="0.25"/>
       <pinlocations pattern="spread"/>
     </pb_type>
 

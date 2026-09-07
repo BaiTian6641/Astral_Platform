@@ -4,7 +4,10 @@
 Task E0-SHL3. Every figure quoted in docs/performance-model.md is produced by this script.
 
 Sources of truth:
-  * frame_map.FrameMap            — per-tile config bitfields (v1.1: CLB+SB+CB)
+  * frame_map.FrameMap            — per-tile config bitfields (interconnect v2c:
+                                    CLB 320 + SB 120 + CB 90 = 530 bits/tile,
+                                    frozen spec interconnect-config-v0.md
+                                    section 7.4)
   * occ_top.sv FSM (occ/occ_top.sv) — WRITE/BLANK/READBACK cycle counts
   * report-E0-MAP2 / incr4c Wilton — VPR c432 CPD/Fmax (cited, not recomputed)
 
@@ -105,7 +108,7 @@ def spi_us(total_bytes: int, f_mhz: float) -> float:
 
 
 def main() -> None:
-    print("=== Config geometry (v1.1 tile = CLB 320 + SB 120 + CB 108 = 548 bits) ===")
+    print("=== Config geometry (v2c tile = CLB 320 + SB 120 + CB 90 = 530 bits) ===")
     fm = FrameMap()
     print(f"tile_width={fm.tile_width} (clb={fm.clb.width} sb={fm.sb.width} cb={fm.cblock.width})")
     g22, g44 = hom_geometry(2, 2), hom_geometry(4, 4)

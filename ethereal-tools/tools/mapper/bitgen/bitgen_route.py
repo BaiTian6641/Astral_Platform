@@ -35,7 +35,9 @@ PathFinder picks ONE per contended wire):
                       per (dst,t); track-permuting — a signal CHANGES track
                       index at each SB hop).
   * inject (CB out): ``(r,c,"clb_out",j) -> (r,c,"out",D,j)``  D∈{n,s,e,w}, j<N_INJ
-  * CB (CB in):      ``(r,c,"out",D,t) -> (r,c,"clb_in",i)``    all D,t,i
+  * CB (CB in):      ``(r,c,"out",D,t) -> (r,c,"clb_in",i)``    v2c subset only:
+                      tracks with (DIR_IDX[D]*W+t) mod CB_DIV == i mod CB_DIV
+                      (CB_DIV=2, Fc=0.5, frozen spec section 7.1)
 
 CRITICAL structural fact (Wilton SB + bidirectional inject model):
 a net driven by ``clb_out[j]`` EXITS onto ``out_D[j]`` (track ``j``, ONE exit
@@ -96,12 +98,13 @@ from bitgen_db import EXT_IN, N, FabricConfigDB  # noqa: E402
 from bitgen_pack import db_grid_bounds  # noqa: E402
 from cb_model import ConnectionBlock  # noqa: E402
 from fabric_model import CHAN_MAP, FabricGrid  # noqa: E402
-from sb_model import DIRS, _wilton_track, sources  # noqa: E402
+from sb_model import DIR_IDX, DIRS, _wilton_track, sources  # noqa: E402
 
 # ---- frozen fabric topology constants (mirror FabricGrid defaults / frame_map)
 FABRIC_W = 12
 FABRIC_N_INJ = N          # 8 — inject_en count (== clb_out count)
 FABRIC_EXT_IN = EXT_IN    # 18 — clb_in count
+FABRIC_CB_DIV = 2         # interconnect v2c (spec section 7.1): CB Fc=0.5
 
 
 # =============================================================================
@@ -132,7 +135,7 @@ class TileRoute:
 
     sb_sel: dict[tuple[str, int], int] = field(default_factory=dict)   # (dir,t)->sel
     inject: dict[int, str] = field(default_factory=dict)               # j -> dir
-    cb_sel: dict[int, int] = field(default_factory=dict)               # clb_in i -> track
+    cb_sel: dict[int, int] = field(default_factory=dict)               # clb_in i -> subset k (v2c)
 
 
 @dataclass
@@ -232,7 +235,14 @@ def _build_possibility_graph(
       ``("chan",)``             fixed channel (no config)
       ``("sb", dst_dir, t, src)``  SB mux  -> sb_sel[(dst_dir,t)] = sel(src)
       ``("inj", j, d)``         inject  -> inject{j: d}  (D in {n,s,e,w})
-      ``("cb", i, dir, t)``     CB      -> cb_sel[i] = track_index(dir,t)
+      ``("cb", i, dir, t)``     CB      -> cb_sel[i] = subset_index(i, track)
+
+    Interconnect v2c (frozen spec section 7.1, CB_DIV=2): the CB possibility
+    edges are PRUNED to the stratified subset — ``out_d[t] -> clb_in[i]`` only
+    when ``(DIR_IDX[d]*W + t) mod CB_DIV == i mod CB_DIV`` (with even W this is
+    simply ``t mod 2 == i mod 2``: 24 of 48 tracks per input, Fc=0.5). This
+    mirrors the reference ``generated/icopt/route/route_check.py`` (knob
+    ``cb_div=2``) and the v2c connection_block RTL exactly.
     """
     adj: dict[tuple, list[tuple[tuple, tuple]]] = defaultdict(list)
 
@@ -276,10 +286,15 @@ def _build_possibility_graph(
             for j in range(N_INJ):
                 for d in DIRS:
                     add((r, c, "clb_out", j), (r, c, "out", d, j), ("inj", j, d))
-            # 4. CB possibility edges: out_dir[t] -> clb_in[i] (sinks only)
+            # 4. CB possibility edges: out_dir[t] -> clb_in[i] (sinks only),
+            #    pruned to the v2c stratified subset (section 7.1): clb_in[i]
+            #    reads only tracks with t mod CB_DIV == i mod CB_DIV (W even).
             for i in sinks_by_tile.get((r, c), ()):
                 for d in DIRS:
                     for t in range(W):
+                        p = DIR_IDX[d] * W + t
+                        if p % FABRIC_CB_DIV != i % FABRIC_CB_DIV:
+                            continue      # not in clb_in[i]'s track subset
                         add((r, c, "out", d, t), (r, c, "clb_in", i),
                             ("cb", i, d, t))
     return adj
@@ -439,6 +454,10 @@ def route(
             routable.append(n)
 
     if not routable:
+        # no routable inter nets (e.g. a pure feed-through design like
+        # present_round, whose S-box layer is one LUT per PO under the v2c
+        # don't-care-drop): the routing problem is VACUOUSLY solved.
+        rc.converged = True
         return rc
 
     # collect sink clb_in nodes (for CB-edge pruning) + build possibility graph
@@ -451,6 +470,7 @@ def route(
     # A net unreachable in the possibility graph is permanently unroutable.
     active: list[Net] = []
     for n in routable:
+        assert n.driver_node is not None        # routable nets always have one
         dist, _prev = _dijkstra(adj, n.driver_node, {}, defaultdict(int))
         if all(s in dist for s in n.sink_nodes):
             active.append(n)
@@ -555,7 +575,11 @@ def _populate_tiles(
                 tr.inject[j] = d
             elif kind == "cb":
                 _, i, d, t = meta
-                tr.cb_sel[i] = ConnectionBlock.track_index(d, t, W)
+                # v2c: cb_sel stores the SUBSET INDEX k (not the absolute
+                # track). The pruned possibility graph guarantees parity, so
+                # k = floor(p / CB_DIV) (spec section 7.1 translation).
+                p = ConnectionBlock.track_index(d, t, W)
+                tr.cb_sel[i] = p // FABRIC_CB_DIV
             # "chan" contributes no per-tile config
 
 
@@ -578,5 +602,5 @@ def apply_route_to_grid(grid: FabricGrid, rc: RouteConfig) -> None:
         for j, d in tr.inject.items():
             sb.inject(j, True, d)
         cb = grid.cb[r][c]
-        for i, track in tr.cb_sel.items():
-            cb.configure(i, track)
+        for i, k in tr.cb_sel.items():
+            cb.configure(i, k)          # v2c: cb_sel holds the subset index k

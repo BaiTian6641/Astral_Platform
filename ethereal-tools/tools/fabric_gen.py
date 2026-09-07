@@ -23,6 +23,7 @@ Descriptor schema (YAML or JSON), all keys optional with v1 defaults:
   EXT_IN     : external cluster inputs  (default 18)
   sel_w      : IIB mux select width     (default 5)
   n_regions  : region count             (default 1)
+  CB_DIV     : CB stratification divisor (default 2 = interconnect v2c Fc=0.5)
 
 Run:  python fabric_gen.py fabric.yaml -o generated/fabricA/
 """
@@ -38,8 +39,8 @@ from dataclasses import dataclass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from frame_map import FrameMap, TT_CLB, TT_MEM, TT_DSP  # noqa: E402
 
-DEFAULTS = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18, sel_w=5, n_regions=1)
-INT_KEYS = ("R", "C", "W", "N", "K", "EXT_IN", "sel_w", "n_regions")
+DEFAULTS = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18, sel_w=5, n_regions=1, CB_DIV=2)
+INT_KEYS = ("R", "C", "W", "N", "K", "EXT_IN", "sel_w", "n_regions", "CB_DIV")
 
 
 @dataclass
@@ -54,6 +55,7 @@ class FabricGen:
     EXT_IN: int
     sel_w: int
     n_regions: int
+    CB_DIV: int
     MEM_AW: int = 11
     # tile_types[col][row] -> "clb_t"|"mem_t"|"dsp_t" (heterogeneous, Phase-1).
     # None = homogeneous all-CLB (v1). Per-column list of per-row type names.
@@ -82,7 +84,7 @@ class FabricGen:
         self.fm = FrameMap(R=self.R, C=self.C, W=self.W, N=self.N, K=self.K,
                            EXT_IN=self.EXT_IN, sel_w=self.sel_w,
                            n_regions=self.n_regions, MEM_AW=self.MEM_AW,
-                           TILE_LAYOUT=layout)
+                           CB_DIV=self.CB_DIV, TILE_LAYOUT=layout)
 
     # -- factories ----------------------------------------------------------
     @classmethod

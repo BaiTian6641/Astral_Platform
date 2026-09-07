@@ -6,15 +6,18 @@ Plan-Ref: ethereal-plan/components/C-soft-工具与固件组件.md §2 (task E0-
           of input net values and returns the cluster's driven nets. Mirrors the
           clb_t.sv / elut4.sv hardware semantics:
 
-              vin = {pin3,pin2,pin1,pin0}            (pin0 = LSB)
-              comb = tt[vin]                          (physical-order TT)
-              muxed = ff_state[gi] if ff_en else comb (registered vs combinational)
-              vout  = muxed ^ out_inv
+          vin = {pin3,pin2,pin1,pin0}            (pin0 = LSB)
+          comb = tt[vin]                          (physical-order TT)
+          muxed = ff_state[gi] if ff_en else comb (registered vs combinational)
+          vout  = muxed ^ out_inv
 
-          Pool select 0..17 = external ``clb_in`` net, 18..25 = feedback from
-          eLUT4 ``(sel-18)``. Combinational feedback (virtual loops, legal user
-          logic per C01 §2.4) is resolved by iterating to a fixpoint; for
-          acyclic combinational clusters (e.g. c17) one pass suffices.
+          IIB selects use the interconnect **v2c** encoding (frozen spec
+          section 7.2, decoded by ``bitgen_db.iib_decode``): ``sel[4]=0`` ->
+          feedback eLUT4 ``j = sel[2:0]``; ``sel[4]=1`` -> external ``clb_in``
+          pin ``{sel[3:0], gk mod 2}``. Combinational feedback (virtual loops,
+          legal user logic per C01 §2.4) is resolved by iterating to a
+          fixpoint; for acyclic combinational clusters (e.g. c17) one pass
+          suffices.
 
           FF modelling is intentionally minimal: ``ff_state`` is an opaque
           stored-state map supplied by the caller (a clocked driver is a later
@@ -23,7 +26,7 @@ Plan-Ref: ethereal-plan/components/C-soft-工具与固件组件.md §2 (task E0-
 """
 from __future__ import annotations
 
-from bitgen_db import EXT_IN, FB_BASE, K, N, ElutConfig, TileLogic
+from bitgen_db import K, N, ElutConfig, TileLogic, iib_decode
 
 
 def simulate_tile(
@@ -49,11 +52,14 @@ def simulate_tile(
         vin = 0
         for gk in range(K):
             sel = tile.iib_mux.get((gi, gk), 0)
-            if sel < EXT_IN:
-                net = tile.cluster_inputs.get(sel)
+            kind, idx = iib_decode(sel, gk)
+            if kind == "clb.I":
+                # reserved sels (pin >= EXT_IN) are MUST-NOT-PROGRAM (section
+                # 7.2); guard to 0 like the pool padding reads.
+                net = tile.cluster_inputs.get(idx) if idx < len(tile.cluster_inputs) else None
                 bit = input_bits.get(net, 0) if net is not None else 0
             else:
-                bit = clb_out.get(sel - FB_BASE, 0)
+                bit = clb_out.get(idx, 0)
             vin |= (bit & 1) << gk
         if ec.ff_en:
             muxed = ff_state.get(gi, 1 if ec.ff_rst_val else 0) & 1

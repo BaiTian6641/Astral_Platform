@@ -22,12 +22,14 @@ V1 = dict(R=4, C=4, W=12, N=8, K=4, EXT_IN=18)
 def test_bitfield_widths():
     assert clb_tile_type().width == 8 * 20 + 32 * 5 == 320
     assert sb_tile_type().width == 4 * 12 * 2 + 8 + 8 * 2 == 120   # mux + inj_en + inj_dir
-    assert cb_tile_type().width == 18 * 6 == 108            # N_CB sel x $clog2(4W)=6
+    # v2c section 7.1: N_CB sel x $clog2(4W/CB_DIV) = 18 x 5 = 90 (was 108)
+    assert cb_tile_type().width == 18 * 5 == 90
+    assert cb_tile_type(CB_DIV=1).width == 18 * 6 == 108    # DIV=1 == v1.1
     fm = FrameMap(**V1)
-    assert fm.tile_width == 548                             # CLB 320 + SB 120 + CB 108
-    assert fm.column_bits == 4 * 548 == 2192
-    assert fm.data_words_per_frame == (2192 + 31) // 32 == 69
-    assert fm.words_per_frame == 70             # +1 CRC tail word
+    assert fm.tile_width == 530                             # CLB 320 + SB 120 + CB 90
+    assert fm.column_bits == 4 * 530 == 2120
+    assert fm.data_words_per_frame == (2120 + 31) // 32 == 67
+    assert fm.words_per_frame == 68             # +1 CRC tail word
 
 
 # ---- 1b. heterogeneous tile types (Phase-1, Stage 4) ------------------------
@@ -41,12 +43,14 @@ def test_het_layout_geometry():
     # 2x2: col0=[MEM,CLB], col1=[CLB,DSP]  (matches fabric_2x2_het.yaml)
     layout = [[TT_MEM, TT_CLB], [TT_CLB, TT_DSP]]
     fm = FrameMap(R=2, C=2, TILE_LAYOUT=layout)
-    # col0 = (CB108+SB120+MEM70) + (CB108+SB120+CLB320) = 298+548 = 846 bits
-    assert fm.column_bits_at(0) == 846
-    # col1 = (CB108+SB120+CLB320) + (CB108+SB120+DSP118) = 548+346 = 894 bits
-    assert fm.column_bits_at(1) == 894
-    assert fm.column_data_words(0) == (846 + 31) // 32
-    assert fm.column_data_words(1) == (894 + 31) // 32
+    # v2c: CLB tile = CB90+SB120+CLB320 = 530; MEM tile = CB90+SB120+MEM70 = 280;
+    # DSP tile = CB90+SB120+DSP118 = 328 (CB+SB are in EVERY column, so the
+    # 548->530 CB shrink moves every het column too).
+    # col0 = 280+530 = 810 bits; col1 = 530+328 = 858 bits
+    assert fm.column_bits_at(0) == 810
+    assert fm.column_bits_at(1) == 858
+    assert fm.column_data_words(0) == (810 + 31) // 32 == 26
+    assert fm.column_data_words(1) == (858 + 31) // 32 == 27
     # per-tile-type points: base CB+SB + logic
     mem_pts = {p.name for p in fm.tile_points_at(0, 0)}
     assert {"cb_sel_0", "mux_n_0", "inj_en_0", "mem_mode", "mem_vd_i"} <= mem_pts
@@ -180,10 +184,11 @@ def test_blank_crc_consistency():
 def test_to_json_structure():
     fm = FrameMap(**V1)
     j = fm.to_json()
-    assert j["version"] == "0.1"
+    assert j["version"] == "0.2"                    # interconnect v2c (section 7.5)
     assert j["params"]["R"] == 4 and j["params"]["C"] == 4
-    assert j["data_words_per_frame"] == 69
-    assert j["words_per_frame"] == 70
+    assert j["params"]["CB_DIV"] == 2
+    assert j["data_words_per_frame"] == 67
+    assert j["words_per_frame"] == 68
     assert j["crc"]["tail_word"] is True
     assert len(j["tile_points"]) == 8 + 32 + 48 + 8 + 8 + 18  # 8 elut + 32 iib + 48 sb-mux + 8 inj_en + 8 inj_dir + 18 cb = 122
     # round-trip serializable

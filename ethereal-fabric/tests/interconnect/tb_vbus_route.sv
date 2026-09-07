@@ -32,10 +32,13 @@
 // Notes:       cfg layout (1x2, TIW=1): cfg_addr = {tile_idx[8], unit[7:6], intra[5:0]}.
 //   unit 2'b00=CLB, 2'b01=SB, 2'b10=CB, 2'b11=TILE-MODE/vbus. tile0=MEM_T, tile1=CLB.
 //   SB (W=12): cfg_addr 0..47 = Wilton sel; 48..55 = inject[en@0, dir@2:1] (0=N,1=S,2=E,3=W).
-//   CB (W=12): cfg_addr 0..17 = clb_in idx; data = track idx (pool {out_w,out_e,out_s,out_n},
+//   CB (W=12, v2c §7.1): cfg_addr 0..17 = clb_in idx; data[4:0] = subset index k,
+//              clb_in[i] = pool[(i%2)+2k] (pool {out_w,out_e,out_s,out_n},
 //              out_n@[0..11], out_s@[12..23], out_e@[24..35], out_w@[36..47]).
+//              clb_in[i] <- out_e[i] is legal (24+i ≡ i mod 2) with k=12+i/2.
 //   eLUT4 cfg_data[19:0]: [19:4]=tt, [3]=ff_en, [2]=ff_rst_en, [1]=ff_rst_val, [0]=out_inv.
-//   CLB IIB cfg_addr: 0..7=eLUT#; 8..39=mux# (8+gi*K+gk), data[4:0]=pool idx (clb_in@[0..17]).
+//   CLB IIB (v2c §7.2) cfg_addr: 0..7=eLUT#; 8..39=mux# (8+gi*K+gk), data[4:0]=sel:
+//              sel[4]=1 -> ext pin 2*sel[3:0]+(m%2); sel[4]=0 -> feedback j=sel[2:0].
 `timescale 1ns/1ps
 
 module tb_vbus_route;
@@ -108,20 +111,30 @@ module tb_vbus_route;
         // TEST A — vbus-OUT: MEM vd_o[3:0] -> SB inject -> CB -> CLB buffer
         // ================================================================
         // tile0 CLB: 4 eLUTs as combinational buffers (clb_out[k]=clb_in[k]).
-        //   tt=0xAAAA -> out=i0; ff_en=0. cfg_data[19:0]=0xAAAA0.
         //   NOTE: a LUT4 is indexed by ALL 4 inputs -> if any input bit is X the
-        //   read is X. So wire all 4 inputs of eLUT[k] to pool[k]=clb_in[k]; then
-        //   the index is {clb_in[k]}x4 (fully defined once the CB drives it) and
-        //   tt=0xAAAA still yields out=clb_in[k] (tt[0]=0, tt[15]=1).
-        cw(0, 2'b00, 0, 32'h000AAAA0);
-        cw(0, 2'b00, 1, 32'h000AAAA0);
-        cw(0, 2'b00, 2, 32'h000AAAA0);
-        cw(0, 2'b00, 3, 32'h000AAAA0);
-        // IIB: eLUT[k] inputs 0..3 all <- pool[k]=clb_in[k]. cfg_addr=8+4k+gk, data=k.
-        cw(0, 2'b00, 8,  32'd0); cw(0, 2'b00, 9,  32'd0); cw(0, 2'b00, 10, 32'd0); cw(0, 2'b00, 11, 32'd0);
-        cw(0, 2'b00, 12, 32'd1); cw(0, 2'b00, 13, 32'd1); cw(0, 2'b00, 14, 32'd1); cw(0, 2'b00, 15, 32'd1);
-        cw(0, 2'b00, 16, 32'd2); cw(0, 2'b00, 17, 32'd2); cw(0, 2'b00, 18, 32'd2); cw(0, 2'b00, 19, 32'd2);
-        cw(0, 2'b00, 20, 32'd3); cw(0, 2'b00, 21, 32'd3); cw(0, 2'b00, 22, 32'd3); cw(0, 2'b00, 23, 32'd3);
+        //   read is X, so ALL 4 pins of each eLUT must be DEFINED. v2c §7.2 R2:
+        //   pin gk of a LUT only reaches ext pins with i%2 == gk%2, so the old
+        //   "all 4 pins = clb_in[k]" pattern is no longer expressible. Instead:
+        //     - the ACTIVE pin (gk matching k's parity) selects clb_in[k] via
+        //       sel = 16 + k/2 (ext pin 2*(k/2) + gk%2 = k);
+        //     - the other-parity pins are parked on a DEFINED same-parity ext
+        //       (clb_in[0]/clb_in[1] via sel=16), ignored by the truth table;
+        //     - even k uses tt=0xAAAA (out=vin[0], active pin gk=0);
+        //       odd k uses tt=0xCCCC (out=vin[1], active pin gk=1).
+        //   cfg_data[19:0] = tt<<4 (ff_en=0): 0xAAAA0 / 0xCCCC0.
+        cw(0, 2'b00, 0, 32'h000AAAA0);   // eLUT0: out = vin[0]
+        cw(0, 2'b00, 1, 32'h000CCCC0);   // eLUT1: out = vin[1]
+        cw(0, 2'b00, 2, 32'h000AAAA0);   // eLUT2: out = vin[0]
+        cw(0, 2'b00, 3, 32'h000CCCC0);   // eLUT3: out = vin[1]
+        // IIB (v2c sel): cfg_addr=8+4k+gk. sel=16 -> ext pin (m%2); sel=17 -> ext pin 2+(m%2).
+        //   eLUT0 (buf clb_in[0]): gk0->ext0 (sel16), gk1->ext1 (sel16), gk2->ext0, gk3->ext1
+        cw(0, 2'b00, 8,  32'd16); cw(0, 2'b00, 9,  32'd16); cw(0, 2'b00, 10, 32'd16); cw(0, 2'b00, 11, 32'd16);
+        //   eLUT1 (buf clb_in[1]): gk0->ext0 (sel16), gk1->ext1 (sel16, ACTIVE), gk2/3 same
+        cw(0, 2'b00, 12, 32'd16); cw(0, 2'b00, 13, 32'd16); cw(0, 2'b00, 14, 32'd16); cw(0, 2'b00, 15, 32'd16);
+        //   eLUT2 (buf clb_in[2]): gk0->ext2 (sel17, ACTIVE), gk1->ext1 (sel16), gk2->ext2, gk3->ext1
+        cw(0, 2'b00, 16, 32'd17); cw(0, 2'b00, 17, 32'd16); cw(0, 2'b00, 18, 32'd17); cw(0, 2'b00, 19, 32'd16);
+        //   eLUT3 (buf clb_in[3]): gk0->ext0 (sel16), gk1->ext3 (sel17, ACTIVE), gk2->ext0, gk3->ext3
+        cw(0, 2'b00, 20, 32'd16); cw(0, 2'b00, 21, 32'd17); cw(0, 2'b00, 22, 32'd16); cw(0, 2'b00, 23, 32'd17);
         // vbus-OUT select: MEM vd_o low bits drive the SB inject.
         cw(0, 2'b11, 6, 32'h1);              // vbus_out_sel = 1
         // SB inject: clb_out_for_sb[0..3] -> out_e[0..3] (dir=E=2 -> data[2:0]=101=5).
@@ -129,11 +142,12 @@ module tb_vbus_route;
         cw(0, 2'b01, 49, 32'd5);
         cw(0, 2'b01, 50, 32'd5);
         cw(0, 2'b01, 51, 32'd5);
-        // CB: clb_in[0..3] <- out_e[0..3] (out_e pool base = 2*W = 24).
-        cw(0, 2'b10, 0, 32'd24);
-        cw(0, 2'b10, 1, 32'd25);
-        cw(0, 2'b10, 2, 32'd26);
-        cw(0, 2'b10, 3, 32'd27);
+        // CB (v2c §7.1): clb_in[i] <- out_e[i] = pool[24+i]; parity 24+i ≡ i (mod 2)
+        // is legal for every i, with subset index k = floor((24+i)/2) = 12 + i/2.
+        cw(0, 2'b10, 0, 32'd12);   // clb_in[0] <- out_e[0]
+        cw(0, 2'b10, 1, 32'd12);   // clb_in[1] <- out_e[1]
+        cw(0, 2'b10, 2, 32'd13);   // clb_in[2] <- out_e[2]
+        cw(0, 2'b10, 3, 32'd13);   // clb_in[3] <- out_e[3]
         @(negedge clk);                       // combinational path settle
         // vd_o[3:0] = 0xCAFEBABE low nibble = 0xE = 4'b1110.
         if (clb_obs[3:0] !== mem_obs[3:0]) begin
@@ -173,12 +187,12 @@ module tb_vbus_route;
         cw(0, 2'b01, 50, 32'd5); cw(0, 2'b01, 51, 32'd5);
         cw(0, 2'b01, 52, 32'd5); cw(0, 2'b01, 53, 32'd5);
         cw(0, 2'b01, 54, 32'd5); cw(0, 2'b01, 55, 32'd5);
-        // CB: clb_in[0..7] <- out_e[0..7] (out_e pool base = 2*W = 24). No track
+        // CB (v2c §7.1): clb_in[i] <- out_e[i] = pool[24+i], k = 12 + i/2. No track
         // depends on an unconfigured SB Wilton select (all 8 sourced from inject).
-        cw(0, 2'b10, 0, 32'd24); cw(0, 2'b10, 1, 32'd25);
-        cw(0, 2'b10, 2, 32'd26); cw(0, 2'b10, 3, 32'd27);
-        cw(0, 2'b10, 4, 32'd28); cw(0, 2'b10, 5, 32'd29);
-        cw(0, 2'b10, 6, 32'd30); cw(0, 2'b10, 7, 32'd31);
+        cw(0, 2'b10, 0, 32'd12); cw(0, 2'b10, 1, 32'd12);
+        cw(0, 2'b10, 2, 32'd13); cw(0, 2'b10, 3, 32'd13);
+        cw(0, 2'b10, 4, 32'd14); cw(0, 2'b10, 5, 32'd14);
+        cw(0, 2'b10, 6, 32'd15); cw(0, 2'b10, 7, 32'd15);
         // Force register va=0 (so register-driven path would read addr 0, NOT 5).
         cw(0, 2'b11, 1, (4'b0000 << 18) | (1 << 16) | 14'h0000);   // va_r=0, ven=1, vwe=0
         // vbus-OUT: CLB drives inject (clb_out=00000101 -> out_e -> CB -> clb_in=5).

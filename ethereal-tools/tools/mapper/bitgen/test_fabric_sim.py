@@ -69,18 +69,22 @@ def _require_c432() -> None:
 def test_clb_eval_bits_matches_clb_t():
     """A 1-eLUT4 AND(clb_in[0], clb_in[1]) TileLogic -> the AND truth table.
 
-    LUT wiring (mirrors clb_t.sv): ``lut_in[0][gk] = pool[mux_sel]`` with
-    ``vin = {pin3,pin2,pin1,pin0}`` (pin0 = LSB) and ``vout = tt[vin]``. We wire
-    pin0<-clb_in[0], pin1<-clb_in[1], pin2/pin3<-clb_in[2]/[3] held at 0 and
-    store the AND truth table in PHYSICAL-pin order (onset only at vin=3).
+    LUT wiring (mirrors clb_t.sv, interconnect v2c): ``lut_in[0][gk]`` reads
+    the v2c-decoded mux source with ``vin = {pin3,pin2,pin1,pin0}`` (pin0 =
+    LSB) and ``vout = tt[vin]``. We wire pin0<-clb_in[0] (sel 16: ext k=0 on an
+    even pin), pin1<-clb_in[1] (sel 16: ext k=0 on an ODD pin -> pin {0,1}=1),
+    pin2/pin3<-clb_in[2]/[3] (sel 17: ext k=1) held at 0, and store the AND
+    truth table in PHYSICAL-pin order (onset only at vin=3). Note pins 0/1
+    share sel=16 but decode DIFFERENT pins via the parity bit — the v2c
+    slice-only encoding in action.
     """
     tile = TileLogic()
     tile.eluts[0] = ElutConfig(tt=1 << 3)              # tt[vin]=1 iff vin==3
-    # iib_mux: pool sel 0..17 = clb_in_bits index. Wire pin0..pin3.
-    tile.iib_mux[(0, 0)] = 0   # pin0 <- clb_in[0]
-    tile.iib_mux[(0, 1)] = 1   # pin1 <- clb_in[1]
-    tile.iib_mux[(0, 2)] = 2   # pin2 <- clb_in[2] (held 0)
-    tile.iib_mux[(0, 3)] = 3   # pin3 <- clb_in[3] (held 0)
+    # iib_mux v2c sels: 16|k = external input 2k + (gk mod 2)
+    tile.iib_mux[(0, 0)] = 16  # pin0 (even) <- clb_in[0]
+    tile.iib_mux[(0, 1)] = 16  # pin1 (odd)  <- clb_in[1]
+    tile.iib_mux[(0, 2)] = 17  # pin2 (even) <- clb_in[2] (held 0)
+    tile.iib_mux[(0, 3)] = 17  # pin3 (odd)  <- clb_in[3] (held 0)
     tile.cluster_outputs[0] = "and_out"
 
     expected = {(0, 0): 0, (1, 0): 0, (0, 1): 0, (1, 1): 1}
@@ -214,7 +218,9 @@ def c432_setup():
                   os.path.join(MAPPER, "c432.place"),
                   os.path.join(MAPPER, "c432.blif"))
     min_x, min_y, _mx, _my = db_grid_bounds(db)
-    rc = route(db, max_iters=100, seed=0)
+    # v2c: seed 0 needs ~116 iters on the pruned-CB graph (measured 2026-09-02);
+    # 300 matches the E2-FAB5 spike's route_check budget.
+    rc = route(db, max_iters=300, seed=0)
     assert rc.converged, "c432 must route conflict-free before sim (prereq)"
     sim = FabricSim(db, rc, min_x, min_y)
     return db, rc, sim, min_x, min_y

@@ -106,10 +106,12 @@ module tb_het_fabric;
         // CLB tile @ tile2 (unit 00): configure eLUT4 (config decode intact on het fabric)
         // ================================================================
         cw(2, 2'b00, 0, 32'h0005555C);  // tile2 eLUT4[0]: tt=0x5555, ff_en, ff_rst_en
-        cw(2, 2'b00, 8, 32'h00000012);  // tile2 IIB mux0..3 = 18 (self-contained feedback)
-        cw(2, 2'b00, 9, 32'h00000012);
-        cw(2, 2'b00, 10, 32'h00000012);
-        cw(2, 2'b00, 11, 32'h00000012);
+        // tile2 IIB mux0..3 = 0 (v2c §7.2: sel=0 = fb j=0 = clb_out[0];
+        // v1.1 wrote sel=18 for the same pool entry). Self-contained feedback.
+        cw(2, 2'b00, 8, 32'h00000000);
+        cw(2, 2'b00, 9, 32'h00000000);
+        cw(2, 2'b00, 10, 32'h00000000);
+        cw(2, 2'b00, 11, 32'h00000000);
         @(negedge clk); rst_ni = 1'b0; @(negedge clk); rst_ni = 1'b1;
         // tile2 is index 2 -> clb_obs[2*8+0] = clb_out[0] should toggle
         @(negedge clk);

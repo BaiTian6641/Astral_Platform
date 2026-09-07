@@ -193,14 +193,14 @@ def test_cb_edges_localize_to_tile():
 
 
 def test_cb_configure_via_unit_cb():
-    """FabricGrid.configure with UNIT_CB writes the CB sel of that tile."""
+    """FabricGrid.configure with UNIT_CB writes the CB subset index of that tile."""
     g = FabricGrid(2, 2, W)
     g.configure(tile_idx=0, unit=FabricGrid.UNIT_CB, intra=3, data=5)
     r, c = g.tile_rc(0)
     assert g.cb[r][c].sel_of(3) == 5
-    # the change is reflected in the graph: clb_in[3]@(0,0) now sourced by
-    # track 5 = ("n", 5) (5 < W)
-    assert ((0, 0, "out", "n", 5), (0, 0, "clb_in", 3)) in g.graph_edges()
+    # the change is reflected in the graph: clb_in[3]@(0,0) with k=5 is sourced
+    # by pool[(3 mod 2) + 2*5] = track 11 = ("n", 11) (v2c subset decode)
+    assert ((0, 0, "out", "n", 11), (0, 0, "clb_in", 3)) in g.graph_edges()
 
 
 # ---- 7. THE KEY TEST: end-to-end routability -------------------------------
@@ -263,11 +263,11 @@ def test_routability_no_path_to_isolated_node():
         #         (out_n sel3=W, _wilton(n,w,0)=0)
         ("e", 1, 2, 0, 1, 0 * W + 0, 3, 0),
         # west  : drv east of sink;  chan out_w -> in_e; sink out_w[0]<-in_e[0]
-        #         (out_w sel3=E, _wilton(w,e,0)=0)
-        ("w", 1, 2, 1, 0, 3 * W + 0, 3, 3 * W),
+        #         (out_w sel3=E, _wilton(w,e,0)=0); CB k = 36/2 = 18 (v2c)
+        ("w", 1, 2, 1, 0, 3 * W + 0, 3, 18),
         # south : drv north of sink; chan out_s -> in_n; sink out_s[0]<-in_n[0]
-        #         (out_s sel1=N, _wilton(s,n,0)=0)
-        ("s", 2, 1, 0, 1, 1 * W + 0, 1, 1 * W),
+        #         (out_s sel1=N, _wilton(s,n,0)=0); CB k = 12/2 = 6 (v2c)
+        ("s", 2, 1, 0, 1, 1 * W + 0, 1, 6),
         # north : drv south of sink; chan out_n -> in_s; sink out_n[0]<-in_s[0]
         #         (out_n sel1=S, _wilton(n,s,0)=0)
         ("n", 2, 1, 1, 0, 0 * W + 0, 1, 0),
