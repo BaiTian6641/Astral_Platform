@@ -67,3 +67,22 @@
   ✅ 增量 2 已完成：CSR/trap 最小集 + `mem` 流比对（见 §4）。
 - **E2-RV0 增量** — 内存访问比对（harness `Commit.mem_*` 字段）+ CSR/trap 流 + 实时锁步 stepper。
 - **集成** — RV 核 + DMA + DRAM + xbar（`BURST_EN=1`）的 SoC 级多主 TB。
+
+## 6. 增量 3（同日完成）：RVFI 轨迹契约形式化 + D 口 AXI4 主
+
+- **形式化（C14 §8 检查点 6）**：新增 `ethereal-shell/formal/eth_rv_core.sby`（prove depth 16 + cover depth 24，`make formal` 自动纳入）。
+  性质族：**P1** `rvfi_valid` 仅对合法离开 MEM 的指令（未停顿、未陷阱、未非法）；**P2** 记录载荷即该 MEM 指令 ⇒ 被冲刷指令不可能入迹；
+  **P3** 冲刷清空 ID/EX（非停顿时）与 IF/ID、陷阱清空 MEM、D 口停顿冻结 MEM 槽及其整载荷、MEM 仅由被接受的 EX 槽填充；
+  **P3b** 译码互斥（非 load&store 同时，贯穿 id/ex/mem/wb）；**P4** `rvfi_order` 每记录恰好 +1（关系式、无界归纳）；
+  **P5** 记录即真实发生的 D 口传输（请求驱动且被接受、地址/写掩码等于总线值、恰一方向、方向掩码为所寻址拍的合法 15 类 lane 连续运行、总线存储字节等于轨迹未移位值）；
+  **P6** 写纪律（无零掩码写、掩码是所寻址拍的子集、读不写）；另 11 条 cover 全部命中。
+  **本人复跑：`sby -f …` → prove `successful proof by k-induction` DONE (PASS, rc=0)**。
+- **D 口 AXI4 主（C14 §4）**：新增 `eth_rv_axi_master.sv`（拍 → AXI4 INCR：单未完成、仅 INCR、`AxSIZE=log2(DW/8)`；
+  存储 AW→W(单拍,WLAST)→**仅在 B 之后才应答核心**（无 posted write）；加载 AR→R 单拍或 `LINE_BEATS` 行填充 + **1 行读缓存**（被存储失效）；
+  突发前做窗口检查；sticky `axi_err_o`；RLAST 兜底以免读挂死核心）。
+- **端到端（本人复跑）**：`run_difftest.py --dram --quiet` → **`OK: 6 corpus program(s), MATCH vs Spike`**（memory active；cor_trap 474 提交 0 分歧）；
+  AXI 侧实测流量（cor_mem 13 AR / 13 多拍突发 / 104 R / 12 AW / 12 W / 5 次行缓存命中；全套 29 次多拍突发）；`--axi-line-beats 1` 同样 6/6；
+  负控在 AXI 路径上仍精确捕获（`--dram --fault 12:mem_wdata`）。
+- **回归**：`make verif-rv` 147 passed；ruff/mypy 干净；lint 干净（主口在 `LINE_BEATS` 1/8/16 三档；两个 TB 构建在 warnings-fatal 下通过）。
+- **工具适配（记录）**：yosys 前端不支持通配包 import（`import eth_rv_pkg::*`）与函数体内裸包名 ⇒ 改为显式 typedef/localparam 别名与 `pkg::NAME` 限定（后者与 `emri/emri_regfile.sv` 既有做法一致）。
+- **C14 §8 检查点状态**：1 取指/译码 ✅、2 内存路径 ✅（含 AXI/DRAM）、3 M/C ✅、4 异常/CSR ✅、5 UART hello ⏳（需 MMIO/UART）、6 轨迹形式化 ✅（本增量）。

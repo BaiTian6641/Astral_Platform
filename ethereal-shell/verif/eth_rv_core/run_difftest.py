@@ -29,6 +29,9 @@ Examples::
 
     # negative control: corrupt one trace record and watch the harness catch it
     python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_alu --fault 12:value=0xdeadbeef
+
+    # the same corpus with the D port on AXI4 into the DRAM socket (8-beat reads)
+    python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --all --dram
 """
 
 from __future__ import annotations
@@ -61,6 +64,13 @@ RTL_SOURCES = [
     RTL_DIR / "cor_regfile.sv",
     RTL_DIR / "cor_decoder.sv",
     RTL_DIR / "eth_rv_core.sv",
+]
+
+# `--dram` build only: the AXI4 master in front of the DRAM socket (C14 §4/§6).
+DRAM_SOURCES = [
+    RTL_DIR / "eth_rv_axi_master.sv",
+    REPO_ROOT / "ethereal-shell" / "rtl" / "dram" / "eth_dram_stub.sv",
+    REPO_ROOT / "ethereal-shell" / "rtl" / "dram" / "eth_dram_ctrl.sv",
 ]
 TB_SOURCE = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv_core" / "tb_eth_rv_core.sv"
 
@@ -149,14 +159,27 @@ def write_memory_image(elf: Path, image_path: Path) -> tuple[int, int]:
     return image.tohost, len(words)
 
 
-def build_model(work_dir: Path, mem_lat: int, rebuild: bool) -> Path:
-    """Verilate + compile the testbench; returns the executable path."""
+def build_model(
+    work_dir: Path, mem_lat: int, rebuild: bool, *, dram: bool = False, line_beats: int = 8
+) -> Path:
+    """Verilate + compile the testbench; returns the executable path.
+
+    ``dram`` selects the AXI4 D-port build (``-DETH_RV_DRAM_AXI``): the core's
+    data port goes through ``eth_rv_axi_master`` into ``eth_dram_ctrl`` +
+    ``eth_dram_stub`` instead of the testbench's behavioral beat memory, and
+    ``line_beats`` picks the master's read line fill (>1 = INCR bursts).
+    """
     verilator = _tool("verilator")
-    obj_dir = work_dir / f"obj_{ 'lat' + str(mem_lat) if mem_lat else 'lat0' }"
+    mode = f"dram{line_beats}" if dram else "beat"
+    obj_dir = work_dir / f"obj_{mode}_lat{mem_lat}"
     exe = obj_dir / "Veth_rv_tb"
-    if exe.is_file() and not rebuild and not _stale(exe):
+    sources = [*RTL_SOURCES, *(DRAM_SOURCES if dram else [])]
+    if exe.is_file() and not rebuild and not _stale(exe, sources):
         return exe
     obj_dir.mkdir(parents=True, exist_ok=True)
+    defines = [f"-DETH_RV_LINE_BEATS={line_beats}"] if dram else []
+    if dram:
+        defines.insert(0, "-DETH_RV_DRAM_AXI")
     argv = [
         verilator,
         "--binary",
@@ -167,7 +190,8 @@ def build_model(work_dir: Path, mem_lat: int, rebuild: bool) -> Path:
         str(obj_dir),
         "-o",
         "Veth_rv_tb",
-        *[str(path) for path in RTL_SOURCES],
+        *defines,
+        *[str(path) for path in sources],
         str(TB_SOURCE),
     ]
     done = run(argv, cwd=REPO_ROOT)
@@ -187,10 +211,10 @@ class RtlRun:
     stdout: str
 
 
-def _stale(exe: Path) -> bool:
+def _stale(exe: Path, sources: list[Path]) -> bool:
     """True when any RTL/TB source is newer than the built model."""
     built = exe.stat().st_mtime
-    return any(path.stat().st_mtime > built for path in [*RTL_SOURCES, TB_SOURCE])
+    return any(path.stat().st_mtime > built for path in [*sources, TB_SOURCE])
 
 
 def run_rtl(
@@ -277,6 +301,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--rebuild", action="store_true", help="force a Verilator rebuild")
+    parser.add_argument(
+        "--dram",
+        action="store_true",
+        help=(
+            "drive the D port through eth_rv_axi_master into eth_dram_ctrl + "
+            "eth_dram_stub (full AXI4 INCR) instead of the behavioral beat memory"
+        ),
+    )
+    parser.add_argument(
+        "--axi-line-beats",
+        type=int,
+        default=8,
+        choices=(1, 2, 4, 8, 16),
+        help="--dram: read line fill in beats (1 = one beat per transaction, the default is 8)",
+    )
     parser.add_argument("--quiet", action="store_true", help="only print the harness verdicts")
     return parser
 
@@ -287,10 +326,21 @@ def main(argv: list[str] | None = None) -> int:
     try:
         build_corpus(args.corpus_dir)
         args.work_dir.mkdir(parents=True, exist_ok=True)
-        exe = build_model(args.work_dir, args.memlat, args.rebuild)
+        exe = build_model(
+            args.work_dir,
+            args.memlat,
+            args.rebuild,
+            dram=args.dram,
+            line_beats=args.axi_line_beats,
+        )
     except SetupError as exc:
         sys.stderr.write(f"[rv-rtl] error: {exc}\n")
         return 2
+    if args.dram:
+        print(
+            f"[rv-rtl] D port: eth_rv_axi_master -> eth_dram_ctrl (+stub), "
+            f"read line fill {args.axi_line_beats} beat(s)"
+        )
 
     failures = 0
     for name in programs:

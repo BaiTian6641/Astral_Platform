@@ -40,6 +40,19 @@
 //              stream, which is how the memory comparison itself is proven to be
 //              live rather than decorative.
 //
+//              TWO D-PORT BUILDS (one source; selected with -DETH_RV_DRAM_AXI):
+//                * default — the v0 behavioral beat memory below (fast, no AXI);
+//                * ETH_RV_DRAM_AXI — the core's D port drives `eth_rv_axi_master`
+//                  into a real `eth_dram_ctrl` + `eth_dram_stub` AXI4 socket. The
+//                  DRAM stub's array is then the single memory image (preloaded
+//                  from +mem and read by the instruction port hierarchically), so
+//                  fetch and data agree; the D port goes through full AXI4.
+//                  `ETH_RV_LINE_BEATS` (default 1) selects the master's read line
+//                  fill: >1 makes a load miss one INCR burst of that many beats and
+//                  serves the following sequential loads out of the line. The PASS
+//                  line reports the AXI transaction/beat counts, and the run FAILs
+//                  if the socket ever answered with a non-OKAY response.
+//
 //              The PASS line also reports what the trace carried — committed
 //              instructions, how many were compressed, and the load/store
 //              counts taken from the RVFI memory fields — so a run is
@@ -55,6 +68,17 @@ module tb_eth_rv_core;
 
     // ------------------------------------------------------------------ params
     localparam int unsigned MEM_WORDS = 32_768;   // 256 KiB @ 8 B/word
+
+`ifndef ETH_RV_LINE_BEATS
+`define ETH_RV_LINE_BEATS 1     // eth_rv_axi_master read line fill (1 = single beat)
+`endif
+
+`ifdef ETH_RV_DRAM_AXI
+    // eth_dram_ctrl window (the ASSUMPTION of the DRAM slice: 0x8000_0000 + 1 MiB)
+    localparam logic [31:0] DRAM_BASE  = 32'h8000_0000;
+    localparam int unsigned DRAM_BYTES = 1 << 20;
+    localparam int unsigned DRAM_WORDS = DRAM_BYTES / 8;
+`endif
 
     // ------------------------------------------------------------------ clock
     logic clk;
@@ -78,20 +102,31 @@ module tb_eth_rv_core;
     logic [63:0] fault_value;
 
     // ------------------------------------------------------------------ memory
+    // One 8-byte word of the image, indexed from the corpus link base. The
+    // instruction port always reads it here; in the v0 build the data port does
+    // too, while the ETH_RV_DRAM_AXI build serves the data port through the AXI
+    // master and takes every word from the DRAM stub's own array (the single
+    // image in that build).
+`ifndef ETH_RV_DRAM_AXI
     logic [63:0] mem [MEM_WORDS];
+`endif
 
     function automatic int unsigned word_of(input logic [63:0] addr);
         word_of = int'((addr - base_addr) >> 3);
     endfunction
 
-    function automatic logic [127:0] window_of(input logic [63:0] addr);
-        logic [63:0] lo;
-        logic [63:0] hi;
+    function automatic logic [63:0] mem_word(input logic [63:0] addr);
         int unsigned wi;
         wi = word_of(addr);
-        lo = (wi < MEM_WORDS) ? mem[wi] : 64'd0;
-        hi = ((wi + 1) < MEM_WORDS) ? mem[wi + 1] : 64'd0;
-        window_of = {hi, lo};
+`ifdef ETH_RV_DRAM_AXI
+        mem_word = (wi < DRAM_WORDS) ? u_dram.u_impl.mem[wi] : 64'd0;
+`else
+        mem_word = (wi < MEM_WORDS) ? mem[wi] : 64'd0;
+`endif
+    endfunction
+
+    function automatic logic [127:0] window_of(input logic [63:0] addr);
+        window_of = {mem_word(addr + 64'd8), mem_word(addr)};
     endfunction
 
     function automatic logic [63:0] read_bytes64(input logic [63:0] addr);
@@ -202,6 +237,169 @@ module tb_eth_rv_core;
 
     // ------------------------------------------------------------------ D port
     logic        dmem_pend;
+`ifdef ETH_RV_DRAM_AXI
+    // ---- D port through the AXI4 master into the DRAM socket -------------
+    logic        m_axi_awvalid;
+    logic        m_axi_awready;
+    logic [31:0] m_axi_awaddr;
+    logic [7:0]  m_axi_awlen;
+    logic [2:0]  m_axi_awsize;
+    logic [1:0]  m_axi_awburst;
+    logic [3:0]  m_axi_awid;
+    logic        m_axi_wvalid;
+    logic        m_axi_wready;
+    logic [63:0] m_axi_wdata;
+    logic [7:0]  m_axi_wstrb;
+    logic        m_axi_wlast;
+    logic        m_axi_bvalid;
+    logic        m_axi_bready;
+    logic [1:0]  m_axi_bresp;
+    logic [3:0]  m_axi_bid;
+    logic        m_axi_arvalid;
+    logic        m_axi_arready;
+    logic [31:0] m_axi_araddr;
+    logic [7:0]  m_axi_arlen;
+    logic [2:0]  m_axi_arsize;
+    logic [1:0]  m_axi_arburst;
+    logic [3:0]  m_axi_arid;
+    logic        m_axi_rvalid;
+    logic        m_axi_rready;
+    logic [63:0] m_axi_rdata;
+    logic [1:0]  m_axi_rresp;
+    logic        m_axi_rlast;
+    logic [3:0]  m_axi_rid;
+    logic        axi_err;
+
+    eth_rv_axi_master #(
+        .AXI_AW     (32),
+        .AXI_DW     (64),
+        .AXI_IDW    (4),
+        .LINE_BEATS (`ETH_RV_LINE_BEATS),
+        .MEM_BASE   (DRAM_BASE),
+        .MEM_BYTES  (DRAM_BYTES)
+    ) u_master (
+        .clk_i         (clk),
+        .rst_ni        (rst_n),
+        .dmem_req_i    (dmem_req),
+        .dmem_we_i     (dmem_we),
+        .dmem_addr_i   (dmem_addr),
+        .dmem_wdata_i  (dmem_wdata),
+        .dmem_wstrb_i  (dmem_wstrb),
+        .dmem_ready_o  (dmem_ready),
+        .dmem_rdata_o  (dmem_rdata),
+        .m_axi_awvalid (m_axi_awvalid),
+        .m_axi_awready (m_axi_awready),
+        .m_axi_awaddr  (m_axi_awaddr),
+        .m_axi_awlen   (m_axi_awlen),
+        .m_axi_awsize  (m_axi_awsize),
+        .m_axi_awburst (m_axi_awburst),
+        .m_axi_awid    (m_axi_awid),
+        .m_axi_wvalid  (m_axi_wvalid),
+        .m_axi_wready  (m_axi_wready),
+        .m_axi_wdata   (m_axi_wdata),
+        .m_axi_wstrb   (m_axi_wstrb),
+        .m_axi_wlast   (m_axi_wlast),
+        .m_axi_bvalid  (m_axi_bvalid),
+        .m_axi_bready  (m_axi_bready),
+        .m_axi_bresp   (m_axi_bresp),
+        .m_axi_bid     (m_axi_bid),
+        .m_axi_arvalid (m_axi_arvalid),
+        .m_axi_arready (m_axi_arready),
+        .m_axi_araddr  (m_axi_araddr),
+        .m_axi_arlen   (m_axi_arlen),
+        .m_axi_arsize  (m_axi_arsize),
+        .m_axi_arburst (m_axi_arburst),
+        .m_axi_arid    (m_axi_arid),
+        .m_axi_rvalid  (m_axi_rvalid),
+        .m_axi_rready  (m_axi_rready),
+        .m_axi_rdata   (m_axi_rdata),
+        .m_axi_rresp   (m_axi_rresp),
+        .m_axi_rlast   (m_axi_rlast),
+        .m_axi_rid     (m_axi_rid),
+        .axi_err_o     (axi_err)
+    );
+
+    eth_dram_ctrl #(
+        .AXI_AW     (32),
+        .AXI_DW     (64),
+        .AXI_IDW    (4),
+        .MEM_BASE   (DRAM_BASE),
+        .MEM_BYTES  (DRAM_BYTES),
+        .RD_LATENCY (4),
+        .WR_LATENCY (2)
+    ) u_dram (
+        .clk_i          (clk),
+        .rst_ni         (rst_n),
+        .s_axi_awvalid  (m_axi_awvalid),
+        .s_axi_awready  (m_axi_awready),
+        .s_axi_awaddr   (m_axi_awaddr),
+        .s_axi_awid     (m_axi_awid),
+        .s_axi_awlen    (m_axi_awlen),
+        .s_axi_awsize   (m_axi_awsize),
+        .s_axi_awburst  (m_axi_awburst),
+        .s_axi_awcache  (4'd0),
+        .s_axi_awprot   (3'd0),
+        .s_axi_awqos    (4'd0),
+        .s_axi_awregion (4'd0),
+        .s_axi_awlock   (1'b0),
+        .s_axi_wvalid   (m_axi_wvalid),
+        .s_axi_wready   (m_axi_wready),
+        .s_axi_wdata    (m_axi_wdata),
+        .s_axi_wstrb    (m_axi_wstrb),
+        .s_axi_wlast    (m_axi_wlast),
+        .s_axi_bvalid   (m_axi_bvalid),
+        .s_axi_bready   (m_axi_bready),
+        .s_axi_bresp    (m_axi_bresp),
+        .s_axi_bid      (m_axi_bid),
+        .s_axi_arvalid  (m_axi_arvalid),
+        .s_axi_arready  (m_axi_arready),
+        .s_axi_araddr   (m_axi_araddr),
+        .s_axi_arid     (m_axi_arid),
+        .s_axi_arlen    (m_axi_arlen),
+        .s_axi_arsize   (m_axi_arsize),
+        .s_axi_arburst  (m_axi_arburst),
+        .s_axi_arcache  (4'd0),
+        .s_axi_arprot   (3'd0),
+        .s_axi_arqos    (4'd0),
+        .s_axi_arregion (4'd0),
+        .s_axi_arlock   (1'b0),
+        .s_axi_rvalid   (m_axi_rvalid),
+        .s_axi_rready   (m_axi_rready),
+        .s_axi_rdata    (m_axi_rdata),
+        .s_axi_rresp    (m_axi_rresp),
+        .s_axi_rlast    (m_axi_rlast),
+        .s_axi_rid      (m_axi_rid)
+    );
+
+    // AXI traffic counters: proof that the corpus really drove the socket, and
+    // how much of it was carried by multi-beat INCR bursts.
+    int unsigned n_axi_ar;
+    int unsigned n_axi_aw;
+    int unsigned n_axi_r_beats;
+    int unsigned n_axi_w_beats;
+    int unsigned n_axi_r_bursts;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            n_axi_ar       <= 0;
+            n_axi_aw       <= 0;
+            n_axi_r_beats  <= 0;
+            n_axi_w_beats  <= 0;
+            n_axi_r_bursts <= 0;
+        end else begin
+            if (m_axi_arvalid && m_axi_arready) begin
+                n_axi_ar <= n_axi_ar + 1;
+                if (m_axi_arlen != 8'd0) begin
+                    n_axi_r_bursts <= n_axi_r_bursts + 1;
+                end
+            end
+            if (m_axi_awvalid && m_axi_awready) n_axi_aw <= n_axi_aw + 1;
+            if (m_axi_rvalid && m_axi_rready) n_axi_r_beats <= n_axi_r_beats + 1;
+            if (m_axi_wvalid && m_axi_wready) n_axi_w_beats <= n_axi_w_beats + 1;
+        end
+    end
+`else
+    // v0 build: the behavioral beat memory, served out of `mem`
     logic [63:0] dmem_addr_q;
     int unsigned dmem_wait;
 
@@ -244,6 +442,7 @@ module tb_eth_rv_core;
             end
         end
     end
+`endif
 
     // ------------------------------------------------------------------ trace
     integer      trace_fd;
@@ -423,14 +622,23 @@ module tb_eth_rv_core;
         void'($value$plusargs("fault_value=%h", fault_value));
         void'($value$plusargs("fault_field=%s", fault_field));
 
-        for (int unsigned i = 0; i < MEM_WORDS; i = i + 1) begin
-            mem[i] = 64'd0;
-        end
         if (mem_path == "") begin
             $display("ETH_RV_TB: FAIL no +mem=<file> given");
             $fatal(1);
         end
+`ifdef ETH_RV_DRAM_AXI
+        // the DRAM stub's array is the one image: preload it so the instruction
+        // port (hierarchical read) and the AXI data port see the same memory
+        for (int unsigned i = 0; i < DRAM_WORDS; i = i + 1) begin
+            u_dram.u_impl.mem[i] = 64'd0;
+        end
+        $readmemh(mem_path, u_dram.u_impl.mem);
+`else
+        for (int unsigned i = 0; i < MEM_WORDS; i = i + 1) begin
+            mem[i] = 64'd0;
+        end
         $readmemh(mem_path, mem);
+`endif
         if (trace_path == "") begin
             $display("ETH_RV_TB: FAIL no +trace=<file> given");
             $fatal(1);
@@ -456,9 +664,20 @@ module tb_eth_rv_core;
                      commits, cycle_cnt);
             $fatal(1);
         end
+`ifdef ETH_RV_DRAM_AXI
+        if (axi_err) begin
+            $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response");
+            $fatal(1);
+        end
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats",
+                 commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
+                 last_trap_cause, last_mem_addr, last_store_data, last_insn,
+                 n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats);
+`else
         $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  last_trap_cause, last_mem_addr, last_store_data, last_insn);
+`endif
         $finish;
     end
 
