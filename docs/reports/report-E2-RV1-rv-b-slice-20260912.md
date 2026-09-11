@@ -34,9 +34,10 @@
 
 ## 3. 明确边界（本切片非目标）
 
-- ⚠️ **无 CSR/异常/中断路径**（SYSTEM/CSR/ecall/ebreak/mret 译码到错误脉冲，不静默）；无 FPU/A/MMU/Vector；
-  非对齐数据访问 → 错误脉冲；无 I/D 缓存、BTB、多 hart、CLINT/PLIC/UART MMIO；尚无轨迹口的形式化证明；
-  内存访问尚未与 Spike 的 `mem` 流比对（RTL 已吐 `rvfi_mem_*`，harness 的 `Commit` 需加字段）。
+- ~~⚠️ **无 CSR/异常/中断路径**（SYSTEM/CSR/ecall/ebreak/mret 译码到错误脉冲，不静默）~~ → **增量 2 已补齐**（见 §4；仍无中断/特权级切换）；
+  无 I/D 缓存、BTB、多 hart、CLINT/PLIC/UART MMIO；D 口仍为简化拍接口（AXI4 主口替换属增量 3）。
+  ✅ 内存访问**已与** Spike 的 `mem` 流比对（增量 2：harness `Commit` 增加 mem 字段 + 6/6 语料 memory-active MATCH）；
+  轨迹口的形式化证明由增量 3 落地。
 - ⚠️ 与 C14 的偏差已记录：I 口为简化取指（非 AXI 突发读）——下一片切换 `eth_axi` 主口。
 
 ## 4. 增量 2（同日完成）：内存流 DiffTest + M 模式 CSR/trap
@@ -62,6 +63,7 @@
 
 ## 5. 下一阶段需要做的内容
 
-- **E2-RV1 续** — CSR/trap 最小集（`mcause/mepc/mtval` + 非法指令/ecall）→ `mem` 流比对 → `eth_axi` AXI4 主口替换 → 轨迹口形式化。
+- **E2-RV1 续（增量 3+）** — `eth_axi` AXI4 主口替换（当前简化取指口）→ 轨迹口形式化（C14 §8 检查点 6）→ 缓存/BTB → 中断与特权级（RV-C 前置）。
+  ✅ 增量 2 已完成：CSR/trap 最小集 + `mem` 流比对（见 §4）。
 - **E2-RV0 增量** — 内存访问比对（harness `Commit.mem_*` 字段）+ CSR/trap 流 + 实时锁步 stepper。
 - **集成** — RV 核 + DMA + DRAM + xbar（`BURST_EN=1`）的 SoC 级多主 TB。

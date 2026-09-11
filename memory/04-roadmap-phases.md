@@ -77,6 +77,15 @@
 - **E2-SEC1b DONE**：EMRI v0.8 §3.10 + `occ_top` 逐区硬件写门（`region_locks_i[7:0]`+`global_lock_i`，WRITE/BLANK 拒 → `done_code=LOCKED` → daemon `EFP_ERR=3`）+ `emri_regfile` LKM 面 + daemon 生命周期锁（RUNNING 锁、BLANK 前解锁、PAUSED restart 拒绝）。端到端 BMC TB 抓出两个真问题：① `LKM_CMD=4` 曾连逐区锁一起清 → 规范澄清"仅清全局位"并修复；② **既有握手死锁**——`occ_top` 在 LOCKED/NEEDS_BLANK 拒绝时从不给 `cmd_ready`，单宿主端口永久挂住，regfile 现于该状态释放挂起事务（顺带让 NEEDS_BLANK→`occ_reject` 在寄存器 ABI 上重新可达）。证据：`tb_lock_matrix`（新）+ 22 个 ripple TB + `tb_bmc_fw`/`tb_ethctl_replay`（真固件）+ `tb_occ_soak` 20000 零损坏 + formal 全过 + lint 干净；3 项负控（门禁用/释放移除/op4 回退）均按预期失败。
 - **E2-DMA1 DONE（垂直切片）**：`ethereal-shell/rtl/dma/`（pkg/fifo/arb/axi_engine 单未完成 INCR 主/channel/top）+ 描述符布局（4×64 bit：SRC/DST/NXT/LEN+SOF/EOF/IOC，32 B 对齐，一次 INCR 取回）+ CSR 映射（4 KiB 窗口，全局 + 逐通道 64 B）+ 错误码语义。TB（DUT=顶层、内存=真实 `eth_dram_ctrl` 插座）**60 checks/0 errors**：多描述符链校验和、双通道交织、两条 DECERR 错误路径（不挂死）、LFSR 背压、连续 AXI 协议监视器；`eth_dma_mc.sby` **k-induction PASS** + cover。非目标：多未完成/Stream 侧/2D/状态回写/循环链；CSR 为通用 valid/ready（AXI4-Lite 外壳属集成层）。
 
+## Progress log (2026-09-12 night — E2-AXI2 / E2-SEC1b / E1-DMO2c / E2-RV1 增量 2 / E2-DMA1)
+
+- **E2-AXI2 DONE**：`eth_axi_xbar` v0.1 突发路由（`BURST_EN` 默认 0 ⇒ 既有单拍用户**逐位不变**，1 启用 INCR）；突发形状随 skid 载荷；容错 LAST（`LAST | cnt==AxLEN`，计数为准）；锁步跨整突发；DECERR 吞整突发 W 且只回 1 拍 R。证据：新 `tb_axi_xbar_burst` **2813 checks/0 errors**（256 拍 sweep 对齐直连基线 + 双主并发 + 3 项非空洞变异全 FAIL）；formal prove/cover PASS；规范 §5.2 已改写、§10-1/§9-6 已解。
+- **E2-SEC1b DONE**：EMRI v0.8 §3.10 锁矩阵（`occ_top` 逐区硬件写门 ⇒ `done_code=LOCKED` ⇒ `EFP_ERR=3`）+ daemon 生命周期锁。端到端 BMC TB 抓出两个真问题：`LKM_CMD=4` 曾连逐区锁一起清（规范澄清"仅清全局位"）与**既有 `occ_top` 拒绝握手死锁**（regfile 现于 LOCKED/NEEDS_BLANK 释放挂起事务）。最终 **91 ok / 0 FAIL**。
+- **E1-DMO2c DONE**：2 列 packed 端到端（`tb_bmc_daemon_packed` **57 ok / 0 fail**）；途中修掉**两个真实产品缺陷**：① blank-before-write 脏位 per-REGION ⇒ 多列部署不可能（改 per-frame-window 位图 + §3.1 措辞）；② `frame_decoder` 陈旧缓冲复用（改按捕获序索引 + sticky `cfg_error_o`，负例 + 变异双证）。
+- **E2-RV1 增量 2 DONE**：内存流 DiffTest（轨迹 `cycle pc rd value [mem_addr mem_wdata [masks]]`；无 mem 字段时明确 "memory: not provided"）+ M 模式 CSR/trap（10 CSR + ecall/ebreak/非法/非对齐，位精确）+ 语料 `cor_csr`/`cor_trap` ⇒ **`make verif-rv` 147 passed、RTL runner 6/6 程序 MATCH vs Spike（memory active）**；负控在精确 commit 处发散。遗留：`mip` 值未比对（Spike 报 MTIP）、Spike mem 日志无 lane 掩码、无中断/特权级。
+- **E2-DMA1 DONE（垂直切片）**：`eth_dma_mc`（描述符 SG + N 通道 + 仲裁 + 单未完成 AXI4 INCR 主）+ `tb_eth_dma_mc` **60 checks/0 errors**（真 DRAM 插座为内存）+ `eth_dma_mc.sby` k-induction PASS。
+- **E2-DRAM1 / E2-RV0 / E3-REP1 / E2-FAB2b / C14** 见同日早段条目。
+
 ## Phase 0 progress log (2026-07-24)
 - **Wk1 infrastructure ✅ (committed `78ab251`):** E0-INF1 (8-repo skeleton) + E0-INF2 (CI) + E0-INF3 (Docker+Makefile+smoke) + E0-INF4 (trademark) + S04-P0#1 (mailbox migrated to ethereal-shell, CERN-OHL-S, lint cleanup pending `S04-P0#2`). Docker-gated validations pending.
 - **E0-FAB1 ✅ (elut4+FF):** `ethereal-fabric/rtl/clb/elut4.sv` G1-clean (in lint glob); golden model `elut4_model.py` validated by **1211 local pytest**; cocotb DUT-vs-model Docker-gated. Bitfield frozen in `ethereal-spec/fabric/elut4-config-v0.md`. Report: `docs/reports/report-E0-FAB1-elut4-20260724.md`.
