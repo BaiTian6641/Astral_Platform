@@ -82,12 +82,30 @@ Single unidirectional channel: `tvalid, tready, tdata[DW-1:0], tkeep[(DW/8)-1:0]
   so responses route back correctly; slaves see the widened ID.
 - **Deadlock-freedom:** per-channel skid buffers so a stalled response never blocks a channel.
 
-### 5.2 v0 scope
-- Bursts: INCR + WRAP (FIXED optional/skipped initially). No read-data interleaving
-  across IDs (AXI4 removed it — simpler). Same-ID transactions complete in order;
-  different-ID may complete out of order (multiple outstanding).
-- ATOP atomics: **deferred to v0.1** (needed only for SMP Linux; the v0 fabric + single-core
-  bring-up don't require them).
+### 5.2 Burst scope (v0.1 — implemented, `BURST_EN`)
+
+- **INCR bursts** are routed (E2-AXI2). WRAP/FIXED and illegal `AxSIZE` are **not
+  re-encoded**: they are forwarded and refused by the memory slave with `SLVERR` (§9).
+- A burst is `AxLEN+1` beats; **every beat follows the destination decoded from the
+  granted AW/AR** — the burst shape (`AxLEN/AxSIZE/AxBURST/WLAST`) travels inside the
+  existing per-channel skid payloads.
+- **LAST policy (tolerant like the memory slave):** slave-facing `WLAST = captured
+  WLAST | (wcnt == AxLEN)`, master-facing `RLAST = slave RLAST | (rcnt == ArLEN)`, with
+  the per-master beat counters as the authoritative bound — a missing or early LAST can
+  neither hang nor silently truncate a routed burst.
+- **Lock-step spans the whole burst:** `wr_busy[d]` is held from the AW grant until that
+  burst's `B`; `rd_busy[d]` until the burst's last R beat; the per-destination
+  uniqueness/owner invariants (§7 (U)/(C)/(O)) therefore hold *mid-burst*.
+  **Multiple outstanding per master remains deferred** (single transaction per master per
+  direction; no read-data interleaving — AXI4 removed it).
+- The decode-error slave sinks **every** W beat of an errored burst before `B` and returns
+  exactly one R beat (`RDATA=0`, `RLAST=1`) (§5.3).
+- **Compatibility:** the burst path is gated by the compile-time parameter `BURST_EN`
+  (default `0`). At 0 the burst attributes are masked to a legal single-beat encoding
+  (`AxLEN=0`, `AxSIZE` = bus width, `AxBURST=INCR`, `WLAST=0`), so existing single-beat
+  users keep the v0 contract **bit-identically**; at 1 bursts are routed. The slave-facing
+  burst port set exists and is well-formed at either setting.
+- ATOP atomics: still deferred (needed only for SMP Linux; not the single-core profile).
 
 ### 5.3 The decode-error slave
 A built-in default slave that answers any unmapped access with `DECERR` and consumes the
@@ -143,13 +161,15 @@ Every `eth_axi` module ships with SVA properties checked by `sby` (and simulated
    `WR_LATENCY`; `AR` captured → first `RVALID` after `RD_LATENCY`+1, then one beat per cycle
    while `RREADY`. All handshake outputs come from stored state (no combinational
    input→output path), and a stalled `R` beat's payload is stable.
-6. **v0.1 gap:** the v0 `eth_axi_xbar` slave port set has no `AxLEN/AxSIZE/AxBURST/WLAST/RLAST`
-   (§5.2 defers bursts to v0.1), so a burst-capable master reaches the DRAM socket directly
-   today; wiring it behind the xbar is `E2-AXI2`.
+6. **Resolved (E2-AXI2, 2026-09-12):** the `eth_axi_xbar` now carries `AxLEN/AxSIZE/AxBURST/
+   WLAST/RLAST` (behind `BURST_EN`, §5.2), so a burst-capable master (the DMA, the RV core)
+   can reach the DRAM socket through the crossbar; direct attach remains valid and is what
+   the current DMA and DRAM testbenches use.
 
 ## 10. Open items (TBD)
-1. **AXI4 full bursts vs AXI4-Lite-only in v0:** the crossbar is designed for full AXI4
-   but v0 bring-up may run it AXI4-Lite-first (simpler). Decision at RTL time.
+1. ~~**AXI4 full bursts vs AXI4-Lite-only in v0:** ... Decision at RTL time.~~
+   **Resolved (E2-AXI2, 2026-09-12):** both — burst routing behind `BURST_EN` (default 0
+   keeps the Lite/single-beat contract bit-identical, 1 routes INCR bursts); see §5.2.
 2. **ATOP atomics timing:** v0.1, needed only for SMP Linux (not the single-core GW5
    profile).
 3. **64-bit datapath:** `AXI_DW=64` parameter — enable when the app-cluster/DRAM path lands.
