@@ -12,6 +12,11 @@ Single generator for BOTH sides of the tb_bmc_daemon contract:
     32-byte manifest digests, and the Ed25519 signatures over the 64-byte
     lowercase-hex UTF-8 of each digest (exactly what ethimg.py signs), plus a
     tampered-signature variant for the bad_sig negative test.
+  * ``--svh-packed`` -> SV include for tb_bmc_daemon_packed.sv (and siblings):
+    the PACKED column-frame DATA words + digest/sig (+ tampered sig) for the
+    single-column images, and — with ``--frame-hex-cols`` — the multi-column
+    image's per-column DATA words, column count and digest/sig for the
+    run_packed deploy that spans N columns (spec emri-v0.md sec 3.3).
 
 Deterministic (fixed key seed, fixed images): committed generated files are
 reproducible byte-for-byte. Uses PyCA ``cryptography`` (the same library
@@ -33,6 +38,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 # Deterministic keypair: Ed25519 private key from a fixed-seed SHA-256 digest
 # (no RNG -> byte-identical regeneration).
 KEY_SEED = hashlib.sha256(b"ethereal-bmc-daemon-e1run2-testkey-v1").digest()
+
+# Fabric column count of the sim fabric (daemon.h DAEMON_FAB_COLS). A run_packed
+# image may not span more columns than the fabric has (spec sec 3.3: region r
+# covers the columns starting at column r, so region + cols <= DAEMON_FAB_COLS).
+FAB_COLS = 2
 
 # Test images (v0 cfg-addr-addressed frame words, mirror tb_mgmt_hotswap.sv):
 #   A: TFF on tile(0,0) eLUT4[0] -> clb_out_obs[0] toggles
@@ -83,11 +93,19 @@ def main() -> int:
     ap.add_argument("--frame-hex-b", type=Path,
                     help="optional SECOND packed column frame (rotation stress; "
                          "emits the DAEMON_IMGP_B_* symbol set)")
+    ap.add_argument("--frame-hex-cols", type=Path, nargs="+", metavar="HEX",
+                    help="multi-column packed image: N (>= 2) column frame "
+                         ".hex files, column 0 first; emits the "
+                         "DAEMON_IMGCOL_* symbol set (per-column DATA words, "
+                         "EFP_IMG_COLS = N, digest/sig/tampered sig). "
+                         "Requires --svh-packed.")
     args = ap.parse_args()
     if not args.keyring and not args.svh and not args.svh_packed:
         ap.error("nothing to do: pass --keyring and/or --svh and/or --svh-packed")
     if args.svh_packed and not args.frame_hex:
         ap.error("--svh-packed requires --frame-hex <path>")
+    if args.frame_hex_cols and not args.svh_packed:
+        ap.error("--frame-hex-cols requires --svh-packed")
 
     sk = Ed25519PrivateKey.from_private_bytes(KEY_SEED)
     pk = sk.public_key().public_bytes_raw()
@@ -167,8 +185,48 @@ def main() -> int:
                 + _sv_words("DAEMON_IMGP_B_SIG", sig_q)
                 + "\n"
             )
-            print(f"[gen_daemon_vectors] svh-packed B: {len(img_q)} DATA words, "
-                  f"digest_PB={dig_q.hex()}")
+        if args.frame_hex_cols is not None:
+            # Multi-column image (E1-DMO2c): N column frames staged as ONE
+            # run_packed image. EFP_IMG_WORDS = per-column DATA words (v0 is
+            # homogeneous, spec sec 3.3) and EFP_IMG_COLS = N; the digest covers
+            # the concatenated per-column DATA words in column order (col 0
+            # first) — the order the host streams them over OCC_WDATA.
+            ncols = len(args.frame_hex_cols)
+            if ncols < 2:
+                ap.error("--frame-hex-cols needs at least 2 column frames "
+                         "(a single column is the --frame-hex set)")
+            if ncols > FAB_COLS:
+                ap.error(f"--frame-hex-cols: {ncols} columns exceed the fabric "
+                         f"({FAB_COLS} columns, daemon.h DAEMON_FAB_COLS)")
+            col_words = [_packed(path)[0] for path in args.frame_hex_cols]
+            nwords = len(col_words[0])
+            if any(len(w) != nwords for w in col_words):
+                ap.error("--frame-hex-cols: column DATA word counts differ "
+                         "(v0 run_packed is homogeneous, spec sec 3.3)")
+            flat = [w for col in col_words for w in col]
+            dig_c = hashlib.sha256(_words_to_bytes(flat)).digest()
+            sig_c = sk.sign(dig_c.hex().encode("utf-8"))
+            tam_c = bytes([sig_c[0] ^ 0x01]) + sig_c[1:]
+            text += (
+                "// Multi-column signed image (E1-DMO2c): N column frames, col 0\n"
+                "// first, staged as ONE run_packed image — EFP_IMG_COLS=N and\n"
+                "// EFP_IMG_WORDS=per-column DATA words (v0 homogeneous, spec\n"
+                "// sec 3.3). DAEMON_IMGCOL_WORDS holds the columns back to back\n"
+                "// (col 0 at index 0); the digest is SHA-256 over those DATA\n"
+                "// words in that order, little-endian in-word (spec sec 3.2).\n"
+                f"localparam int DAEMON_IMGCOL_NCOLS = {ncols};\n"
+                f"localparam int DAEMON_IMGCOL_NWORDS = {nwords};\n"
+                + _sv_u32_list("DAEMON_IMGCOL_WORDS", flat)
+                + "\n"
+                + _sv_words("DAEMON_IMGCOL_DIGEST", dig_c)
+                + "\n"
+                + _sv_words("DAEMON_IMGCOL_SIG", sig_c)
+                + "\n"
+                + _sv_words("DAEMON_IMGCOL_SIG_TAMPER", tam_c)
+                + "\n"
+            )
+            print(f"[gen_daemon_vectors] svh-packed cols: {ncols} columns x "
+                  f"{nwords} DATA words, digest_PC={dig_c.hex()}")
         args.svh_packed.write_text(text)
         print(f"[gen_daemon_vectors] svh-packed: {len(img_p)} DATA words, "
               f"digest_P={dig_p.hex()}")

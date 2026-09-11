@@ -241,6 +241,8 @@ static uint8_t occ_blank_region(uint8_t region, uint16_t words);
 static uint8_t occ_blank_column(uint8_t region, uint32_t col, uint16_t words);
 static uint8_t occ_check(uint32_t status);
 static uint8_t ctx_issue(uint8_t ctx_cmd); /* v0.7 sec 3.9 (stop releases a pause) */
+static void lkm_lock(uint8_t region);      /* v0.8 sec 3.10 (lock on RUNNING) */
+static void lkm_unlock(uint8_t region);    /* v0.8 sec 3.10 (unlock before BLANK) */
 
 
 /* Watchdog abort (sec 3.5): report, then (WRITE ops only — BLANK/READBACK
@@ -593,6 +595,9 @@ static void do_run(uint8_t region_sel)
     g_last_packed = 0u;
     g_done        = 1u;
     set_state(EFP_S_RUNNING);   /* busy stays 1; the dispatcher clears it */
+    /* v0.8 sec 3.10: a running region is write-protected (C03 sec 5) — the
+     * OCC refuses raw WRITE/BLANK from any other bus master. */
+    lkm_lock((uint8_t)region);
     /* v0.6 sec 3.8: a completed deploy notifies the HW monitor (bit r); the
      * regfile pulses MON_RECFG_COUNT[region] and runs the window/threshold. */
     emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_DEPLOY((uint8_t)region));
@@ -753,6 +758,8 @@ static void do_run_packed(uint8_t region_sel)
     g_last_packed = 1u;
     g_done        = 1u;
     set_state(EFP_S_RUNNING);   /* busy stays 1; the dispatcher clears it */
+    /* v0.8 sec 3.10: write-protect the running region (C03 sec 5). */
+    lkm_lock((uint8_t)region);
     /* v0.6 sec 3.8: completed deploy -> notify bit r (one pulse per deploy,
      * not per column; the HW monitor counts deploys, sec 3.8). */
     emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_DEPLOY((uint8_t)region));
@@ -778,6 +785,9 @@ static void do_stop(uint8_t region_sel)
     }
     if (g_regions[region_sel].state != REGION_FREE) {
         uint8_t err;
+        /* v0.8 sec 3.10: unlock before blanking — the hardware gate would
+         * otherwise refuse the per-column BLANK. */
+        lkm_unlock(region_sel);
         if (g_regions[region_sel].img_cols != 0u) {
             err = occ_blank_packed(region_sel, g_regions[region_sel].img_cols,
                                    g_regions[region_sel].img_words);
@@ -816,6 +826,8 @@ static void do_restart(void)
     }
     if (g_regions[region].state == REGION_RUNNING) {
         uint8_t err;
+        /* v0.8 sec 3.10: unlock before the stop-half BLANK. */
+        lkm_unlock(region);
         if (g_regions[region].img_cols != 0u) {
             err = occ_blank_packed(region, g_regions[region].img_cols,
                                    g_regions[region].img_words);
@@ -840,6 +852,27 @@ static void do_restart(void)
     } else {
         do_run(region);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Region lock matrix (v0.8 sec 3.10, C03 sec 5): a region is locked    */
+/* while it runs, so any raw OCC write from another bus master is       */
+/* refused by the hardware gate; the daemon unlocks before blanking.    */
+/* ------------------------------------------------------------------ */
+static void lkm_cmd(uint8_t op, uint8_t region)
+{
+    emri_write(EMRI_LKM_CMD_WORD,
+               (uint32_t)op | ((uint32_t)(region & 0x0Fu) << 4));
+}
+
+static void lkm_lock(uint8_t region)
+{
+    lkm_cmd(EMRI_LKM_OP_LOCK, region);
+}
+
+static void lkm_unlock(uint8_t region)
+{
+    lkm_cmd(EMRI_LKM_OP_UNLOCK, region);
 }
 
 /* ------------------------------------------------------------------ */
@@ -950,6 +983,7 @@ static void do_abort(void)
             (void)ctx_issue(EMRI_CTX_CMD_RESTORE);
         }
         if (g_regions[i].state != REGION_FREE) {
+            lkm_unlock((uint8_t)i); /* v0.8 sec 3.10: unlock before abort's BLANK */
             if (g_regions[i].img_cols != 0u) {
                 (void)occ_blank_packed((uint8_t)i, g_regions[i].img_cols,
                                        g_regions[i].img_words);

@@ -307,7 +307,15 @@ module tb_bmc_daemon_packed;
       .start_i(dec_start), .col_i(dec_col),
       .busy_o(dec_busy), .done_o(dec_done),
       .fbus_addr_i(fbus_addr), .fbus_wdata_i(fbus_wdata), .fbus_we_i(fbus_we),
-      .frame_base_i(16'h0000),
+      // The decoder buffers the stream at `fbus_addr_i - frame_base_i`, so
+      // frame_base MUST be the base of the column being decoded. The daemon
+      // programs OCC_FRAME_ADDR = column_frame_base(region,col) (spec §2, v0.6:
+      // region<<12 | col<<8) immediately before pulsing OCC_DECODE=col, so the
+      // column controller's frame-base register IS the live OCC_FRAME_ADDR.
+      // (With a constant 0 — the pre-v0.6 single-column shortcut — column 1's
+      // words land at 0x100+ > MAX_WORDS, are silently dropped by the capture
+      // guard, and the decoder re-decodes the STALE column-0 buffer: E1-DMO2c.)
+      .frame_base_i(occ_frame_addr),
       .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
       .crc_error_o(dec_crc_error)
   );
@@ -461,6 +469,23 @@ module tb_bmc_daemon_packed;
       end
   endtask
 
+  // Diagnostic: print the tail of the captured daemon UART log (so a failing
+  // deploy reports the daemon's own verdict — "err occ_reject", "st ERROR", the
+  // last per-column state line — instead of only a failed containment check).
+  task automatic dump_uart_tail;
+      integer from, j;
+      begin
+          from = (rxn > 256) ? (rxn - 256) : 0;
+          $write("       daemon UART tail (last %0d of %0d bytes):\n       ",
+                 rxn - from, rxn);
+          for (j = from; j < rxn; j = j + 1) begin
+              if (rxq[j] == 8'h0a) $write("\n       ");
+              else $write("%c", rxq[j]);
+          end
+          $write("\n");
+      end
+  endtask
+
   // ============================================================================
   // Host BFM (AXI master 1) — drive on negedge, sample handshakes on posedge
   // ============================================================================
@@ -573,6 +598,33 @@ module tb_bmc_daemon_packed;
               to = to + 1;
           end
           chk(s[3:0] == st && !s[4], tag);
+      end
+  endtask
+
+  // Same terminal wait as host_wait_terminal(RUNNING), but it also stops on the
+  // daemon's ERROR state: a refused/CRC-failed per-column op is terminal in
+  // ERROR within microseconds, so spinning the whole 4 M-iteration poll budget
+  // (~4 s sim ≈ 20 min wall) before reporting only makes a failing run useless
+  // as a diagnostic. The verdict is unchanged — ERROR still FAILS the check.
+  task automatic host_wait_running_or_error(input string tag);
+      logic [31:0] s;
+      integer to;
+      begin
+          to = 0;
+          host_rd(R_EFP_STATUS, s);
+          while (!((s[3:0] == EFP_S_RUNNING && !s[4]) || (s[3:0] == EFP_S_ERROR))
+                 && to < 4000000) begin
+              #(1000);
+              host_rd(R_EFP_STATUS, s);
+              to = to + 1;
+          end
+          chk(s[3:0] == EFP_S_RUNNING && !s[4], tag);
+          if (s[3:0] == EFP_S_ERROR) begin
+              host_rd(R_EFP_ERR, s);
+              $display("       daemon ERROR: EFP_ERR=%0d (1=bad_sig 4=occ_crc 5=occ_reject 7=img_len 9=watchdog)",
+                       s[7:0]);
+              dump_uart_tail();
+          end
       end
   endtask
 
@@ -822,7 +874,7 @@ module tb_bmc_daemon_packed;
       host_stream_packed_col(0);
       wait_uart_new("st LOAD c1\n", "run_packed C: col 1 WRITE armed");
       host_stream_packed_col(1);
-      host_wait_terminal(EFP_S_RUNNING, "run_packed C: terminal RUNNING (busy=0)");
+      host_wait_running_or_error("run_packed C: terminal RUNNING (busy=0)");
       host_rd(R_EFP_STATUS, rd);
       chk(rd[3:0] == EFP_S_RUNNING && rd[5] == 1'b1,
           "run_packed C: EFP_STATUS = RUNNING + done");

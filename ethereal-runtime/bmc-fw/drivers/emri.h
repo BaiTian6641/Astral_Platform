@@ -52,6 +52,14 @@
 #define EMRI_CTX_STATUS_DONE  (1u << 0)
 #define EMRI_CTX_STATUS_BUSY  (1u << 1)
 #define EMRI_CTX_STATUS_ERR   (1u << 2)
+/* Region lock matrix (v0.8, spec sec 3.10; C03 sec 5). */
+#define EMRI_LKM_STATUS_WORD  0x29u /* R_LKM_STATUS R: [7:0] region locks, [8] global */
+#define EMRI_LKM_CMD_WORD     0x2Au /* R_LKM_CMD    W: [3:0] op, [7:4] region index */
+#define EMRI_LKM_OP_LOCK       0x1u /* lock region */
+#define EMRI_LKM_OP_UNLOCK     0x2u /* unlock region */
+#define EMRI_LKM_OP_LOCK_ALL   0x3u /* global lock */
+#define EMRI_LKM_OP_UNLOCK_ALL 0x4u /* global unlock */
+#define EMRI_LKM_STATUS_GLOBAL (1u << 8)
 /* Capability-declaration gate (v0.6 sec 3.7): the host stages the compact
  * capabilities.yaml bitmap before EFP_CMD; CAP_STATUS is the RTL verdict
  * (read-only — cap_decl_* are plain RW staging, CAP_STATUS is produced by the

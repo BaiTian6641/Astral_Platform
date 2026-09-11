@@ -18,6 +18,8 @@ Outputs (under --out):
     dec_col0.hex     2x2 col-0 frame with a KNOWN non-trivial config (unit TB).
     img_a_col0.hex   image A = TFF on tile(0,0) eLUT0 (capstone).
     img_b_col0.hex   image B = const1 on tile(0,0) eLUT0 (capstone).
+    img_c_col0.hex   image C col 0 = TFF on tile(0,0) eLUT0 (multi-column).
+    img_c_col1.hex   image C col 1 = const1 on tile(0,1) eLUT0 (multi-column).
     blank_col0.hex   all-zero safe (blank) frame.
     manifest.json    expected geometry + a handful of check-points for the TBs.
 """
@@ -87,11 +89,28 @@ def build(fm: FrameMap) -> dict[str, list[int]]:
     img_b = fm.pack_column(0, [{"elut0": CONST1_WORD}, {}])
     blank = fm.blank_column(0)
 
+    # --- 2-column packed image C (E1-DMO2c, multi-column deploy) --------------
+    # The first packed image that spans TWO fabric columns: col0 keeps the TFF
+    # image (clb_out_obs[0] toggles), col1 is a const1 image on its own column's
+    # tile(row0,col1) eLUT0 -> clb_out_obs[8] (= tile index r*C+c = 1) is
+    # constant 1. The columns therefore carry DISTINGUISHABLE configurations:
+    # a swapped/mixed column, or a per-column frame window that aliases col0's
+    # (the v0.5 col<<4 stride, E1-DMO2b), is visible in the fabric outputs and
+    # in the per-column config windows.
+    img_c_col0 = fm.pack_column(0, [
+        {"elut0": TFF_WORD,
+         "iib_mux0": 0, "iib_mux1": 0, "iib_mux2": 0, "iib_mux3": 0},
+        {},
+    ])
+    img_c_col1 = fm.pack_column(1, [{"elut0": CONST1_WORD}, {}])
+
     return {
         "dec_col0": dec_col0,
         "img_a_col0": img_a,
         "img_b_col0": img_b,
         "blank_col0": blank,
+        "img_c_col0": img_c_col0,
+        "img_c_col1": img_c_col1,
     }
 
 
@@ -174,6 +193,22 @@ def main() -> int:
         "tff_word": TFF_WORD,
         "const1_word": CONST1_WORD,
         "frames": {name: len(words) for name, words in frames.items()},
+        # Multi-column (2-column) image C: per-column DATA words + the frame
+        # windows the daemon programs (spec sec 2: OCC_FRAME_ADDR =
+        # {region_id[15:12], col_id[11:8], word[7:0]}) + the fabric outputs it
+        # must produce (tile index r*C+c, eLUT0 of each column's row-0 tile).
+        "img_c": {
+            "region": 0,
+            "cols": [0, 1],
+            "col_data_words": [fm.column_data_words(0), fm.column_data_words(1)],
+            "column_frame_base": {"col0": 0x0000, "col1": 0x0100},
+            "checks": {
+                "col0_tile0_elut0": {"tile": 0, "unit": 0, "intra": 0,
+                                     "data": TFF_WORD},
+                "col1_tile1_elut0": {"tile": 1, "unit": 0, "intra": 0,
+                                     "data": CONST1_WORD},
+            },
+        },
         # expected decode checks for tb_frame_decoder (unit TB), tile(0,0):
         #   cfg_addr = {tile_idx@[8+:TIW], unit@[7:6], intra@[5:0]}; TIW=2 for 2x2.
         # NOTE on tile index: cfg_addr tile field is ROW-MAJOR (tile_idx = r*C+c,
