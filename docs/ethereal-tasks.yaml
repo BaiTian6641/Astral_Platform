@@ -429,7 +429,7 @@ tasks:
     est_days: 2
     deliverable: release v0.1.0 + 博客文章
     acceptance: 仓库公开，文档站上线
-    status: todo   # 2026-09-11: 依赖 E1-DMO2（sim 验收已过，见 report-E1-DMO2-hotswap-stress-20260911）；验收物全部为外部动作（8 仓库公开 / 3 分钟演示视频 / 博客 / 文档站 / 社区发布），需维护者执行——本环境无法完成
+    status: blocked   # 2026-09-11: 依赖 E1-DMO2（sim 验收已过，见 report-E1-DMO2-hotswap-stress-20260911）；验收物全部为外部动作，需维护者执行。**2026-09-12 已把可本地完成的部分做完**：`docs/releases/v0.1.0-notes.md`（发布说明，逐条引用本仓库可复现证据）+ `docs/blog/2026-09-12-docker-for-fpgas.md`（博客初稿）+ `AGENTS.md` §7 状态块刷新（2026-09-12：当前队列、复现入口、证据映射、固件新鲜度陷阱、DMEM/Ed25519 栈预算警告）。⇒ 剩余 = 打 tag / 创建 Release / 8 仓库公开 / 演示视频 / 文档站上线 / 社区发布（外部动作）
 
   # ================= PHASE 2（中粒度） =================
   - id: E2-FAB1

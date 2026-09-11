@@ -3,7 +3,7 @@
 > **Who this is for**: AI coding agents (Kimi K3 and others) operating in this repository.
 > Read this file fully before any task. It encodes the project's identity, locked decisions,
 > mandatory engineering rules, and the operating protocol you must follow.
-> Last updated: 2026-07-24 · Plan version: v2.1
+> Last updated: 2026-09-12 · Plan version: v2.1
 
 ---
 
@@ -136,9 +136,7 @@ If you find yourself proposing something contrary to these, STOP. These are sett
 
 ## 7. Current work & your operating loop
 
-**We are at the very start of Phase 0 (M0–M2): simulation validation, no vendor tools.** Phase-0 exit: dual-image hot-swap passes in sim; AES-128 & FIR16 bit-true; ADR-012 archived; CI green.
-
-**Phase 0 week-by-week:** Wk1 infra (`E0-INF1/2/3/4`) → Wk2–3 fabric core (`E0-FAB1..6`, OCC) → Wk3–4 toolchain (`E0-MAP1..5`) → Wk5–8 Shell assembly + dual-image hot-swap demo.
+**Phase 0 week-by-week (historical plan):** Wk1 infra (`E0-INF1/2/3/4`) → Wk2–3 fabric core (`E0-FAB1..6`, OCC) → Wk3–4 toolchain (`E0-MAP1..5`) → Wk5–8 Shell assembly + dual-image hot-swap demo.
 
 **For any task, follow this loop:**
 1. Read this `AGENTS.md`, then the relevant `phases/phase-N-*.md` + `subsystems/Sxx.md` + `components/Cxx.md`.
@@ -155,6 +153,16 @@ The **AXI-MailboxFabric NoC** (EBI backbone, S04) licensing is **FINALIZED** (`e
 - **Remote:** `origin = https://github.com/BaiTian6641/Astral_Platform.git` (personal account; an `ethereal-fpga` org split is a later decision gated by `E0-INF4`).
 - **Local toolchain = OSS-CAD Suite** at `~/oss-cad-suite` (Verilator 5.051, Yosys 0.67, iverilog 14, cocotb). With `PATH=~/oss-cad-suite/bin:$PATH`: `make lint` (project RTL — **clean**), `make test-sv` (SystemVerilog testbenches via iverilog/vvp), and `make test-model` (golden-model pytest) **all run locally** — the verilator-lint + DUT-sim backlog is CLEARED. Docker (`make docker-build`) is now OPTIONAL (only for the full reproducible VPR image / CI parity). `gh` still absent → real GitHub push deferred to maintainer.
 - **Fabric core validated (2026-07-24):** `E0-FAB1..3` (elut4, clb_t, switch_box, fabric_top) DONE + **lint-clean** (OSS-CAD: clean modules strict `-Wall`; fabric loop-modules with documented `-Wno-UNOPTFLAT` per §2.4) + golden-model **1876 pytest pass** + **3 SystemVerilog testbenches pass** (`make test-sv`, via iverilog/vvp). cocotb has a py3.11/3.12 + v1/v2-makefile mismatch locally → **SV TBs are the local DUT validation**. v1 IIB = flat crossbar, SB = disjoint unidir (both VPR-pending ASSUMPTIONs). **Convention:** `make test-model` = pure-Python golden-model pytest (local); `make test-sv` = SystemVerilog TBs via iverilog (local); cocotb `test_<unit>.py` = Docker-gated (needs the ethereal-sim image's cocotb). Next: `S02-P0#1` (frame-map) / `E0-FAB4` (OCC v0).
+
+### 📍 State (2026-09-12) — what is verified, and how to re-verify it
+
+- **Queue:** see `docs/ethereal-tasks.yaml` (the live source of truth). Open items are `E2-RV1` (eth_rv depth), `E2-AST1` (WASM acceptance — environment-gated), `E1-DMO3` + `E0-INF2` (external actions: publish, first real CI run).
+- **Local toolchain (beyond OSS-CAD):** Spike (`generated/rv_difftest/spike/install/bin/spike`, needs the built `dtc` on `PATH`) and the RISC-V GCC (`~/tools/riscv/usr/bin`) power the `eth_rv` DiffTest. Entry points: `make lint`, `make test-model`, `make test-sv`, `make verif-rv`, `make formal`, `make stress`.
+- **Fabric/control-plane evidence** (all reproducible in sim): hot-swap incl. 2-column packed deploy (**57 ok**), lock matrix end-to-end (**91 ok / 0 FAIL**), ctx-scan pause/resume, DRAM ctrl (13854 checks), multi-channel DMA (**60 checks** + k-induction), AXI burst routing (2813 checks + formal), OCI registry tools (48 tests). Measured Fmax 93.77/69.35/99.09 MHz (LUT map); DSP-mapped MAC 324–331 MHz, FIR16 259 MHz, bit-exact.
+- **`eth_rv` (C14) status:** RV64IMC 5-stage core with Zicsr + M/S/U-capable CSRs + RVFI trace; **8 corpus programs MATCH Spike on both the beat and the AXI/DRAM paths**; bare-metal UART hello (15 frames × 160 cycles, 0 framing errors); access-fault traps for D/I ports. `make verif-rv` covers the Python harness; Verilator TBs are the RTL oracle.
+- **Firmware freshness trap:** after ANY `ethereal-runtime/bmc-fw/**` change, run `make -C ethereal-runtime/bmc-fw` (and `script scripts` for that variant) **and copy the hexes from `ethereal-runtime/bmc-fw/build/` into `generated/bmc/`** — otherwise the Verilator TBs silently run stale firmware. `make test-sv` does this for you.
+- **Firmware budget warning (E2-BMC):** the DMEM-exec daemon's Ed25519 verify chain needs ~2 KiB of stack; any DMEM growth eats it (found while building the AST1 script demo).
+- **Reports:** every closed task has `docs/reports/report-<task>-<date>.md` with a Mermaid diagram and the two fixed sections; read them before re-deriving state.
 
 ### ⚠️ Open questions pending maintainer confirmation (raise if your task touches them)
 🔴 exact Zynq US+ board model · 🔴 Tang Mega 138K Dock vs Pro (Board Manifest) · 🟡 virtual LUT granularity final = LUT4? · 🟡 ADR-012 dual-track acceptable? · 🟡 Profile-E first small device · 🟡 BMC FW v1 bare-metal vs Zephyr. Full list in `memory/04-roadmap-phases.md`.
