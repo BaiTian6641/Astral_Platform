@@ -69,6 +69,15 @@ module tb_eth_rv_core;
     // ------------------------------------------------------------------ params
     localparam int unsigned MEM_WORDS = 32_768;   // 256 KiB @ 8 B/word
 
+    // Console UART of the SoC data map (rtl/eth_rv/eth_rv_mmio_mux.sv): the same
+    // page Spike's ns16550 answers on, with a 16-cycle bit cell, so a queued
+    // burst drains at 160 cycles per byte. The receiver below decodes the line
+    // with the SAME divisor, which is what makes the frame timing checkable.
+    localparam logic [63:0] UART_BASE = 64'h0000_0000_1000_0000;
+    localparam int unsigned UART_DIV  = 16;       // cycles per 8N1 bit cell
+    localparam int unsigned UART_FRAME_CYCLES = 10 * UART_DIV;
+    localparam int unsigned UART_MAX_BYTES = 256; // receiver buffer (overflow = FAIL)
+
 `ifndef ETH_RV_LINE_BEATS
 `define ETH_RV_LINE_BEATS 1     // eth_rv_axi_master read line fill (1 = single beat)
 `endif
@@ -100,6 +109,14 @@ module tb_eth_rv_core;
     int unsigned max_traps;
     int unsigned fault_index;
     logic [63:0] fault_value;
+    // Console-UART controls: the received byte string is written to `+uart=<file>`
+    // and `+uart_fault_frame=N +uart_fault_bit=M` inverts one bit cell of one
+    // received frame — the negative control for the UART assertion (the runner
+    // must then see the wrong string; it is a line fault, never a design option).
+    string       uart_path;
+    int unsigned uart_drain_cycles;
+    int          uart_fault_frame;
+    int          uart_fault_bit;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -149,6 +166,18 @@ module tb_eth_rv_core;
     logic        imem_ready;
     logic [31:0] imem_rdata;
 
+    // The core's own D port (`core_dmem_*`) goes through the SoC MMIO decode,
+    // which re-drives the memory-side `dmem_*` group below — so the behavioral
+    // memory and the AXI/DRAM path both keep seeing exactly what they saw
+    // before, plus the address filter that keeps device accesses out of them.
+    logic        core_dmem_req;
+    logic        core_dmem_we;
+    logic [63:0] core_dmem_addr;
+    logic [63:0] core_dmem_wdata;
+    logic [7:0]  core_dmem_wstrb;
+    logic        core_dmem_ready;
+    logic [63:0] core_dmem_rdata;
+
     logic        dmem_req;
     logic        dmem_we;
     logic [63:0] dmem_addr;
@@ -156,6 +185,10 @@ module tb_eth_rv_core;
     logic [7:0]  dmem_wstrb;
     logic        dmem_ready;
     logic [63:0] dmem_rdata;
+
+    logic        uart_tx;
+    logic        uart_busy;
+    logic        uart_overflow;
 
     logic        rvfi_valid;
     logic [63:0] rvfi_order;
@@ -182,13 +215,13 @@ module tb_eth_rv_core;
         .imem_addr_o     (imem_addr),
         .imem_ready_i    (imem_ready),
         .imem_rdata_i    (imem_rdata),
-        .dmem_req_o      (dmem_req),
-        .dmem_we_o       (dmem_we),
-        .dmem_addr_o     (dmem_addr),
-        .dmem_wdata_o    (dmem_wdata),
-        .dmem_wstrb_o    (dmem_wstrb),
-        .dmem_ready_i    (dmem_ready),
-        .dmem_rdata_i    (dmem_rdata),
+        .dmem_req_o      (core_dmem_req),
+        .dmem_we_o       (core_dmem_we),
+        .dmem_addr_o     (core_dmem_addr),
+        .dmem_wdata_o    (core_dmem_wdata),
+        .dmem_wstrb_o    (core_dmem_wstrb),
+        .dmem_ready_i    (core_dmem_ready),
+        .dmem_rdata_i    (core_dmem_rdata),
         .rvfi_valid_o    (rvfi_valid),
         .rvfi_order_o    (rvfi_order),
         .rvfi_pc_o       (rvfi_pc),
@@ -205,6 +238,37 @@ module tb_eth_rv_core;
         .err_pc_o        (core_err_pc),
         .err_insn_o      (core_err_insn),
         .err_code_o      (core_err_code)
+    );
+
+    // ------------------------------------------------------------- SoC MMIO decode
+    // The core has ONE data port; the console UART is decoded in front of the
+    // memory path (rtl/eth_rv/eth_rv_mmio_mux.sv). Everything the memory side
+    // sees is unchanged for a non-device address, so both D-port builds below
+    // keep their existing behavior bit for bit.
+    eth_rv_mmio_mux #(
+        .UART_BASE      (UART_BASE),
+        .UART_BIT_CYCLES(UART_DIV),
+        .UART_FIFO_DEPTH(64)
+    ) u_mmio (
+        .clk_i          (clk),
+        .rst_ni         (rst_n),
+        .req_i          (core_dmem_req),
+        .we_i           (core_dmem_we),
+        .addr_i         (core_dmem_addr),
+        .wdata_i        (core_dmem_wdata),
+        .wstrb_i        (core_dmem_wstrb),
+        .ready_o        (core_dmem_ready),
+        .rdata_o        (core_dmem_rdata),
+        .mem_req_o      (dmem_req),
+        .mem_we_o       (dmem_we),
+        .mem_addr_o     (dmem_addr),
+        .mem_wdata_o    (dmem_wdata),
+        .mem_wstrb_o    (dmem_wstrb),
+        .mem_ready_i    (dmem_ready),
+        .mem_rdata_i    (dmem_rdata),
+        .uart_tx_o      (uart_tx),
+        .uart_busy_o    (uart_busy),
+        .uart_overflow_o(uart_overflow)
     );
 
     // ------------------------------------------------------------------ I port
@@ -444,8 +508,111 @@ module tb_eth_rv_core;
     end
 `endif
 
+    // ------------------------------------------------------------------ console
+    // Receiver-side model of the SoC UART's serial line (a standard 8N1 mid-bit
+    // sampler using the SAME divisor the transmitter was built with), so what
+    // the runner asserts is a bit-timing property and not just a byte count:
+    //   * every frame is start(0) + eight data bits LSB first + stop(1), and
+    //     each of its ten bit cells is sampled at its center;
+    //   * consecutive frames inside a burst are exactly UART_FRAME_CYCLES cycles
+    //     apart (start edge to start edge) — the transmit queue never runs dry
+    //     mid-burst, so the whole string holds one bit rate;
+    //   * the bytes that come out are the string the program wrote.
+    // A frame error (start not low, stop not high), a FIFO overflow at the
+    // transmitter and a receiver-buffer overflow are all counted; the runner
+    // requires zero. `+uart_fault_frame=N +uart_fault_bit=M` inverts one bit
+    // cell of one received frame on the way in: a verification-only line fault,
+    // the negative control for the assertion above.
+    localparam logic [15:0] RX_RELOAD_START = 16'(UART_DIV / 2 - 1);
+    localparam logic [15:0] RX_RELOAD       = 16'(UART_DIV - 1);
+
+    logic        rx_active;
+    logic [15:0] rx_baud_cnt;
+    logic [3:0]  rx_cell;
+    logic [7:0]  rx_acc;
+    logic [7:0]  rx_bytes [0:UART_MAX_BYTES-1];
+    int unsigned rx_nbytes;
+    int unsigned rx_nframes;
+    int unsigned rx_errors;
+    int unsigned rx_prev_start;
+    int unsigned rx_gap_min;
+    int unsigned rx_gap_max;
+    int unsigned rx_cycles;
+    bit          rx_start_seen;
+    bit          rx_gap_seen;
+    bit          rx_buf_overflow;
+    bit          rx_fault_active;
+
+    wire uart_line = uart_tx ^ rx_fault_active;
+
+    assign rx_fault_active = (uart_fault_frame >= 0)
+                             && (int'(rx_nframes) == uart_fault_frame)
+                             && (int'(rx_cell) == uart_fault_bit)
+                             && rx_active;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_active       <= 1'b0;
+            rx_baud_cnt     <= 16'd0;
+            rx_cell         <= 4'd0;
+            rx_acc          <= 8'h00;
+            rx_nbytes       <= 0;
+            rx_nframes      <= 0;
+            rx_errors       <= 0;
+            rx_prev_start   <= 0;
+            rx_gap_min      <= 0;
+            rx_gap_max      <= 0;
+            rx_cycles       <= 0;
+            rx_start_seen   <= 1'b0;
+            rx_gap_seen     <= 1'b0;
+            rx_buf_overflow <= 1'b0;
+        end else begin
+            rx_cycles <= rx_cycles + 1;
+            if (!rx_active) begin
+                if (!uart_line) begin          // start-bit falling edge
+                    rx_active   <= 1'b1;
+                    rx_baud_cnt <= RX_RELOAD_START;
+                    rx_cell     <= 4'd0;
+                    rx_acc      <= 8'h00;
+                    if (rx_start_seen) begin   // gap = start edge to start edge
+                        rx_gap_min <= (rx_gap_seen && ((rx_cycles - rx_prev_start) >= rx_gap_min))
+                                      ? rx_gap_min : (rx_cycles - rx_prev_start);
+                        rx_gap_max <= (rx_gap_seen && ((rx_cycles - rx_prev_start) <= rx_gap_max))
+                                      ? rx_gap_max : (rx_cycles - rx_prev_start);
+                        rx_gap_seen <= 1'b1;
+                    end else begin
+                        rx_start_seen <= 1'b1;
+                    end
+                    rx_prev_start <= rx_cycles;
+                end
+            end else if (rx_baud_cnt == 16'd0) begin
+                rx_baud_cnt <= RX_RELOAD;      // next bit cell, sampled at its center
+                rx_cell     <= rx_cell + 4'd1;
+                if (rx_cell == 4'd0) begin
+                    if (uart_line) rx_errors <= rx_errors + 1;    // start bit must be low
+                end else if (rx_cell == 4'd9) begin
+                    if (!uart_line) rx_errors <= rx_errors + 1;   // stop bit must be high
+                    rx_active <= 1'b0;
+                    rx_nframes <= rx_nframes + 1;
+                    if (rx_nbytes < UART_MAX_BYTES) begin
+                        rx_bytes[rx_nbytes] <= rx_acc;
+                        rx_nbytes <= rx_nbytes + 1;
+                    end else begin
+                        rx_buf_overflow <= 1'b1;
+                    end
+                end else begin
+                    rx_acc <= {uart_line, rx_acc[7:1]};           // data bits, LSB first
+                end
+            end else begin
+                rx_baud_cnt <= rx_baud_cnt - 16'd1;
+            end
+        end
+    end
+
     // ------------------------------------------------------------------ trace
     integer      trace_fd;
+    integer      uart_fd;
+    int unsigned drain_used;
     int unsigned commits;
     int unsigned n_compressed;
     int unsigned n_loads;
@@ -609,6 +776,10 @@ module tb_eth_rv_core;
         fault_field  = "none";
         mem_path     = "";
         trace_path   = "";
+        uart_path    = "";
+        uart_drain_cycles = 20_000;
+        uart_fault_frame  = -1;
+        uart_fault_bit    = 0;
         rst_n        = 1'b0;
 
         void'($value$plusargs("mem=%s", mem_path));
@@ -621,6 +792,10 @@ module tb_eth_rv_core;
         void'($value$plusargs("fault_index=%d", fault_index));
         void'($value$plusargs("fault_value=%h", fault_value));
         void'($value$plusargs("fault_field=%s", fault_field));
+        void'($value$plusargs("uart=%s", uart_path));
+        void'($value$plusargs("uart_drain=%d", uart_drain_cycles));
+        void'($value$plusargs("uart_fault_frame=%d", uart_fault_frame));
+        void'($value$plusargs("uart_fault_bit=%d", uart_fault_bit));
 
         if (mem_path == "") begin
             $display("ETH_RV_TB: FAIL no +mem=<file> given");
@@ -664,19 +839,64 @@ module tb_eth_rv_core;
                      commits, cycle_cnt);
             $fatal(1);
         end
+
+        // ---------------------------------------------------------- console UART
+        // The commit trace is closed above, so the cycles spent here cannot
+        // affect the DiffTest — they exist so the serial line finishes carrying
+        // the burst the program queued before its HTIF exit store.
+        drain_used = 0;
+        while (uart_busy && (drain_used < uart_drain_cycles)) begin
+            @(posedge clk);
+            drain_used = drain_used + 1;
+        end
+        if (uart_busy) begin
+            $display("ETH_RV_TB: FAIL the console UART did not drain within %0d cycles",
+                     uart_drain_cycles);
+            $fatal(1);
+        end
+        if (uart_overflow) begin
+            $display("ETH_RV_TB: FAIL a console UART transmit byte was dropped (queue full)");
+            $fatal(1);
+        end
+        if (rx_buf_overflow) begin
+            $display("ETH_RV_TB: FAIL the console UART receiver buffer overflowed");
+            $fatal(1);
+        end
+        if (uart_path != "") begin
+            uart_fd = $fopen(uart_path, "w");
+            if (uart_fd == 0) begin
+                $display("ETH_RV_TB: FAIL cannot open uart file '%s'", uart_path);
+                $fatal(1);
+            end
+            // Header fields are what the runner asserts (plus the hex payload on
+            // the `data:` line, so any byte value survives the text format).
+            $fwrite(uart_fd, "# eth_rv uart rx v1\n");
+            $fwrite(uart_fd, "# bit_cycles: %0d frame_cycles: %0d bytes: %0d frames: %0d errors: %0d overflow: %0d drain_cycles: %0d\n",
+                    UART_DIV, UART_FRAME_CYCLES, rx_nbytes, rx_nframes, rx_errors,
+                    rx_buf_overflow, drain_used);
+            $fwrite(uart_fd, "# gap_min: %0d gap_max: %0d\n", rx_gap_min, rx_gap_max);
+            $fwrite(uart_fd, "data: ");
+            for (int unsigned i = 0; i < rx_nbytes; i = i + 1) begin
+                $fwrite(uart_fd, "%02x", rx_bytes[i]);
+            end
+            $fwrite(uart_fd, "\n");
+            $fclose(uart_fd);
+        end
 `ifdef ETH_RV_DRAM_AXI
         if (axi_err) begin
             $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  last_trap_cause, last_mem_addr, last_store_data, last_insn,
-                 n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats);
+                 n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
+                 rx_nbytes, rx_nframes, rx_errors, drain_used);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 last_trap_cause, last_mem_addr, last_store_data, last_insn);
+                 last_trap_cause, last_mem_addr, last_store_data, last_insn,
+                 rx_nbytes, rx_nframes, rx_errors, drain_used);
 `endif
         $finish;
     end

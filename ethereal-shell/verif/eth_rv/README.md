@@ -72,7 +72,7 @@ Spike is installed elsewhere, point the harness at it with `--spike PATH` or
 | `rv_dut.py` | DUT adapters (`dump:` / `model:` / `callback:`) + fault injection |
 | `rv_model.py` | Worked-example DUT: RV64IMC interpreter (RV64I + M + integer C subset) |
 | `rv_difftest.py` | CLI + comparator: first divergence with pc/rd/cycle, exit codes |
-| `corpus/` | Bare-metal RV64IMC corpus: `crt0.S`, `link.ld`, four `cor_*.S` programs, builder |
+| `corpus/` | Bare-metal RV64IMC corpus: `crt0.S`, `link.ld`, seven `cor_*.S` programs, builder |
 | `tests/` | pytest suite; `tests/fixtures/` holds the checked-in golden fixtures |
 
 ## The trace protocol
@@ -153,7 +153,12 @@ Two details matter and are handled for you:
 tests) run without Spike. A *canonical* trace needs nothing else; a *raw* Spike
 log additionally needs `--elf` so the two rules above can be applied.
 
-## DUT side: how the future `eth_rv` RTL plugs in
+## DUT side: how the `eth_rv` RTL plugs in
+
+The RTL is here now (`ethereal-shell/rtl/eth_rv/`, E2-RV1): the core's RVFI port
+feeds the testbench below, and `ethereal-shell/verif/eth_rv_core/run_difftest.py`
+(the `make verif-rv-rtl` target) drives the whole loop — corpus →
+`$readmemh` image → Verilated run → `dump:` comparison → console assertion.
 
 Three adapters, one contract: an ordered iterator of commits.
 
@@ -189,7 +194,7 @@ produce, memory stream included.
 
 ## Corpus
 
-Four self-checking bare-metal programs (`-march=rv64imc -mabi=lp64 -nostdlib
+Seven self-checking bare-metal programs (`-march=rv64imc_zicsr -mabi=lp64 -nostdlib
 -mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
 `corpus/crt0.S`):
 
@@ -201,6 +206,7 @@ Four self-checking bare-metal programs (`-march=rv64imc -mabi=lp64 -nostdlib
 | `cor_csr.S` | M-mode CSR read/write semantics: `mhartid`, `mscratch` (all three op forms + immediate), `misa` (read-only), `mie` (mask), `mip` (access legality), `mtvec` (MODE kept), `mepc` (bit 0 RO), `mcause`/`mtval`, `mstatus` (write mask) |
 | `cor_trap.S` | the exception path: `ecall`, compressed/32-bit `ebreak`, illegal (32-bit + compressed), misaligned load/store (all widths + a compressed store), unimplemented CSR numbers, `mstatus` bookkeeping, trap-aborts-the-access, a MODE=1 `mtvec` |
 | `cor_model.S` | the C forms the example DUT implements — source of the checked-in fixtures |
+| `cor_hello.S` | the C14 §8 checkpoint 5 bring-up vehicle: polls the SoC UART's line-status register and writes a known string to its transmit register at `0x1000_0000`, then exits via HTIF — see "Console" below |
 
 `main` returns 0 on success or the index of the first failed check; `crt0.S`
 turns that into the HTIF exit store, so a corpus bug shows up as a non-zero
@@ -220,6 +226,57 @@ not matter here because the corpus is `-nostdlib -nostartfiles -ffreestanding`:
 `-march=rv64imc -mabi=lp64` compiles and links as-is. If a future corpus program
 needs libc/libgcc, build it for `rv64imac` (or add a multilib) — Spike and the
 harness take the ISA string from `--isa`, so nothing else changes.
+
+## Console: bare-metal `hello` over the SoC UART (C14 §8 checkpoint 5)
+
+`cor_hello.S` is the bring-up vehicle the RV-B milestone is defined by: a
+bare-metal program that makes itself visible on a serial line, on a channel
+independent of the BMC/mFSM mailbox (S15 §5). The SoC side is
+`ethereal-shell/rtl/eth_rv/eth_rv_uart.sv` (a 16550-subset byte-register
+peripheral with an 8N1 transmit shifter and a parameterised clock divisor) behind
+`ethereal-shell/rtl/eth_rv/eth_rv_mmio_mux.sv` (the D-port address decoder, on the
+same `0x1000_0000` page Spike's own `ns16550` answers on). The testbench
+(`verif/eth_rv_core/tb_eth_rv_core.sv`) decodes the serial line and the RTL runner
+asserts the result:
+
+```bash
+PATH="$HOME/oss-cad-suite/bin:$PATH" make verif-rv-rtl          # all seven programs
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_hello
+# -> [rv-rtl] cor_hello: UART 15 bytes 'hello, eth_rv!\n' — 15 frames of 160 cycles
+#            (16-cycle bit cell), gap 160..160, 0 frame error(s)
+#    MATCH: 134 commits compared, 0 divergence — pc, rd and value agree
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_hello --uart-fault 0:1
+# -> [rv-rtl] cor_hello: UART negative control caught: payload 'iello, eth_rv!\n' != …
+```
+
+What exactly is asserted, and why it is a *bit-timing* claim rather than a byte
+count: the testbench samples each frame at the centre of its ten bit cells with
+the same divisor the transmitter was built with, checks the start/stop levels
+(framing), counts the frames, and measures the start-edge-to-start-edge distance
+of every consecutive pair — they must all equal exactly `10 × BIT_CYCLES`. A
+transmitter whose bit rate were off, or that left an idle bit between frames,
+fails that measurement even if the bits happened to be sampled correctly.
+
+The register-visible status of the UART is deliberately Spike's model rather than
+the physical transmitter's: Spike's `ns16550` never reports a busy transmitter
+(`tx_byte()` writes the character and leaves `TEMT|THRE` set), so `LSR` reads
+`0x60` on both sides at all times and a `while (!(lsr & THRE)) ;` poll retires
+exactly the same number of instructions under Spike and under the RTL. A UART
+that exposed its real divider-paced state would make the poll loop take a
+different number of iterations on each side, and the two commit streams could not
+match at all. The physical state is exported as the module's `tx_busy_o` /
+`tx_overflow_o` ports (verification status, not program-visible state), and the
+testbench uses the first to know when the burst has drained and the second to FAIL
+loudly if a byte was ever dropped. `expected` payloads are per-program
+(`EXPECTED_UART` in `verif/eth_rv_core/run_difftest.py`): `hello` must produce its
+string and every other program must leave the line completely idle.
+
+Not implemented on purpose, and the reason: the receiver, the `FCR` FIFO-clear
+bits and `MCR` loopback — each is unobservable in Spike's model for a program
+that only transmits (`rx_queue` stays empty unless the program enables the FIFO,
+and `lsr` stays `0x60`), so a transmit-only console mirrors the golden byte for
+byte. A program that read `RBR`, wrote `FCR.FIFO_ENABLE` or enabled loopback
+would leave that equivalence, and is out of scope until the RX path exists.
 
 ## Tests and fixtures
 
@@ -281,6 +338,20 @@ error.
   `UnsupportedInstruction` by design); `cor_csr`/`cor_trap` are the RTL's corpus
   and run through the RTL runner. An interrupt *stream* (CLINT/PLIC, Sv39) is
   still ahead, in RV-C.
+* **The CLINT is deferred** (C14 §8 checkpoint 5 needs none): Spike ticks `mtime`
+  from its own instruction counter, so a value a program reads back is a function
+  of the golden model's progress and cannot be matched by RTL running at a
+  different cycles-per-retirement rate. It becomes verifiable together with the
+  interrupt path it exists for.
+* **The console UART is transmit-only, byte-register, and mirrored to Spike's
+  model.** `LSR`/`IIR`/`MSR` are the ns16550 values Spike's own device returns
+  (`0x60`, `0xC1`/`0xC2`, `0xD0`); the receiver, the `FCR` clear bits and `MCR`
+  loopback are not implemented (see "Console" above). The corpus therefore uses
+  byte accesses to offsets 0..7 only.
+* **No D-port error response yet.** An access to an unimplemented offset inside
+  the claimed UART page is not acknowledged (the D port wedges and the testbench's
+  cycle budget reports the pc) rather than diverging from Spike silently; a
+  bus-error exception arrives with the AXI error-response increment.
 * **Single hart, no MMU, no atomics/floating point** in the model; clock-domain
   and reset behaviour are out of scope for a commit diff.
 * **Not a lockstep co-sim yet.** This is a post-hoc commit diff (the standard
@@ -295,20 +366,19 @@ error.
 ```bash
 python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_difftest/corpus
 .venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests
-.venv/bin/ruff check ethereal-shell/verif/eth_rv
-.venv/bin/mypy --strict ethereal-shell/verif/eth_rv
+.venv/bin/ruff check ethereal-shell/verif/eth_rv ethereal-shell/verif/eth_rv_core
+.venv/bin/mypy --strict ethereal-shell/verif/eth_rv ethereal-shell/verif/eth_rv_core
 ```
 
-Suggested root-Makefile target (the parent adds it; this directory does not
-edit the `Makefile`):
+The root `Makefile` carries both halves already: `make verif-rv` (build the corpus +
+run this suite) and `make verif-rv-rtl` (run the corpus on the Verilated RTL — all
+seven programs, both D-port builds with `--dram`, and the console assertion). The
+corpus step needs `riscv64-unknown-elf-gcc`, the RTL step needs Verilator, and the
+tests self-skip when a tool is missing.
 
-```make
-verif-rv: ## eth_rv DiffTest: build the bare-metal corpus + run the harness tests
-	python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_difftest/corpus
-	@if [ -x .venv/bin/pytest ]; then .venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests; \
-	else pytest -q ethereal-shell/verif/eth_rv/tests; fi
-```
-
-(Add it to `.PHONY` and the `help` text if the maintainer wants it in `make help`.
-The corpus step needs `riscv64-unknown-elf-gcc`; the Spike golden path needs the
-Spike build, and the tests self-skip when either is missing.)
+The two console peripherals (`eth_rv_uart.sv`, `eth_rv_mmio_mux.sv`) are linted
+with the same strict command `make lint` uses per module
+(`verilator --lint-only -Wall --top-module <m>`, no waivers needed); adding them to
+`RTL_CLEAN` and giving `eth_rv_mmio_mux` its `eth_rv_uart.sv` dependency is a
+one-line Makefile edit that this increment's scope excludes — see the increment
+notes for the exact lines.

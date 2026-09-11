@@ -85,4 +85,17 @@
   负控在 AXI 路径上仍精确捕获（`--dram --fault 12:mem_wdata`）。
 - **回归**：`make verif-rv` 147 passed；ruff/mypy 干净；lint 干净（主口在 `LINE_BEATS` 1/8/16 三档；两个 TB 构建在 warnings-fatal 下通过）。
 - **工具适配（记录）**：yosys 前端不支持通配包 import（`import eth_rv_pkg::*`）与函数体内裸包名 ⇒ 改为显式 typedef/localparam 别名与 `pkg::NAME` 限定（后者与 `emri/emri_regfile.sv` 既有做法一致）。
-- **C14 §8 检查点状态**：1 取指/译码 ✅、2 内存路径 ✅（含 AXI/DRAM）、3 M/C ✅、4 异常/CSR ✅、5 UART hello ⏳（需 MMIO/UART）、6 轨迹形式化 ✅（本增量）。
+- **C14 §8 检查点状态**：1 ✅、2 ✅（含 AXI/DRAM）、3 ✅、4 ✅、5 **✅ 增量 4**（见下）、6 ✅。
+
+## 7. 增量 4（同日完成）：UART `hello` 里程碑（C14 §8 检查点 5）
+
+- **SoC 接线决策**：D 口前加一个小型 **MMIO mux**（`eth_rv_core → eth_rv_mmio_mux → {eth_rv_uart, memory}`）：组合译码，设备地址从内存路径**门掉**（AXI/DRAM 构建所必需），内存路径**逐位直通**；地址表：`0x8000_0000` 内存、`0x1000_0000` 控制台 UART（4 KiB 页，与 Spike 的 ns16550 页一致）。
+- **UART**：16550 子集（THR/RBR、IER、IIR/FCR、LCR、MCR、LSR、MSR、SCR + DLAB 别名）；TX FIFO 64 深；**真实 8N1 移位器**（可参数化分频 `BIT_CYCLES`）。**关键决策**：LSR/IIR/MSR 取值**镜像 Spike 的 ns16550**（`0x60`/`0xC1|0xC2`/`0xD0`）⇒ THRE 轮询在 Spike 与 RTL 下**退役方式一致**，DiffTest 才能成立；物理状态另经 `tx_busy_o/tx_overflow_o` 导出（验证用，不对程序可见）。
+- **语料**：`cor_hello.S`（写出已知字符串并经 HTIF 退出）。
+- **验证（本人复跑）**：`run_difftest.py` → **`[rv-rtl] OK: 7 corpus program(s), MATCH vs Spike + console asserted`**；
+  `cor_hello: UART 15 bytes 'hello, eth_rv!\n' — 15 frames of 160 cycles (16-cycle bit cell), gap 160..160, 0 frame error(s)`（**位时序断言**：8N1 起始/停止、逐帧起始沿间隔恰为 10×BIT_CYCLES）；
+  7 个程序在**拍**与 **AXI/DRAM** 两条路径上均 MATCH（cor_hello AXI 侧仅 1 AR/1 AW ⇒ 15 次 UART 存/取**从未触达插座**，证明 mux 门控正确）；
+  负控：`--uart-fault 0:1` 轨迹仍 MATCH 但 UART 校验 FAIL（载荷被改）、`--uart-fault 3:9` 抓到帧错。
+  `make verif-rv` **176 passed**（147+29 新增 `test_rv_uart.py`）；lint 干净（无新豁免）；`eth_rv_core.sby` 仍 PASS（新外设不在被证明状态内）。
+- **CLINT 延后（有据）**：Spike 的 mtime 由自身指令计数推进，任何程序都读不到一致值 ⇒ 检查点 5 也不需要它。
+- **遗留（agent 如实列出）**：D 口尚**无错误响应**（UART 页内未实现偏移会卡住而非像 Spike 那样陷阱 —— 归入 AXI 错误响应增量）；CLINT/PLIC + 中断交付（RV-C）；UART RX 路径；可选的 `eth_rv_uart.sby`。

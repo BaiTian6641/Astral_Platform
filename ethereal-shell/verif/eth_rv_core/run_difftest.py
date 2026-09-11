@@ -13,15 +13,19 @@ Pipeline per corpus ELF (C14 §5):
    ``mem_addr mem_wdata mem_rmask mem_wmask`` suffix (C14 §5.2),
 4. hand that dump to ``rv_difftest.py --dut dump:...`` for comparison against the
    Spike golden stream — pc/rd/value *and* the memory stream — and propagate its
-   verdict.
+   verdict,
+5. for the console (C14 §8 checkpoint 5): the testbench decodes the SoC UART's
+   serial line at its own divisor and writes what it received to ``+uart=<file>``;
+   every program is held to its `EXPECTED_UART` payload — `cor_hello` to its
+   string, every other program to an idle line.
 
-Exit status: ``0`` when every requested ELF MATCHes (and, for ``--fault``, when the
-injected fault is caught at the expected commit), ``1`` otherwise, ``2`` on a
-setup/toolchain error.
+Exit status: ``0`` when every requested ELF MATCHes and every console payload is
+the expected one (and, for ``--fault``/``--uart-fault``, when the injected fault
+is caught), ``1`` otherwise, ``2`` on a setup/toolchain error.
 
 Examples::
 
-    # all four corpus programs
+    # all seven corpus programs
     python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --all
 
     # one program, with a one-cycle-latency memory (exercises the stall path)
@@ -32,6 +36,9 @@ Examples::
 
     # the same corpus with the D port on AXI4 into the DRAM socket (8-beat reads)
     python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --all --dram
+
+    # negative control for the UART: break one bit cell of the first byte on the line
+    python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_hello --uart-fault 0:1
 """
 
 from __future__ import annotations
@@ -64,6 +71,11 @@ RTL_SOURCES = [
     RTL_DIR / "cor_regfile.sv",
     RTL_DIR / "cor_decoder.sv",
     RTL_DIR / "eth_rv_core.sv",
+    # SoC MMIO: the console UART and the address decoder in front of the D port
+    # (C14 §4). Both sit in front of either memory path, so they are part of
+    # every build.
+    RTL_DIR / "eth_rv_uart.sv",
+    RTL_DIR / "eth_rv_mmio_mux.sv",
 ]
 
 # `--dram` build only: the AXI4 master in front of the DRAM socket (C14 §4/§6).
@@ -74,7 +86,37 @@ DRAM_SOURCES = [
 ]
 TB_SOURCE = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv_core" / "tb_eth_rv_core.sv"
 
-CORPUS_PROGRAMS = ["cor_alu", "cor_mem", "cor_muldiv", "cor_model", "cor_csr", "cor_trap"]
+CORPUS_PROGRAMS = [
+    "cor_alu",
+    "cor_mem",
+    "cor_muldiv",
+    "cor_model",
+    "cor_csr",
+    "cor_trap",
+    "cor_hello",
+]
+
+HELLO_STRING = b"hello, eth_rv!\n"
+"""The console string ``corpus/cor_hello.S`` writes — the C14 §8 checkpoint 5 vehicle.
+
+The testbench decodes the SoC UART's serial line at its own divisor and writes
+what it received to ``+uart=<file>``; every program is then held to its expected
+payload below. `test_rv_uart.py` re-reads this constant against `cor_hello.S`,
+so the program and the assertion cannot drift apart."""
+
+EXPECTED_UART: dict[str, bytes] = {"cor_hello": HELLO_STRING}
+"""Expected console output per corpus program: only `hello` uses the UART, and
+the other programs must leave the line completely idle (a stray device access
+would show up here as bytes nobody asked for)."""
+
+UART_RECORD_PATTERN = re.compile(
+    r"^# eth_rv uart rx v1\n"
+    r"# bit_cycles: (?P<bit>\d+) frame_cycles: (?P<frame>\d+) bytes: (?P<bytes>\d+) "
+    r"frames: (?P<frames>\d+) errors: (?P<errors>\d+) overflow: (?P<overflow>\d+) "
+    r"drain_cycles: (?P<drain>\d+)\n"
+    r"# gap_min: (?P<gap_min>\d+) gap_max: (?P<gap_max>\d+)\n"
+    r"data: (?P<data>[0-9a-f]*)\n$"
+)
 
 DIVERGE_RE = re.compile(r"DIVERGENCE \((\w+)\) at commit #(\d+) \(cycle (\d+)\)")
 
@@ -209,6 +251,126 @@ class RtlRun:
     commits: int
     status: str
     stdout: str
+    uart: UartRecord
+
+
+@dataclass(frozen=True, slots=True)
+class UartRecord:
+    """What the testbench's receiver decoded off the console UART's serial line.
+
+    The testbench samples each 8N1 frame at the center of its ten bit cells with
+    the same divisor the transmitter was built with, so these fields are a
+    bit-timing statement, not just a byte count: `frame_cycles` is the exact
+    length of a frame, and `gap_min`/`gap_max` are the measured start-edge-to-
+    start-edge distances inside the burst (they must all equal `frame_cycles`).
+    """
+
+    bit_cycles: int
+    frame_cycles: int
+    header_bytes: int
+    data: bytes
+    frames: int
+    errors: int
+    overflow: bool
+    drain_cycles: int
+    gap_min: int
+    gap_max: int
+
+    @property
+    def text(self) -> str:
+        """The received bytes as text (latin-1: the assertion is byte-exact)."""
+        return self.data.decode("latin-1")
+
+
+def parse_uart_record(path: Path) -> UartRecord:
+    """Parse the `+uart=<file>` record; a malformed record is a setup error."""
+    match = UART_RECORD_PATTERN.match(path.read_text(encoding="ascii"))
+    if match is None:
+        raise SetupError(f"{path}: not an eth_rv UART record (see tb_eth_rv_core.sv)")
+    return UartRecord(
+        bit_cycles=int(match.group("bit")),
+        frame_cycles=int(match.group("frame")),
+        header_bytes=int(match.group("bytes")),
+        data=bytes.fromhex(match.group("data")),
+        frames=int(match.group("frames")),
+        errors=int(match.group("errors")),
+        overflow=bool(int(match.group("overflow"))),
+        drain_cycles=int(match.group("drain")),
+        gap_min=int(match.group("gap_min")),
+        gap_max=int(match.group("gap_max")),
+    )
+
+
+def uart_problems(record: UartRecord, expected: bytes) -> list[str]:
+    """Every way the console evidence can fail to be the string the program wrote.
+
+    The checks are the point of checkpoint 5, so they are stated separately and
+    reported verbatim: the byte string, the frame count that carried it, the
+    framing (start/stop) errors, the bit rate of every inter-frame gap, and the
+    "no byte was dropped" condition at the transmitter.
+    """
+    problems: list[str] = []
+    if record.data != expected:
+        problems.append(f"payload {record.text!r} != expected {expected.decode('latin-1')!r}")
+    if record.header_bytes != len(record.data):
+        problems.append(
+            f"header says {record.header_bytes} bytes, payload carries {len(record.data)}"
+        )
+    if record.frames != len(record.data):
+        problems.append(f"{record.frames} frames carried {len(record.data)} bytes")
+    if record.errors:
+        problems.append(f"{record.errors} framing error(s)")
+    if record.overflow:
+        problems.append("the transmit queue overflowed (bytes were dropped)")
+    if record.frame_cycles != 10 * record.bit_cycles:
+        problems.append(
+            f"frame_cycles {record.frame_cycles} != 10 * bit_cycles {record.bit_cycles}"
+        )
+    if record.frames > 1 and (record.gap_min, record.gap_max) != (
+        record.frame_cycles,
+        record.frame_cycles,
+    ):
+        problems.append(
+            f"bit timing: inter-frame gap {record.gap_min}..{record.gap_max} cycles, "
+            f"expected exactly {record.frame_cycles}"
+        )
+    return problems
+
+
+def report_uart(
+    name: str, record: UartRecord, expected: bytes, *, expect_fault: bool
+) -> int:
+    """Print the console-UART verdict for one program; returns the failure count.
+
+    In the normal mode a program must have emitted exactly its expected payload
+    and nothing else (`EXPECTED_UART`); with `--uart-fault` the injected line
+    fault must instead have BROKEN that assertion — the negative control that
+    shows the check is live rather than tautological.
+    """
+    problems = uart_problems(record, expected)
+    # `ascii()` is repr with the non-ASCII bytes escaped: the payload is printed
+    # the way a log line should show it (a `\n` stays visible, a stray 0xE9 does
+    # not reach the terminal raw).
+    payload = ascii(record.text)
+    detail = (
+        f"{record.frames} frames of {record.frame_cycles} cycles "
+        f"({record.bit_cycles}-cycle bit cell), gap {record.gap_min}..{record.gap_max}, "
+        f"{record.errors} frame error(s), drain {record.drain_cycles} cycles"
+    )
+    if not expect_fault:
+        if problems:
+            print(f"[rv-rtl] {name}: UART FAIL: {'; '.join(problems)}")
+            return 1
+        print(f"[rv-rtl] {name}: UART {len(record.data)} bytes {payload} — {detail}")
+        return 0
+    if not expected:
+        print(f"[rv-rtl] {name}: UART idle, no line-fault target (nothing to corrupt)")
+        return 0
+    if problems:
+        print(f"[rv-rtl] {name}: UART negative control caught: {'; '.join(problems)}")
+        return 0
+    print(f"[rv-rtl] {name}: UART negative control NOT caught (payload {payload} arrived intact)")
+    return 1
 
 
 def _stale(exe: Path, sources: list[Path]) -> bool:
@@ -218,17 +380,32 @@ def _stale(exe: Path, sources: list[Path]) -> bool:
 
 
 def run_rtl(
-    exe: Path, elf: Path, work_dir: Path, *, mem_lat: int, fault: str | None, quiet: bool
+    exe: Path,
+    elf: Path,
+    work_dir: Path,
+    *,
+    mem_lat: int,
+    fault: str | None,
+    quiet: bool,
+    uart_fault: str | None = None,
 ) -> RtlRun:
-    """Run the RTL on one ELF and produce its commit trace file."""
+    """Run the RTL on one ELF; produce its commit trace and console record.
+
+    `+uart=<file>` asks the testbench for what its receiver decoded off the
+    console UART's serial line (the C14 §8 checkpoint 5 evidence), and
+    `uart_fault` = ``FRAME:BIT`` inverts one bit cell of one received frame — the
+    negative control that proves the UART assertion is live.
+    """
     stem = elf.stem if fault is None else f"{elf.stem}.fault"
     image_path = work_dir / f"{elf.stem}.mem.hex"
     trace_path = work_dir / f"{stem}.trace"
+    uart_path = work_dir / f"{elf.stem}.uart"
     tohost, _ = write_memory_image(elf, image_path)
     argv = [
         str(exe),
         f"+mem={image_path}",
         f"+trace={trace_path}",
+        f"+uart={uart_path}",
         f"+base=0x{MEM_BASE:x}",
         f"+tohost=0x{tohost:x}",
         f"+memlat={mem_lat}",
@@ -236,6 +413,9 @@ def run_rtl(
     if fault is not None:
         index, field, value = parse_fault(fault)
         argv += [f"+fault_index={index}", f"+fault_field={field}", f"+fault_value=0x{value:x}"]
+    if uart_fault is not None:
+        frame, bit = parse_uart_fault(uart_fault)
+        argv += [f"+uart_fault_frame={frame}", f"+uart_fault_bit={bit}"]
     done = run(argv, cwd=REPO_ROOT, quiet=quiet)
     banner = "ETH_RV_TB:"
     status = next(
@@ -246,8 +426,26 @@ def run_rtl(
         raise SetupError(f"{elf.name}: RTL run did not complete cleanly: {status}\n{done.stdout}")
     commits = int(re.search(r"PASS (\d+) commits", status).group(1))  # type: ignore[union-attr]
     return RtlRun(
-        elf=elf, trace=trace_path, commits=commits, status=status, stdout=done.stdout
+        elf=elf,
+        trace=trace_path,
+        commits=commits,
+        status=status,
+        stdout=done.stdout,
+        uart=parse_uart_record(uart_path),
     )
+
+
+def parse_uart_fault(spec: str) -> tuple[int, int]:
+    """``FRAME:BIT`` -> ``(frame, bit)`` for the UART line-fault negative control.
+
+    ``BIT`` is a bit cell of the frame (0 = start, 1..8 = data LSB first,
+    9 = stop); the testbench inverts the line for the whole cell, so the received
+    byte — or the frame's framing — must change.
+    """
+    match = re.fullmatch(r"(\d+):(\d+)", spec.strip())
+    if match is None or int(match.group(2)) > 9:
+        raise SetupError(f"--uart-fault wants FRAME:BIT (BIT 0..9), got {spec!r}")
+    return int(match.group(1)), int(match.group(2))
 
 
 def parse_fault(spec: str) -> tuple[int, str, int]:
@@ -287,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run the eth_rv RTL on the DiffTest corpus and compare it with Spike",
     )
     pick = parser.add_mutually_exclusive_group()
-    pick.add_argument("--all", action="store_true", help="run all four corpus programs (default)")
+    pick.add_argument("--all", action="store_true", help="run every corpus program (default)")
     pick.add_argument("--only", action="append", default=[], help="program name (repeatable)")
     parser.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--work-dir", type=Path, default=DEFAULT_WORK)
@@ -307,6 +505,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "drive the D port through eth_rv_axi_master into eth_dram_ctrl + "
             "eth_dram_stub (full AXI4 INCR) instead of the behavioral beat memory"
+        ),
+    )
+    parser.add_argument(
+        "--uart-fault",
+        default=None,
+        help=(
+            "negative control for the console-UART assertion: FRAME:BIT inverts one bit "
+            "cell of one received frame on the line (the trace must still MATCH and the "
+            "string check must fail)"
         ),
     )
     parser.add_argument(
@@ -349,18 +556,29 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"[rv-rtl] error: no such corpus ELF: {elf}\n")
             return 2
         try:
-            rtl = run_rtl(exe, elf, args.work_dir, mem_lat=args.memlat, fault=args.fault, quiet=args.quiet)
+            rtl = run_rtl(
+                exe,
+                elf,
+                args.work_dir,
+                mem_lat=args.memlat,
+                fault=args.fault,
+                quiet=args.quiet,
+                uart_fault=args.uart_fault,
+            )
         except SetupError as exc:
             sys.stderr.write(f"[rv-rtl] error: {exc}\n")
             return 2
 
+        expected = EXPECTED_UART.get(name, b"")
         if args.fault is None:
             matched, report = compare(elf, rtl.trace, quiet=args.quiet)
             print(f"[rv-rtl] {name}: {rtl.status}")
             print(report)
-            if matched:
-                continue
-            failures += 1
+            failures += report_uart(
+                name, rtl.uart, expected, expect_fault=args.uart_fault is not None
+            )
+            if not matched:
+                failures += 1
         else:
             index, field, value = parse_fault(args.fault)
             matched, report = compare(elf, rtl.trace, quiet=args.quiet)
@@ -381,7 +599,12 @@ def main(argv: list[str] | None = None) -> int:
     if failures:
         print(f"[rv-rtl] FAIL: {failures} of {len(programs)} corpus program(s) did not match")
         return 1
-    verb = "negative control caught" if args.fault is not None else "MATCH vs Spike"
+    if args.fault is not None:
+        verb = "negative control caught"
+    elif args.uart_fault is not None:
+        verb = "MATCH vs Spike + UART negative control caught"
+    else:
+        verb = "MATCH vs Spike + console asserted"
     print(f"[rv-rtl] OK: {len(programs)} corpus program(s), {verb}")
     return 0
 
