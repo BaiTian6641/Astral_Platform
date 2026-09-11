@@ -96,7 +96,7 @@ tasks:
     est_days: 1
     deliverable: GitHub Actions 工作流
     acceptance: dummy RTL 测试在 CI 变绿
-    status: in_progress
+    status: in_progress   # 2026-09-11: 工作流三件套在树（lint-and-test / dco / docs）；本地镜像全绿（make lint / test-model / test-sv / formal 均本地通过、模型 2683+2xfail）。「CI 变绿」的远程确认需维护者 push（环境无 gh，origin=个人账号）；CI 覆盖面扩展（test-sv/test-model/formal + 自托管上板 runner）= phase-1 §1 第 18 项 S14-P1#1
 
   - id: E0-INF3
     title: 仿真环境 Dockerfile（Verilator5 + cocotb + Yosys + VPR8）
@@ -309,7 +309,7 @@ tasks:
     est_days: 2
     deliverable: rtl/emri/ + ethctl 探测逻辑
     acceptance: ethctl 自动识别 BMC/mFSM 模式并调整会话语义
-    status: in_progress
+    status: in_progress   # 2026-09-11 对账: EMRI 寄存器面已实现（emri_regfile + 全套 TB）；模式探测=CAPABILITIES.has_bmc 可读（ethctl info 输出 has_bmc）；**缺**：ethctl 依据探测结果自动选择/调整 EFP↔mFSM 会话语义（当前为显式 --transport 选择）。mFSM 侧 RTL（E2-BMC1）到位后可一并关
 
   - id: E1-IO1
     title: SPI 数据通道（NEORV32 SDI + EFP-SPI 帧协议固件栈 + CRC16）
@@ -402,7 +402,7 @@ tasks:
     est_days: 2
     deliverable: tests/stress/ + 报告
     acceptance: 零配置损坏、零跨区干扰
-    status: todo
+    status: done   # 2026-09-11 (sim 范围): ① OCC 层字面 2×10000：tb_occ_soak 20000 次 BLANK→WRITE→READBACK（镜像 A/B 交替；v0.5 expected-CRC 门 + RAM 影子 + 邻区逐字比对）0 errors / 0 词失配（1.5 s wall）；② daemon 层轮换：tb_hotswap_stress 6 轮（STOP→run_packed→RUNNING，2 region × 签名镜像 A/B）**69 ok / 0 fail**，三层校验（EFP_ERR / RAM 影子 / 真实织物输出 + 邻区不受扰）；③ 工具：gen_daemon_vectors --frame-hex-b（第二签名镜像）+ `make stress` 独立目标。发现并记录：ALLOC 仅接受 FREE（热替换 = stop+deploy）、OCC_FRAME_ADDR 列字段 16 词步长 vs 34–68 词帧 → 同 region 多列别名（E1-DMO2b，spec v0.6 方案）。daemon 层字面 2×10000 = 硅范围（验签 ~0.84 s/轮）。report-E1-DMO2-hotswap-stress-20260911
 
   - id: E1-DMO3
     title: v0.1.0 里程碑发布（视频+博客+文档站）
@@ -411,7 +411,7 @@ tasks:
     est_days: 2
     deliverable: release v0.1.0 + 博客文章
     acceptance: 仓库公开，文档站上线
-    status: todo
+    status: todo   # 2026-09-11: 依赖 E1-DMO2（sim 验收已过，见 report-E1-DMO2-hotswap-stress-20260911）；验收物全部为外部动作（8 仓库公开 / 3 分钟演示视频 / 博客 / 文档站 / 社区发布），需维护者执行——本环境无法完成
 
   # ================= PHASE 2（中粒度） =================
   - id: E2-FAB1
@@ -421,7 +421,7 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/mem_t/
     acceptance: AES S-box MEM-T 版 vs LUT 版 eLUT 占用降 ≥5x
-    status: in_progress
+    status: done   # 2026-09-11 对账: 接受指标已达成 —— AES S-box 4779→290 eLUT + 16 MEM-T = 16.5×（≥5×）；tile RTL/frame_map/fabric_top/packed capstone 全链在位（report-P1-het-tiles/framemap/fabric-top/acceptance/packed-capstone 20260728-0730）
 
   - id: E2-FAB2
     title: DSP-T tile（27x18 MAC 模式封装）
@@ -430,7 +430,7 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/dsp_t/
     acceptance: FIR16 DSP-T 链实测 Fmax 与吞吐达标（vs LUT 版 ≥10x 吞吐）
-    status: in_progress
+    status: in_progress   # 2026-09-11 对账: 吞吐结构性达标（real-tap fir16 → 16 $macc_v2 级联 + 0 eLUT 数据通路，32 向量 bit-true；vs 124-eLUT 拥堵 LUT 版）；**缺**：DSP 链单独实测 Fmax 数字（het VPR arch 的 c432 188.7 MHz 不能替代）——需 nextpnr/实板单列表征后可关
 
   - id: E2-FAB3
     title: SSM-T tile + 上下文保存 v1（FF 状态扫描读/写，BMC 编排）
@@ -448,7 +448,7 @@ tasks:
     est_days: 5
     deliverable: fabric-gen v2 + 帧映射 v2
     acceptance: 混合 tile region 生成/配置/运行全链路通过
-    status: in_progress
+    status: done   # 2026-09-11 对账: 混合 tile 全链路已证 —— fabric_2x2_het 描述符 + TILE_LAYOUT/frame_map het + fabric_top TILE_TYPE + vbus↔虚拟路由双向打通（tb_vbus_route）+ 异构 packed capstone（解复用 backdoor 探针 + CLB 翻转）；report-P1-het-framemap/fabric-top/vbus-routing/het-packed-capstone（20260728-0730）
 
   - id: E2-FAB5
     title: 互联优化 v2（两源轨道 + LUT 平台期对齐）
