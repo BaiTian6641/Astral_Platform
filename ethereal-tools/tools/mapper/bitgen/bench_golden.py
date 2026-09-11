@@ -21,6 +21,9 @@ BLIF NET-NAMING CONVENTION (verified against generated/mapper/*.blif,
 Public API:
   * :func:`port_net_names` — expand a ``(name, width)`` port to its net names.
   * :func:`int_to_bits` / :func:`bits_to_int` — integer <-> per-net 0/1 split.
+  * :func:`golden_seq` — per-cycle golden for CLOCKED benchmarks (E1-DMO1):
+    drives a stable-across-the-edge PI stream, samples POs after each posedge
+    (the exact semantics of ``FabricSim.tick``).
   * :func:`golden_comb` — the workhorse: write+run an iverilog tb applying
     ``n_vectors`` random inputs, capture outputs, return ``[(pi_dict, po_dict)]``
     keyed by the bit-blasted net names FabricSim expects.
@@ -192,4 +195,118 @@ def golden_comb(
         results.append((pi_dict, po_dict))
     assert len(results) == n_vectors, (
         f"expected {n_vectors} golden lines, got {len(results)}")
+    return results
+
+# =============================================================================
+# Sequential (per-cycle) golden — E1-DMO1 demo images
+# =============================================================================
+
+def golden_seq(
+    bench_v: str,
+    top: str,
+    pi_stream: list[dict[str, int]],
+    output_ports: list[tuple[str, int]],
+    clk_port: str = "clk",
+) -> list[tuple[dict[str, int], dict[str, int]]]:
+    """Per-cycle golden trace for a CLOCKED benchmark (E1-DMO1 tick model).
+
+    ``pi_stream`` is one entry PER CLOCK CYCLE, each an ``{input_port: int}``
+    dict (the port values held stable across that cycle's posedge — the TB
+    applies them on the negedge before). Returns ``[(pi_dict, po_dict)]`` per
+    cycle where ``po_dict`` is sampled just AFTER the cycle's posedge — the
+    exact semantics of :meth:`fabric_sim.FabricSim.tick`, so the lists compare
+    element-wise.
+
+    The DUT must be POWER-UP-DETERMINISTIC: the fabric eLUT4 FF pool
+    zero-inits, so the benchmark declares ``reg ... = 1'b0`` initializers (no
+    routed reset in the v0 fabric) and iverilog starts it in the same
+    all-zero state the tick model's first ``ff_state={}`` assumes.
+    """
+    if not shutil.which("iverilog") or not shutil.which("vvp"):
+        raise RuntimeError("iverilog / vvp not on PATH (needs oss-cad-suite)")
+    if not os.path.exists(bench_v):
+        raise FileNotFoundError(bench_v)
+    os.makedirs(MAPPER, exist_ok=True)
+
+    n = len(pi_stream)
+    assert n > 0, "golden_seq: empty pi_stream"
+    in_ports = sorted(pi_stream[0])
+    widths = {p: max((v[p].bit_length() for v in pi_stream), default=0)
+              for p in in_ports}
+    widths = {p: max(w, 1) for p, w in widths.items()}
+
+    lines = [
+        "`timescale 1ns/1ps",
+        f"module {top}_golden_seq_tb;",
+        "  integer cyc = 0;",
+        "  reg clk;",
+    ]
+    for p in in_ports:
+        lines.append(f"  reg [{widths[p] - 1}:0] pi_{p};")
+    for name, width in output_ports:
+        lines.append(f"  wire [{width - 1}:0] po_{name};")
+    conn = ", ".join([f".{p}(pi_{p})" for p in in_ports]
+                     + [f".{n_}(po_{n_})" for n_, _ in output_ports]
+                     + [f".{clk_port}(clk)"])
+    lines.append(f"  {top} dut({conn});")
+    # stimulus ROM: one hex token per cycle per port (all ports, full width).
+    for p in in_ports:
+        body = "\n".join(
+            f"    stim_{p}[{t}] = {widths[p]}'h{pi_stream[t][p]:x};"
+            for t in range(n))
+        lines.append(f"  reg [{widths[p] - 1}:0] stim_{p} [0:{n - 1}];")
+        lines.append("  initial begin\n" + body + "\n  end")
+    lines += [
+        "  initial begin",
+        "    clk = 1'b0;",
+        "    forever #10 clk = ~clk;   // 20 ns period",
+        "  end",
+        "  // apply cycle t's PIs on the negedge BEFORE posedge t (stable",
+        "  // across the sampling edge, like a synchronous input register).",
+        "  always @(negedge clk) begin",
+        "    cyc = cyc + 1;",
+        *[f"    pi_{p} = stim_{p}[cyc];" for p in in_ports],
+        "  end",
+        "  initial begin",
+        *[f"    pi_{p} = stim_{p}[0];" for p in in_ports],
+        "  end",
+        "  // sample POs just after each posedge (all NBA updates settled).",
+        "  always @(posedge clk) begin",
+        "    #1;",
+        "    $display(\"%0d " + " ".join(["%h"] * (len(in_ports)
+                                                + len(output_ports))) + "\", cyc"
+        + "".join(f", pi_{p}" for p in in_ports)
+        + "".join(f", po_{p}" for p, _w in output_ports) + ");",
+        "  end",
+        # finish after the LAST posedge sample (20n-9) but before the
+        # negedge that would index stim[n] (out of ROM -> x).
+        f"  initial begin #({20 * n - 5}); $finish; end",
+        "endmodule",
+    ]
+    tb_path = os.path.join(MAPPER, f"golden_seq_{top}_tb.v")
+    out_bin = os.path.join(MAPPER, f"golden_seq_{top}_vvp")
+    open(tb_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    subprocess.run(["iverilog", "-g2012", "-o", out_bin, bench_v, tb_path],
+                   check=True, capture_output=True)
+    run = subprocess.run(["vvp", out_bin], check=True, capture_output=True,
+                         text=True)
+
+    results: list[tuple[dict[str, int], dict[str, int]]] = []
+
+    for line in run.stdout.strip().splitlines():
+        toks = line.split()
+        if not toks or not toks[0].lstrip("-").isdigit():
+            continue
+        assert len(toks) == 1 + len(in_ports) + len(output_ports), (
+            f"malformed golden_seq line: {line!r}")
+        pi_dict: dict[str, int] = {}
+        for p, tok in zip(in_ports, toks[1:1 + len(in_ports)], strict=True):
+            pi_dict.update(int_to_bits(_bit_from_hex(tok, p), p, widths[p]))
+        po_dict: dict[str, int] = {}
+        for (name, width), tok in zip(
+                output_ports, toks[1 + len(in_ports):], strict=True):
+            po_dict.update(int_to_bits(_bit_from_hex(tok, name), name, width))
+        results.append((pi_dict, po_dict))
+    assert len(results) == n, (
+        f"expected {n} golden_seq lines, got {len(results)}")
     return results

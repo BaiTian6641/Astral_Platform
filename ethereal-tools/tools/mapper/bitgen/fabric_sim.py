@@ -156,6 +156,36 @@ def clb_eval_bits(
             break
     return clb_out
 
+def clb_ff_next(
+    tile: TileLogic,
+    clb_in_bits: list[int],
+    clb_out_bits: list[int],
+) -> dict[int, int]:
+    """Next virtual-FF state for every ``ff_en`` eLUT of ``tile``.
+
+    Mirrors ``elut4.sv``: on each ``posedge clk_i`` (``cfg_ce_i`` tied 1 — the
+    v0 flow maps CE into the LUT cone via ``dffunmap``) ``vff_r <= comb_out``
+    where ``comb_out = tt_r[vin_i]`` — the RAW LUT value, before the
+    ``out_inv`` stage (inversion applies after the register mux). ``vin`` is
+    recomputed from the RESOLVED fixpoint inputs (external pins via
+    ``clb_in_bits``, feedback via ``clb_out_bits`` — registered slots hold the
+    stored bit, exactly what the IIB feedback mux reads on the fabric).
+    """
+    nxt: dict[int, int] = {}
+    for gi, ec in tile.eluts.items():
+        if not ec.ff_en:
+            continue
+        vin = 0
+        for gk in range(K):
+            kind, idx = iib_decode(tile.iib_mux.get((gi, gk), 0), gk)
+            if kind == "clb.I":
+                if idx < EXT_IN:
+                    vin |= (clb_in_bits[idx] & 1) << gk
+            else:
+                vin |= (clb_out_bits[idx] & 1) << gk
+        nxt[gi] = (ec.tt >> vin) & 1
+    return nxt
+
 
 # =============================================================================
 # Fabric simulator
@@ -250,17 +280,56 @@ class FabricSim:
         # diagnostics from the last evaluate()
         self.last_iters: int = 0
         self.converged: bool = False
+        # tick model: {(row, col, gi): captured-D} from the last evaluate()
+        # with a non-None ff_state (E1-DMO1).
+        self.last_ff_next: dict[tuple[int, int, int], int] = {}
+
+    def tick(
+        self,
+        pi_values: dict[str, int],
+        ff_state: dict[tuple[int, int, int], int] | None = None,
+        max_iters: int = 64,
+    ) -> tuple[dict[str, int], dict[tuple[int, int, int], int]]:
+        """Advance the fabric by ONE clock edge under ``pi_values`` (tick model).
+
+        The fabric clock is the CALLER's model: hardware runs ``comb fixpoint
+        -> posedge capture`` continuously; one :meth:`tick` is one edge —
+
+        1. fixpoint under the PRE-edge FF state captures every FF's D
+           (:func:`clb_ff_next`, ``vff_r <= comb_out``);
+        2. the state advances to those D values;
+        3. a second fixpoint under the POST-edge state reads the POs —
+           exactly what a per-cycle golden TB samples just after its posedge.
+
+        Returns ``(po_dict, next_ff_state)``; feed ``next_ff_state`` (all-zero
+        ``{}`` at power-up — the pool zero-init) into the next tick.
+        """
+        self.evaluate(pi_values, max_iters=max_iters, ff_state=ff_state or {})
+        nxt = dict(self.last_ff_next)
+        po = self.evaluate(pi_values, max_iters=max_iters, ff_state=nxt)
+        return po, nxt
 
     def evaluate(
         self,
         pi_values: dict[str, int],
         max_iters: int = 64,
+        ff_state: dict[tuple[int, int, int], int] | None = None,
     ) -> dict[str, int]:
         """Run the configured fabric to a combinational fixpoint under PIs.
 
         Returns ``{primary_output_net: bit}`` for every PO net found at a
         driver cluster's ``clb_out``. Deterministic (fixed tile iteration
         order). Sets ``self.last_iters`` / ``self.converged`` for diagnostics.
+
+        ``ff_state`` (E1-DMO1 tick model): the CURRENT virtual-FF state keyed
+        ``(row, col, gi)`` — the fabric powers up all-zero (pool zero-init),
+        so the first call passes ``{}`` (or ``None``, which reads every FF as
+        its ``ff_rst_val`` default = the reset constant, matching the old
+        combinational-only behavior). With ``ff_state`` given, registered
+        eLUT outputs hold their stored bits during the fixpoint and
+        ``self.last_ff_next`` carries every FF's captured D value
+        (``tt[vin]``, mirroring ``elut4.sv``'s ``vff_r <= comb_out``) so the
+        caller can advance the clock — see :meth:`tick`.
         """
         R, C, N_elt = self.R, self.C, self.N
         out_n = [[0] * C for _ in range(R)]
@@ -271,6 +340,13 @@ class FabricSim:
         # stable fixpoint; updated every pass).
         clb_out_bits_grid: list[list[list[int]]] = [
             [[0] * N_elt for _ in range(C)] for _ in range(R)]
+        # per-tile ff_state views (tick model) + final-pass tile I/O snapshot
+        # for next-state extraction.
+        ff_by_tile: dict[tuple[int, int], dict[int, int]] = {}
+        if ff_state is not None:
+            for (r, c, gi), bit in ff_state.items():
+                ff_by_tile.setdefault((r, c), {})[gi] = bit & 1
+        tile_io: dict[tuple[int, int], tuple[list[int], list[int]]] = {}
 
         iters = 0
         converged = False
@@ -300,11 +376,14 @@ class FabricSim:
                             if net is not None and net in pi_values:
                                 clb_in_bits[i] = pi_values[net] & 1
                         # 4. CLB evaluation (inner fixpoint over eLUT feedback).
-                        clb_out_bits = clb_eval_bits(tl, clb_in_bits)
+                        clb_out_bits = clb_eval_bits(
+                            tl, clb_in_bits, ff_by_tile.get((r, c)))
                         clb_out_bits_grid[r][c] = clb_out_bits
                         clb_out_packed = 0
                         for j in range(N_elt):
                             clb_out_packed |= (clb_out_bits[j] & 1) << j
+                        if ff_state is not None:
+                            tile_io[(r, c)] = (clb_in_bits, clb_out_bits)
                     else:
                         clb_out_packed = 0      # routing-only / empty tile
 
@@ -324,6 +403,17 @@ class FabricSim:
 
         self.last_iters = iters
         self.converged = converged
+
+        # tick model: next virtual-FF state (captured D = tt[vin] per ff_en
+        # eLUT) from the final-pass tile I/O snapshot.
+        self.last_ff_next: dict[tuple[int, int, int], int] = {}
+        if ff_state is not None:
+            for (r, c), (in_bits, out_bits) in tile_io.items():
+                tm = self.tiles[r][c]
+                if tm.logic is not None:
+                    for gi, nxt in clb_ff_next(tm.logic, in_bits,
+                                               out_bits).items():
+                        self.last_ff_next[(r, c, gi)] = nxt
 
         # primary outputs: read the driver cluster's clb_out at the fixpoint.
         result: dict[str, int] = {}

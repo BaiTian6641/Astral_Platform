@@ -71,6 +71,7 @@ def synth_ethereal(design: str, out_prefix: str, top: str | None = None,
             "alumacc\n"
             "opt\n"
             "simplemap\n"
+            "dffunmap\n"
             "abc -lut 4\n"
             "opt -full\n"
             "clean\n"
@@ -79,9 +80,14 @@ def synth_ethereal(design: str, out_prefix: str, top: str | None = None,
             f"write_blif {out_prefix}.blif\n"
         )
     else:
+        # dffunmap before abc (E1-DMO1, latent-bug fix): synth leaves CE /
+        # sync-reset FFs ($_DFFE_/$_SDFFCE_) which `abc -lut 4` silently drops
+        # (uart_loopback lost 51 of 59 FFs); dffunmap rewrites them to plain
+        # $_DFF_ + LUT logic. No-op for FF-free (combinational) designs.
         script = (
             f"read_verilog {design}\n"
             f"synth {top_opt}\n"
+            "dffunmap\n"
             "abc -lut 4\n"
             "opt -full\n"
             "clean\n"

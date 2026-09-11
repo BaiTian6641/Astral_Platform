@@ -394,8 +394,7 @@ def parse_place(path: str) -> dict[str, tuple[int, int]]:
     with open(path, encoding="utf-8") as fh:
         for raw in fh:
             line = raw.strip()
-            if not line or line.startswith("#") or line.startswith("Netlist_File") \
-                    or line.startswith("Array size"):
+            if not line or line.startswith(("#", "Netlist_File", "Array size")):
                 continue
             parts = line.split()
             # <name> <x> <y> <subblk> <#num>
@@ -578,17 +577,43 @@ def _assign_lut_gk(
     return gk_map
 
 
+def _fle_out_net(fl: ET.Element) -> str | None:
+    """The net a fle's physical output drives (the name downstream sees).
+
+    Combinational fle: the ``lut[0]`` leaf out-port net. FF-carrying fle:
+    the FF's Q net — the ble4 out mux selects ff.Q, and VPR may rename the
+    Q net to a buffer-absorbed alias (uart_loopback: BLIF latch ``rxs[1]``
+    drives the identity buffer ``rx_stop``; VPR absorbs the buffer and
+    names the Q port ``rx_stop``). This rule MUST stay identical to
+    :func:`_build_tile` pass 1: ``build_db``'s ``driven`` set (and thus
+    buffer-alias ``canon``) is built from it, and a name mismatch leaves
+    the FF's sinks unrouted (E1-DMO1: 5 silently-unrouted uart_loopback
+    cluster inputs read default tracks -> wrong sequential logic).
+    """
+    outnet: str | None = None
+    lut = fl.find(".//block[@instance='lut[0]']")
+    if lut is not None:
+        outp = lut.find("./outputs/port[@name='out']")
+        if outp is not None and outp.text:
+            outnet = outp.text.strip()
+    if _fle_ff_used(fl):
+        ff = fl.find(".//block[@instance='ff[0]']")
+        if ff is not None:
+            qp = ff.find("./outputs/port[@name='Q']")
+            if qp is not None and qp.text:
+                outnet = qp.text.strip()
+    return outnet
+
+
 def _tile_output_nets(clb: ET.Element) -> set[str]:
-    """The routed net names this clb block drives (lut[0] leaf out ports)."""
+    """The routed net names this clb block drives (mirrors _build_tile pass 1)."""
     out: set[str] = set()
     for fl in clb:
         if not (fl.get("instance", "").startswith("fle[") and fl.get("mode") == "n1_lut4"):
             continue
-        lut = fl.find(".//block[@instance='lut[0]']")
-        if lut is not None:
-            outp = lut.find("./outputs/port[@name='out']")
-            if outp is not None and outp.text:
-                out.add(outp.text.strip())
+        name = _fle_out_net(fl)
+        if name is not None:
+            out.add(name)
     return out
 
 
@@ -641,13 +666,14 @@ def _build_tile(clb: ET.Element,
             continue
         gi = _fle_index(fl.get("instance", ""))
         fles.append((gi, fl))
-        lut = fl.find(".//block[@instance='lut[0]']")
-        outnet: str | None = None
-        if lut is not None:
-            outp = lut.find("./outputs/port[@name='out']")
-            if outp is not None and outp.text:
-                outnet = outp.text.strip()
-        tile.cluster_outputs[gi] = outnet
+        # The fle's physical output is the REGISTERED value when the ble4 out
+        # mux selects ff.Q — the cluster output carries the FF's Q net (what
+        # feedback, routing and PO taps must see), never the lut leaf's
+        # PRE-edge D net. _fle_out_net owns that rule; _tile_output_nets
+        # mirrors it so the driven-name set and the tile outputs agree
+        # (E1-DMO1: VPR renames FF Q nets after absorbed buffers, e.g.
+        # uart_loopback latch rxs[1] -> Q rx_stop).
+        tile.cluster_outputs[gi] = _fle_out_net(fl)
 
     # this tile's own feedback producers: net -> fle j (a logical input driven
     # by one of THIS tile's LUTs is a feedback source; anything else is an
@@ -715,7 +741,14 @@ def _build_tile(clb: ET.Element,
                 continue
             kind, idx, net = entry
             tile.iib_mux[(gi, gk)] = iib_sel_for(gi, gk, (kind, idx))
-            pin_logpos[gk] = dem["input_list"].index(net)
+            # Logical position of this net in its .names block: the position
+            # recorded at demand build — net names are canonicalized through
+            # the buffer classes, so .index() on the raw input_list misses
+            # (E1-DMO1: rxs[1] -> rx_stop).
+            if net in dem["ext"]:
+                pin_logpos[gk] = dem["ext"][net]
+            else:
+                pin_logpos[gk] = dem["fb"][net][1]
 
         phys_tt = 0
         logical_tt = dem["logical_tt"]

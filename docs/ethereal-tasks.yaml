@@ -291,7 +291,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-runtime/bmc-fw/
     acceptance: 固件 UART 启动；region 状态机空转演示；FW 双分区自更新演示
-    status: in_progress
+    status: done   # 2026-09-11 (sim 范围): 三条验收证据齐 —— ① UART 启动（tb_bmc_fw）② region 生命周期（tb_bmc_daemon 7 阶段 41 检查）③ FW 双分区自更新（bmc-fw/fwupdate/ + tb_bmc_fwupdate 30/30，emri-v0 §3.6 v0.4）。生产 daemon 对 EFP_CMD 6/7 应答 bad_cmd（demo 为独立固件变体）；reboot 为模拟（netlist 无核内软复位，ASSUMPTION 已记录）。report-E1-BMC2-fwupdate-20260911；GW5 板级验证随 E1-PLT2
 
   - id: E1-BMC3
     title: BMC 调试通道（UART 控制台 + JTAG 排针 + OpenOCD 配置）
@@ -393,7 +393,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-images/ 三个镜像
     acceptance: 2 region 轮换运行；热替换 <10ms(BMC+DMA) / <100ms(上位机经 SPI)
-    status: in_progress
+    status: in_progress   # 2026-09-11: PWM + UART 两镜像闭环（pwm 64 向量全帧位真；uart 6873 周期 tick 位真 + 6 字节语义解码；根因=bitgen_db FF-Q 视图漂移→5 输入静默未布线，修复 + 回归全绿）。AES-128 按既有结论递延（C02 异构 S-box 解锁，Phase 2）；「2 region 轮换 + 热替换计时」验收 = E1-DMO2。report-E1-DMO1-demo-images-20260902（2026-09-11 闭合更新）
 
   - id: E1-DMO2
     title: 热替换稳定性测试（2x10000 次 + 干扰监测）
