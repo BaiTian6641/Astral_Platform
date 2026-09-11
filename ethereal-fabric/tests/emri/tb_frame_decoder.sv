@@ -38,7 +38,7 @@ module tb_frame_decoder;
   // ---- decoder stimulus ----
   logic        start = 1'b0;
   logic [7:0]  col = 8'd0;
-  logic        busy, done, crc_error;
+  logic        busy, done, crc_error, cfg_error;
   logic [15:0] fbus_addr = 16'h0;
   logic [31:0] fbus_wdata = 32'h0;
   logic        fbus_we = 1'b0;
@@ -58,7 +58,7 @@ module tb_frame_decoder;
     .fbus_addr_i(fbus_addr), .fbus_wdata_i(fbus_wdata), .fbus_we_i(fbus_we),
     .frame_base_i(frame_base),
     .cfg_we_o(cfg_we), .cfg_addr_o(cfg_addr), .cfg_data_o(cfg_data),
-    .crc_error_o(crc_error)
+    .crc_error_o(crc_error), .cfg_error_o(cfg_error)
   );
 
   // ---- frame data (from the helper): DATA words + CRC tail (tail unread) ----
@@ -117,6 +117,7 @@ module tb_frame_decoder;
 
     chk(busy == 1'b0, "decoder idle at reset");
     chk(crc_error == 1'b0, "crc_error tied 0 in v0");
+    chk(cfg_error == 1'b0, "cfg_error clear at reset (E1-DMO2c)");
 
     // ---- start a decode for column 0 ----
     @(negedge clk); col = 8'd0; start = 1'b1;
@@ -178,6 +179,63 @@ module tb_frame_decoder;
     // tile(row1,col0) elut7 = 0xF0F0F (CLB unit0 intra7)
     d = find_data(mkaddr(2,0,7));
     chk(found && d == 32'h000F0F0F, "tile(row1) elut7 decoded (tile-boundary offset)");
+
+    // ================================================================
+    // E1-DMO2c: frame-window contract (order-based capture + cfg_error)
+    // ================================================================
+    // ---- (a) NON-ZERO stream base with a MATCHING frame_base_i: decodes, no flag.
+    //         Capture is order-based, so streaming the same column-0 image at
+    //         0x0100 decodes to the same tile values.
+    nwrites = 0;
+    frame_base = 16'h0100;
+    @(negedge clk); start = 1'b1;
+    @(negedge clk); start = 1'b0;
+    for (i = 0; i < NWORDS; i = i + 1) begin
+      @(negedge clk);
+      fbus_we    = 1'b1;
+      fbus_addr  = frame_base + 16'(i);
+      fbus_wdata = frame[i];
+      @(posedge clk);
+    end
+    @(negedge clk); fbus_we = 1'b0; fbus_wdata = 32'h0;
+    i = 0;
+    while (!done && i < 5000) begin @(posedge clk); i = i + 1; end
+    chk(done == 1'b1, "offset-base decode: done asserted");
+    chk(cfg_error == 1'b0, "matching frame_base_i raises no frame-window error");
+    d = find_data(mkaddr(0,2,0));
+    chk(found && d == 32'd5, "offset-base decode: cb_sel_0 decoded");
+
+    // ---- (b) NEGATIVE: stream at base 0x0100 with frame_base_i = 0 (the silent
+    //         mis-wire E1-DMO2c found). Mutate word 0's cb_sel_0 field (5 -> 29)
+    //         so the value decoded now distinguishes THIS stream from the stale
+    //         buffer left by (a): a stale re-decode would report 5, not 29.
+    frame[0] = (frame[0] & 32'hFFFF_FFE0) | 32'd29;
+    nwrites = 0;
+    frame_base = 16'h0000;                    // MIS-WIRED (stream base is 0x0100)
+    @(negedge clk); start = 1'b1;
+    @(negedge clk); start = 1'b0;
+    chk(busy == 1'b1, "mis-wired base: busy after start");
+    for (i = 0; i < NWORDS; i = i + 1) begin
+      @(negedge clk);
+      fbus_we    = 1'b1;
+      fbus_addr  = 16'h0100 + 16'(i);
+      fbus_wdata = frame[i];
+      @(posedge clk);
+    end
+    @(negedge clk); fbus_we = 1'b0; fbus_wdata = 32'h0;
+    i = 0;
+    while (!done && i < 5000) begin @(posedge clk); i = i + 1; end
+    chk(done == 1'b1, "mis-wired base: decode still completes");
+    chk(cfg_error == 1'b1, "mis-wired frame_base_i raises the sticky cfg_error");
+    d = find_data(mkaddr(0,2,0));
+    chk(found && d == 32'd29,
+        "mis-wired base: decoded the NEW stream, NOT the stale buffer");
+    chk(nwrites == 228, "mis-wired base: still emits the full point walk");
+
+    // ---- (c) the sticky flag clears on the next start_i ----
+    @(negedge clk); start = 1'b1;
+    @(negedge clk); start = 1'b0;
+    chk(cfg_error == 1'b0, "cfg_error clears on the next start_i");
 
     // ---- report ----
     if (errors == 0)

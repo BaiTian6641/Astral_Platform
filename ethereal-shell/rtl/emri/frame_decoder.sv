@@ -41,6 +41,8 @@
 //                * DSP dsp_vcasc (48b) -> intra4 (hi 32 of [47:16]) + intra5 (lo 16).
 // Maintainer:  BaiTian6641
 // Created:     2026-07-30
+// Modified:    2026-09-12 - E1-DMO2c hardening: order-based capture + sticky
+//                           cfg_error_o frame-window violation flag
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §5 ·
 //              ethereal-plan/components/C03-OCC组件.md §0 ·
@@ -55,6 +57,18 @@
 //              counts DATA words and leaves the tail unread (the OCC's word_count
 //              for a packed deploy = column_data_words, tail excluded — matching
 //              how bitgen/OCC treat the CRC as a transport trailer, not config).
+//
+//              FRAME-WINDOW CONTRACT (E1-DMO2c, 2026-09-12): the capture buffer is
+//              filled in STREAM ORDER (cap_count_r), independent of the frame-bus
+//              address offset, so a stream at ANY frame base decodes correctly and
+//              a stale buffer can never be re-decoded onto the target tiles.
+//              `frame_base_i` is therefore only a contract declaration: a captured
+//              DATA word whose offset (fbus_addr_i - frame_base_i) leaves the
+//              window [0, MAX_WORDS) raises the sticky `cfg_error_o` — the caller
+//              mis-wired the base (e.g. streaming column 1 at 0x100 with
+//              frame_base_i = 0), which used to drop every word silently and
+//              re-decode the previous buffer. The flag REPORTS (the OCC can
+//              surface it); it does not block the decode.
 module frame_decoder #(
     parameter int R = 2,
     parameter int C = 2,
@@ -90,7 +104,9 @@ module frame_decoder #(
     output logic [15:0] cfg_addr_o,
     output logic [31:0] cfg_data_o,
     // ---- status ----
-    output logic        crc_error_o       // v0: tied 0 (CRC16 verify deferred, Notes)
+    output logic        crc_error_o,      // v0: tied 0 (CRC16 verify deferred, Notes)
+    // ---- status: E1-DMO2c frame-window contract violation (sticky) ----
+    output logic        cfg_error_o
 );
 
     // ------------------------------------------------------------------
@@ -450,6 +466,16 @@ module frame_decoder #(
     logic [15:0] widx;
     assign widx = fbus_addr_i - frame_base_i;
 
+    // E1-DMO2c: sticky frame-window contract violation. Set when a captured DATA
+    // word's frame-relative offset (fbus_addr_i - frame_base_i) falls outside the
+    // buffer window [0, MAX_WORDS) — the symptom of a caller whose frame_base_i
+    // does not match the base it streams at. Capture itself no longer depends on
+    // that offset (see the capture block), so the config is still correct; this
+    // flag makes the mis-wire visible instead of silent. Cleared on the next
+    // start_i. (MAX_WORDS must be >= column_data_words for the geometry/CB_DIV in
+    // use — true for the default CB_DIV=2, where the widest tile is CLB at 530 b.)
+    logic        cfg_error_r;
+
     // DATA-word count for the requested column (combinational helper for c_start).
     logic [15:0] nw_comb;
     always_comb begin
@@ -472,9 +498,19 @@ module frame_decoder #(
                 nwords_r    <= nw_comb;
                 cap_count_r <= '0;
             end else if (c_capture) begin
-                if (widx < 16'(MAX_WORDS)) fbuf[int'(widx)] <= fbus_wdata_i;
+                // E1-DMO2c: capture in STREAM ORDER, not by the caller-supplied
+                // address offset. The buffer then always holds THIS stream's
+                // words, so a caller streaming at a non-zero frame base with a
+                // stale frame_base_i can never make the decoder re-decode the
+                // previous column's stale buffer. cap_count_r is bounded by
+                // nwords_r (the FSM leaves ST_STREAM on the last DATA word).
+                if (cap_count_r < 16'(MAX_WORDS)) fbuf[int'(cap_count_r)] <= fbus_wdata_i;
                 cap_count_r <= cap_count_r + 16'd1;
             end
+            // E1-DMO2c sticky flag: a DATA word arrived at an offset outside the
+            // declared frame window (caller contract violation — see cfg_error_o).
+            if (c_start) cfg_error_r <= 1'b0;
+            if (c_capture && (widx >= 16'(MAX_WORDS))) cfg_error_r <= 1'b1;
 
             if (state_r == ST_SETUP) begin
                 // initialise the walker at tile(row 0), its CB phase.
@@ -521,6 +557,7 @@ module frame_decoder #(
     assign busy_o     = (state_r != ST_IDLE);
     assign done_o     = (state_r == ST_DONE);
     assign crc_error_o = 1'b0;   // v0: CRC16 verify deferred (OCC does CRC32; Notes)
+    assign cfg_error_o = cfg_error_r;   // E1-DMO2c: sticky frame-window violation
 
 endmodule
 

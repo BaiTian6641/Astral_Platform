@@ -279,13 +279,14 @@ module tb_bmc_watchdog;
       .start_i(dec_start), .col_i(dec_col),
       .busy_o(dec_busy), .done_o(dec_done),
       .fbus_addr_i(fbus_addr), .fbus_wdata_i(fbus_wdata), .fbus_we_i(fbus_we),
-      // frame_base_i must track the in-flight op's frame base: the decoder
-      // computes widx = fbus_addr - frame_base, so a hardwired 0 only works
-      // for base-0 deploys (region 0 / column 0). Region 1's base is
-      // 0x1000|(1<<8) = 0x1100 (OCC_FRAME_ADDR v0.6: 256-word column window).
+      // frame_base_i declares the in-flight op's frame window: the decoder
+      // captures in stream order but flags an out-of-window word via cfg_error_o
+      // (E1-DMO2c), so a hardwired 0 is only correct for base-0 deploys (region 0
+      // / column 0). Region 1's base is 0x1000|(1<<8) = 0x1100 (OCC_FRAME_ADDR
+      // v0.6: 256-word column window).
       .frame_base_i(occ_frame_addr),
       .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
-      .crc_error_o(dec_crc_error)
+      .crc_error_o(dec_crc_error), .cfg_error_o()
   );
 
   // Fabric user/region reset (tb_bmc_daemon_packed pattern).

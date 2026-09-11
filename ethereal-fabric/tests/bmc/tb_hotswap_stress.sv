@@ -277,9 +277,11 @@ module tb_hotswap_stress;
       .start_i(dec_start), .col_i(dec_col),
       .busy_o(dec_busy), .done_o(dec_done),
       .fbus_addr_i(fbus_addr), .fbus_wdata_i(fbus_wdata), .fbus_we_i(fbus_we),
-      .frame_base_i(16'h0000),
+      // frame_base_i must declare the in-flight op's frame window (see
+      // tb_bmc_watchdog): a hardwired 0 is only correct for base-0 deploys.
+      .frame_base_i(occ_frame_addr),
       .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
-      .crc_error_o(dec_crc_error)
+      .crc_error_o(dec_crc_error), .cfg_error_o()
   );
 
   // Fabric user/region reset: pulsed AFTER the WRITE decode completes so the

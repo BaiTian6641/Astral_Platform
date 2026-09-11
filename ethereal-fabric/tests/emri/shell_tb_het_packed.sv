@@ -73,7 +73,7 @@ module shell_tb_het_packed;
 
   // ---- frame_decoder <-> fabric cfg ----
   logic        dec_cfg_we; logic [15:0] dec_cfg_addr; logic [31:0] dec_cfg_data;
-  logic        dec_start = 1'b0; logic dec_busy, dec_done, dec_crc_error;
+  logic        dec_start = 1'b0; logic dec_busy, dec_done, dec_crc_error, dec_cfg_error;
 
   // ---- fabric observation ----
   logic [OBS_W-1:0]      clb_out_obs;
@@ -123,7 +123,7 @@ module shell_tb_het_packed;
     .fbus_addr_i(fbus_addr), .fbus_wdata_i(fbus_wdata), .fbus_we_i(fbus_we),
     .frame_base_i(16'h0000),
     .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
-    .crc_error_o(dec_crc_error)
+    .crc_error_o(dec_crc_error), .cfg_error_o(dec_cfg_error)
   );
 
   fabric_top #(.R(R), .C(C), .W(W), .N(N), .K(K), .EXT_IN(EXT_IN),
@@ -203,6 +203,7 @@ module shell_tb_het_packed;
       chk(dc==2'd0, "BLANK done_code=DONE");
       k=0; while (!dec_done && k<8000) begin @(posedge clk); k=k+1; end
       chk(dec_done==1'b1, "frame_decoder done after BLANK decode");
+      chk(dec_cfg_error==1'b0, "frame-window contract held (BLANK decode)");
       @(negedge clk);
 
       // WRITE the packed image
@@ -216,6 +217,7 @@ module shell_tb_het_packed;
       chk(dc==2'd0, "WRITE done_code=DONE");
       k=0; while (!dec_done && k<8000) begin @(posedge clk); k=k+1; end
       chk(dec_done==1'b1, "frame_decoder done after WRITE decode");
+      chk(dec_cfg_error==1'b0, "frame-window contract held (WRITE decode)");
       @(negedge clk);
     end
   endtask
