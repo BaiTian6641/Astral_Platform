@@ -45,7 +45,8 @@ module tb_blank;
     logic [DATA_W-1:0]     fbus_rdata;
     logic [2:0]            status;
     logic                  crc_error;
-    logic                  region_locked;
+    logic [7:0]            region_locks;
+    logic                  global_lock;
 
     integer errors = 0;
 
@@ -85,7 +86,7 @@ module tb_blank;
         .fbus_rdata_i   (fbus_rdata),
         .status_o       (status),
         .crc_error_o    (crc_error),
-        .region_locked_i(region_locked),
+        .region_locks_i(region_locks), .global_lock_i(global_lock),
         .expect_crc_i   (32'h0),   // v0.5 §3.1.1: this TB issues no READBACK
         .crc_result_o   ()
     );
@@ -172,7 +173,8 @@ module tb_blank;
         word_count    = '0;
         wdata         = '0;
         wdata_valid   = 1'b0;
-        region_locked = 1'b0;
+        region_locks = 8'h00;
+        global_lock  = 1'b0;
 
         cfg[0] = 32'h0000_0001;
         cfg[1] = 32'h0000_0002;
@@ -370,7 +372,7 @@ module tb_blank;
         // ================================================================
         // region 0 is dirty (from check 5). Lock must take priority -> LOCKED,
         // NOT NEEDS_BLANK.
-        region_locked = 1'b1;
+        region_locks = 8'h01;   // lock region 0 (frame_addr 0x0100)
         @(negedge clk);
         @(negedge clk);
         begin : c6
@@ -415,7 +417,7 @@ module tb_blank;
             if (errors == 0) $display("PASS: locked WRITE left RAM unchanged");
         end
         @(negedge clk);
-        region_locked = 1'b0;
+        region_locks = 8'h00;
         @(negedge clk);
         if (status !== S_IDLE) begin
             $display("FAIL: post-lock status=%0d (expected IDLE=0)", status);

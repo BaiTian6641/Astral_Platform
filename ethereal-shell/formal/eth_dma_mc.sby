@@ -1,0 +1,51 @@
+# eth_dma_mc AXI4 master formal proof (SymbiYosys).
+#
+# Proves the AXI4 VALID/READY discipline of `eth_dma_axi_engine` — the single
+# AXI4 master port of the multi-channel scatter-gather DMA `eth_dma_mc`
+# (S15 §3; eth-axi-v0.md §2 rules 1-2, §7 props 1-2):
+#   F1  no VALID withdrawal before the handshake, with stable AW/AR payload
+#       (AWADDR/AWLEN/AWID, ARADDR/ARLEN/ARID);
+#   F2  W held stable while stalled (WDATA/WSTRB/WLAST freeze until WREADY);
+#   F3  WLAST asserted exactly on the last beat of the burst and only there;
+#   F4  no lost / duplicated beats: one beat is counted per accepted W beat, the
+#       write stream leaves E_W exactly at that last beat, R beats are accepted
+#       only while the read burst is open and it closes exactly on RLAST, and
+#       the FSM transition relation makes a second AW (or AR, or completion)
+#       per grant unreachable;
+#   F5  single outstanding transaction (tx_ready_o only in E_IDLE, and an
+#       accepted request always enters an address phase);
+#   F6  BREADY only after the write data stream finished (E_W -> E_B -> E_IDLE).
+#
+# The properties are written as inductive relations over (state, inputs, next
+# state) plus one-cycle VALID-stability checks on registered outputs, so the
+# proof holds by k-induction at UNBOUNDED depth — there is no harness length
+# bound and no property-only counting state.  Environment assumptions are the
+# AXI/DRAM-socket contracts: a producer holds a presented W beat until accepted,
+# and a compliant slave ends a burst with RLAST on the last requested beat (an
+# erroring read may end early — eth-axi-v0.md §9.4).
+#
+# The cover task witnesses completed read and write bursts, including erroring
+# ones, so the safety proof is non-vacuous.  Liveness/progress (fairness of
+# READY) is out of scope.
+#
+# Run:  sby -f eth_dma_mc.sby     (picked up by `make formal`)
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 24
+cover: mode cover
+cover: depth 24
+
+[engines]
+prove: smtbmc
+cover: smtbmc
+
+[script]
+read -formal eth_dma_axi_engine.sv
+prep -top eth_dma_axi_engine
+
+[files]
+ethereal-shell/rtl/dma/eth_dma_axi_engine.sv

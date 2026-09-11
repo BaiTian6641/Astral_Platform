@@ -178,7 +178,7 @@ module tb_bmc_fw;
         .occ_cmd_o(), .occ_cmd_valid_o(), .occ_cmd_ready_i(1'b0),
         .occ_frame_addr_o(), .occ_word_count_o(),
         .occ_wdata_o(), .occ_wdata_valid_o(), .occ_wdata_ready_i(1'b0),
-        .occ_status_i(3'd0), .occ_crc_error_i(1'b0), .occ_region_locked_o(),
+        .occ_status_i(3'd0), .occ_crc_error_i(1'b0), .occ_region_locks_o(), .occ_global_lock_o(),
         .dec_start_o(), .dec_col_o(), .dec_busy_i(1'b0),
         .occ_expect_crc_o(),
         .occ_crc_result_i(32'h0)

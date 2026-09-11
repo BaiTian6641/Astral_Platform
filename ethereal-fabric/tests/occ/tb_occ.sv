@@ -9,8 +9,9 @@
 //                2. CRC tamper: backdoor-flip one RAM word, READBACK ->
 //                   status=ERROR, crc_error=1 (sticky).
 //                3. BLANK an 8-word frame -> DONE, all target RAM words == 0.
-//                4. LOCK blocks WRITE: region_locked_i=1 + WRITE -> status=LOCKED,
-//                   cmd_ready=0, RAM unchanged.
+//                4. LOCK blocks WRITE: region_locks_i bit 0 (frame_addr 0x0300 is
+//                   region 0) + WRITE -> status=LOCKED (lock dominates the dirty
+//                   bit), cmd_ready=0, RAM unchanged.
 //                5. NOP / idle: status=IDLE with no command.
 //              Run: iverilog -g2012 -o /tmp/tb_occ tb_occ.sv column_cfg_ram.sv \
 //                              ../../rtl/occ/occ_top.sv && vvp /tmp/tb_occ
@@ -44,7 +45,8 @@ module tb_occ;
     logic                  crc_error;
     logic [31:0]           crc_result;    // v0.5 §3.1.1: OCC running CRC
     logic [31:0]           expect_crc;    // v0.5 §3.1.1: READBACK gate value
-    logic                  region_locked;
+    logic [7:0]            region_locks;
+    logic                  global_lock;
 
     integer errors = 0;
 
@@ -83,7 +85,7 @@ module tb_occ;
         .fbus_rdata_i  (fbus_rdata),
         .status_o      (status),
         .crc_error_o   (crc_error),
-        .region_locked_i(region_locked),
+        .region_locks_i(region_locks), .global_lock_i(global_lock),
         .expect_crc_i  (expect_crc),      // v0.5 §3.1.1
         .crc_result_o  (crc_result)
     );
@@ -179,7 +181,8 @@ module tb_occ;
         word_count    = '0;
         wdata         = '0;
         wdata_valid   = 1'b0;
-        region_locked = 1'b0;
+        region_locks  = 8'h00;
+        global_lock   = 1'b0;
         expect_crc    = 32'h0;
 
         // counter-config pattern
@@ -293,7 +296,7 @@ module tb_occ;
         // ================================================================
         $display("== check 4: LOCK blocks WRITE ==");
         // ================================================================
-        region_locked = 1'b1;
+        region_locks = 8'h01;   // lock region 0 (frame_addr[15:12] = 0)
         @(negedge clk);
         @(negedge clk);
         begin : lock_check
@@ -333,7 +336,7 @@ module tb_occ;
             if (errors == 0) $display("PASS: locked WRITE left RAM unchanged");
         end
         @(negedge clk);
-        region_locked = 1'b0;
+        region_locks = 8'h00;
         @(negedge clk);
         // sanity: status returns to IDLE after unlocking + NOP
         if (status !== S_IDLE) begin

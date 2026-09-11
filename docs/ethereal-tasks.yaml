@@ -571,7 +571,7 @@ tasks:
     est_days: 3
     deliverable: occ_top 逐区锁位 + EMRI LKM 寄存器面 + daemon 锁生命周期联动
     acceptance: 越权 region 写被拒且事件上报（S10 §3 Phase-1 #1）
-    status: in_progress   # 2026-09-12: EMRI v0.8 §3.10 已冻结（LKM_STATUS @0x29 / LKM_CMD @0x2A；锁定区 WRITE/BLANK 在 OCC 硬件门拒绝 → done_code=LOCKED → EFP_ERR=3；RUNNING 自动锁、BLANK 前解锁）；daemon 侧生命周期锁/解锁已落地并编译通过；RTL 面（occ_top 逐区门 + emri_regfile LKM 面）与 TB 实现中
+    status: done   # 2026-09-12: EMRI v0.8 §3.10 + occ_top 逐区硬件写门（region_locks_i[7:0]+global_lock_i；WRITE/BLANK 拒 → done_code=LOCKED(3) → daemon EFP_ERR=3；READBACK 不受限）+ emri_regfile LKM 面 + daemon 生命周期（RUNNING 锁、BLANK 前解锁、PAUSED restart 拒绝）。端到端 BMC TB 抓出两个真问题并修掉：① LKM_CMD=4 曾连逐区锁一起清 → 规范澄清"仅清全局位"（LKM_OP_GLOBAL_CLEAR 只动 global_lock_r）；② 既有握手死锁 —— occ_top 在 LOCKED/NEEDS_BLANK 拒绝时不给 cmd_ready，单宿主端口永久挂住 → regfile 于该状态释放挂起事务（NEEDS_BLANK→occ_reject 亦在寄存器 ABI 上重新可达）。证据：tb_lock_matrix（新）+ 22 个 ripple TB + tb_bmc_fw/tb_ethctl_replay（真固件）+ tb_occ_soak 20000 零损坏 + formal 全过（含 emri_r_occ_decode）+ make lint 干净；3 项负控按预期失败。report-E2-SEC1b-lock-matrix-20260912。注：修正后的 tb_bmc_daemon 阶段 1d 复跑确认中（首轮已证 RUNNING 自动锁/裸写被拒且 RAM 逐字节不变/全局锁闸门）
 
   - id: E2-AST1
     title: Astral 聚合 v1（Zephyr+WAMR + Type-F 容器经 EFP 调 vFPGA）
@@ -635,7 +635,7 @@ tasks:
     est_days: 45
     deliverable: ethereal-shell/rtl/dma/eth_dma_mc.sv + formal
     acceptance: 描述符链表 SG 传输 TB 通过；形式化 VALID/READY 性质
-    status: todo
+    status: done   # 2026-09-12 (垂直切片): `ethereal-shell/rtl/dma/`（eth_dma_pkg 描述符布局/CSR 映射/错误码 + fifo + arb + **axi_engine 单未完成 AXI4 INCR 主**（6 态 FSM + FORMAL 性质块）+ channel（取/译/校验/突发分块/CSR/IRQ）+ top（CSR 文件/N 通道/仲裁/ID 路由/聚合 irq）+ AXI4 主口）。描述符 32 B（SRC/DST/NXT/LEN+SOF/EOF/IOC，32 B 对齐，一次 INCR 读回）；v0 规则与分块策略见头注释。**TB `tb_eth_dma_mc` 60 checks / 0 errors**（DUT=顶层，内存=真实 `eth_dram_ctrl` 插座）：多描述符链校验和、双通道交织、两条 DECERR 错误路径不挂死、LFSR 背压、连续 AXI 协议监视器（VALID 不撤回/WLAST/单未完成/beat 计数）。**形式化 `eth_dma_mc.sby` k-induction PASS + cover**（已并入 make formal）。非目标：多未完成/Stream/2D/状态回写/循环链/LEN>65535；CSR 为通用 valid/ready（AXI4-Lite 外壳属集成层）；与 xbar 的挂接需 E2-AXI2 突发扩展。report-E2-DMA1-dma-mc-20260912
 
   - id: E2-DMA2
     title: eth_dma_2d 图形 DMA（ND-strided + blit/fill/ROP，Service-Tile 级）

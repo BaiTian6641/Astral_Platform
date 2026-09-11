@@ -59,7 +59,8 @@ module tb_emri_regfile;
   logic        occ_wdata_ready;
   logic [2:0]  occ_status;
   logic        occ_crc_error;
-  logic        occ_region_locked;
+  logic [7:0]  occ_region_locks;
+  logic        occ_global_lock;
 
   // ---- DUT ----
   logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
@@ -89,7 +90,7 @@ module tb_emri_regfile;
     .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
     .occ_wdata_ready_i(occ_wdata_ready),
     .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-    .occ_region_locked_o(occ_region_locked),
+    .occ_region_locks_o(occ_region_locks), .occ_global_lock_o(occ_global_lock),
     .occ_expect_crc_o(),
     .occ_crc_result_i(32'h0),
     // v0.7 §3.9 context engine command/status (stub-driven; see ctx_* above)
@@ -292,7 +293,8 @@ module tb_emri_regfile;
     host_write(R_OCC_CMD, 32'h0000_010F);  // 0x10F = bit8 + region1(0x0C) + BLANK(3)
     // wait for stub to return to IDLE
     timeout_wait_idle();
-    chk(occ_region_locked == 1'b0, "region_locked hardwired 0");
+    chk(occ_region_locks == 8'h00 && occ_global_lock == 1'b0,
+        "v0.8 lock matrix reset-clear");
 
     // ---- 5. OCC WRITE: set frame addr + word count, issue WRITE cmd, then
     //         push 4 data words sequentially (single host bus — no concurrency).

@@ -114,7 +114,7 @@ module tb_ctx_multiword;
     .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
     .occ_wdata_ready_i(1'b0),
     .occ_status_i(OCC_S_IDLE), .occ_crc_error_i(1'b0),
-    .occ_region_locked_o(),
+    .occ_region_locks_o(), .occ_global_lock_o(),
     .occ_expect_crc_o(), .occ_crc_result_i(32'h0),
     .dec_start_o(dec_start), .dec_col_o(dec_col), .dec_busy_i(1'b0),
     // v0.7 §3.9 engine command/status (engine + freeze live in the wrapper)

@@ -174,7 +174,7 @@ module tb_bmc_axi_emri;
         .occ_wdata_o(), .occ_wdata_valid_o(), .occ_wdata_ready_i(1'b0),
         .occ_status_i(3'd0),      // OCC_S_IDLE
         .occ_crc_error_i(1'b0),
-        .occ_region_locked_o(),
+        .occ_region_locks_o(), .occ_global_lock_o(),
         .occ_expect_crc_o(),
         .occ_crc_result_i(32'h0)
     );

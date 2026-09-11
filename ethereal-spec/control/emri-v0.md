@@ -1,8 +1,8 @@
-# EMRI — Ethereal Management Register Interface (v0.7, draft)
+# EMRI — Ethereal Management Register Interface (v0.8, draft)
 
-> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.7** (v0.7 adds the **context save/restore orchestration** surfaces — `CTX_CMD`/`CTX_WORDS`/`CTX_STATUS` @ `0x26`-`0x28` (§3.9), `EFP_CMD=8 ctx_save` / `9 ctx_restore`, `EFP_STATUS=9 PAUSED`, `EFP_ERR=13 ctx_error` — for the E2-FAB3 scan-chain engine (`ethereal-spec/fabric/ctx-scan-v0.md`); v0.6 added the **capability-declaration gate** (`CAP_DECL_IO` @ `0x22` / `CAP_DECL_SVC` @ `0x23` / `CAP_STATUS` @ `0x24`, §3.7) + **anomaly monitoring v1** (per-region reconfig/watchdog counters @ `0x32`/`0x33`, spike flags + throttle mask @ `0x34`, window/threshold config @ `0x35`/`0x36`, §3.8) + `EFP_ERR=11 capability_denied` / `12 rate_limited` + event codes 4/5, and **re-maps `OCC_FRAME_ADDR`** to `{region_id[15:12], col_id[11:8], word[7:0]}` — v0.5's 4-bit column field/16-word stride aliased adjacent columns of a multi-column packed image in the readback store (E1-DMO2b; `capabilities.yaml` schema in `ethereal-spec/security/capabilities-v0.md`). v0.5 added the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
+> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.8** (v0.8 adds the **region lock matrix** surface — `LKM_STATUS` @ `0x29` / `LKM_CMD` @ `0x2A` (§3.10), the per-region hardware write gate specified in C03 §5 — E2-SEC1b; v0.7 added the **context save/restore orchestration** surfaces — `CTX_CMD`/`CTX_WORDS`/`CTX_STATUS` @ `0x26`-`0x28` (§3.9), `EFP_CMD=8 ctx_save` / `9 ctx_restore`, `EFP_STATUS=9 PAUSED`, `EFP_ERR=13 ctx_error` — for the E2-FAB3 scan-chain engine (`ethereal-spec/fabric/ctx-scan-v0.md`); v0.6 added the **capability-declaration gate** (`CAP_DECL_IO` @ `0x22` / `CAP_DECL_SVC` @ `0x23` / `CAP_STATUS` @ `0x24`, §3.7) + **anomaly monitoring v1** (per-region reconfig/watchdog counters @ `0x32`/`0x33`, spike flags + throttle mask @ `0x34`, window/threshold config @ `0x35`/`0x36`, §3.8) + `EFP_ERR=11 capability_denied` / `12 rate_limited` + event codes 4/5, and **re-maps `OCC_FRAME_ADDR`** to `{region_id[15:12], col_id[11:8], word[7:0]}` — v0.5's 4-bit column field/16-word stride aliased adjacent columns of a multi-column packed image in the readback store (E1-DMO2b; `capabilities.yaml` schema in `ethereal-spec/security/capabilities-v0.md`). v0.5 added the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
 > Plan-Ref: `ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.3`, `ethereal-plan/components/C05-BMC组件.md §3/§4`
-> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · v0.6: 2026-09-11 · v0.7: 2026-09-11 · Implements: ADR-013/014/015/016
+> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · v0.6: 2026-09-11 · v0.7: 2026-09-11 · v0.8: 2026-09-12 · Implements: ADR-013/014/015/016
 
 The **unified management register ABI** exposed to the host by **both** the BMC
 (NEORV32 soft-core) and the **mFSM** (register-based small-device fallback).
@@ -88,6 +88,8 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x26` | `CTX_CMD` | W | 8 | **Context engine trigger** (v0.7, §3.9): `bit0=start` (one-shot), `bit1=mode` (`0=save`, `1=restore`). Reads 0. The engine ignores a start while busy. |
 | `0x27` | `CTX_WORDS` | RW | 16 | **Chain word count** for the next context operation (v0.7, §3.9): `ceil(N/32)` where `N = R*C*8` (one bit per eLUT vff). `0` → the command is refused with `EFP_ERR=13`. |
 | `0x28` | `CTX_STATUS` | R | 8 | **Context engine status** (v0.7, §3.9): `{done[0], busy[1], err[2]}`. `done` is a latched completion flag cleared by the next `CTX_CMD` write; `err` is sticky until then too. |
+| `0x29` | `LKM_STATUS` | R | 32 | **Region lock bitmap** (v0.8, §3.10): `[7:0]` bit `r` = region `r` locked; `[8]` = global lock; rest reserved-0. Mirrors the OCC lock matrix (`occ_top`) — not a software copy. |
+| `0x2A` | `LKM_CMD` | W | 32 | **Lock command** (v0.8, §3.10): `[3:0]` opcode `1=lock region`, `2=unlock region`, `3=set global lock`, `4=clear global lock`; `[7:4]` = region index (for 1/2). Opcodes 3/4 touch **only** the global bit — per-region locks are cleared by opcode 2 explicitly, never as a side effect. Reads 0. |
 | `0x3F` | `SPI_CRC` | W | 16 | **EFP-SPI transport-CRC16 latch** (§7.1, v0.3): `DATA[15:0]` = expected CRC16 of the session's OCC_PUSH stream. Intercepted by the SPI front-end; not a regfile storage word. RD returns front-end debug `{state[17:16], crc_acc[15:0]}`. |
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
@@ -100,7 +102,7 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x38` | `EVT_LOG_CTRL` | R/W1C | 32 | **Event-log ring control** (v0.4, §3.4): R = `{count[15:0], wr_ptr[31:16]}`; a write with `bit16=1` CLEARS the ring (count/wr_ptr/read-ptr = 0, entries dropped); all other writes are no-ops. |
 | `0x39` | `EVT_LOG_DATA` | push-W / pop-R | 32 | **Event-log ring data** (v0.4, §3.4): a WRITE pushes one entry (the written word, `{code[7:0], region[15:8], stamp[31:16]}`); a READ pops the OLDEST un-read entry (advancing the read pointer; empty reads 0, no advance). Depth 16, overwrite-oldest when full. |
 
-**Reserved ranges** after v0.7 allocations: `0x07`, `0x29-0x2F`,
+**Reserved ranges** after v0.8 allocations: `0x07`, `0x2B-0x2F`,
 `0x3A-0x3E`, `0x60+` — read-as-0, write-ignored. Allocation map:
 telemetry @ `0x40-0x4F` (planned), `IMG_SIG` @ `0x50-0x5F` (v0.2), scheduler @
 `0x60+` (planned).
@@ -110,7 +112,8 @@ History: `0x06`=`REGION_SEL` (v0.1, §6), `0x0D`=`OCC_DECODE` (v0.1, §3.1),
 `0x0E`=`OCC_EXPECT_CRC` / `0x0F`=`OCC_CRC_RESULT` (v0.5, §3.1.1),
 `0x38-0x39`=event-log ring (v0.4, §3.4),
 `0x22-0x24`=capability gate / `0x32-0x36`=anomaly monitor (v0.6, §3.7/§3.8),
-`0x26-0x28`=context engine / `EFP_CMD` 8/9 (v0.7, §3.9).
+`0x26-0x28`=context engine / `EFP_CMD` 8/9 (v0.7, §3.9),
+`0x29-0x2A`=region lock matrix (v0.8, §3.10).
 
 ---
 
@@ -543,6 +546,39 @@ Rules:
    context window, not in the image) — restore or stop instead.
 6. The context window is the dedicated context storage (the SSM-T window, C02 §3);
    v0 exposes no window address register — the engine owns it.
+
+## 3.10 Region lock matrix (offsets `0x29`/`0x2A`, v0.8, E2-SEC1b)
+
+Hardware write-protection per region (C03 §5): N region lock bits + one global
+lock. **A locked region's frame-bus write enable is physically closed at the
+column decode** — this is a hardware gate, not a software check.
+
+| Element | Behaviour |
+| --- | --- |
+| lock bits | held in `occ_top` (`region_locks` + `global_lock`), reset to 0 (unlocked) |
+| gate | `occ_top` refuses **WRITE and BLANK** targeting a locked region with `done_code = LOCKED (3)` (READBACK stays allowed); the daemon maps that to `EFP_ERR=3 region_locked` and pushes an event |
+| `LKM_STATUS` | read-only mirror of the hardware bitmap (single source of truth: the OCC) |
+| `LKM_CMD` | write-only command: `1/2` lock/unlock region `[7:4]`; `3/4` global lock/unlock |
+| lifecycle policy (daemon) | on reaching RUNNING → lock region `r`; before the per-column BLANK of stop/abort → unlock `r`; LOADING/BLANKING are therefore always unlocked |
+
+Rules:
+
+1. The lock state lives in hardware only; the EMRI surface issues commands and
+   reads the bitmap (no software copy to drift).
+2. A refused locked write is reported, never silently dropped: `OCC_STATUS.done_code
+   = LOCKED` → `EFP_ERR=3` (daemon) / a `LOCKED` status read (mFSM host).
+3. Locked regions still permit READBACK and the §3.5 heartbeat probe (they are
+   read-only operations).
+4. The global lock ORs into every region's gate; it is the maintenance/quarantine
+   lever (and the pre-image-swap blanket, S02 §2.3).
+5. `run`/`restart` on a non-FREE region remain refused by the allocator
+   (`EFP_ERR=2 region_full`) — the lock protects against **raw OCC writes** from
+   any other bus master, which is the §3.10 threat model.
+6. Reset (or `abort`) leaves all locks clear.
+
+// ASSUMPTION: v0 EMRI trusts the bus master; C03 §5.2's "only the BMC may set
+clear locks" is an OCC-endpoint/HP-channel property (S02 §2.3), not modelled in
+the v0 sim fabric (TBD, 2026-09-12).
 
 ## 4. OCC_STATUS register (offset `0x0A`)
 

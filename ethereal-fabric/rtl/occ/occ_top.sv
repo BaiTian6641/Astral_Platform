@@ -14,8 +14,12 @@
 //                            against expect_crc_i latched at command accept
 //                            (v0.5 spec §3.1.1: the caller captures crc_result_o
 //                            after the WRITE and supplies it as the expectation).
-//               WRITE/BLANK are gated by region_locked_i (reject -> LOCKED);
-//               READBACK is NOT lock-checked in v0 (read is non-destructive).
+//               WRITE/BLANK are gated by the per-region lock matrix (C03 §5,
+//               v0.8 spec §3.10): a region whose `region_locks_i` bit is set —
+//               or any region while `global_lock_i` is set — is refused with
+//               status_o = LOCKED, no state transition, and no frame-bus write
+//               enable. READBACK is NOT lock-checked (read is non-destructive;
+//               §3.10 rule 3 keeps locked regions readable/heartbeat-probeable).
 //               crc_error_o is sticky: set on a READBACK CRC mismatch, cleared on
 //               the next accepted command.
 //
@@ -30,17 +34,26 @@
 // Modified:    2026-07-24 - blank-before-write enforcement + NEEDS_BLANK (task E0-FAB5)
 // Modified:    2026-09-11 - v0.5 expected-CRC gate: expect_crc_i latched at
 //                           accept, crc_result_o exposed (spec §3.1.1)
+//              2026-09-12 - v0.8 §3.10 region lock matrix (E2-SEC1b): scalar
+//                           region_locked_i replaced by region_locks_i[7:0] +
+//                           global_lock_i (per-region gate, C03 §5)
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-plan/components/C03-OCC组件.md §2
+// Plan-Ref:    ethereal-plan/components/C03-OCC组件.md §2/§5 (C03 §5 lock
+//              matrix: v0.8 spec §3.10, E2-SEC1b)
 // Notes:       v0 scope per C03 §2.2 (simplified): no mailbox/DMA, no col_ack
 //              frame-level handshake (1 word/cycle backpressure via wdata_ready),
-//              no blank.hex ROM (blank = hardwired zero frame), no lock MATRIX
-//              (single region_locked_i gate). FABulous blank-before-write red
+//              no blank.hex ROM (blank = hardwired zero frame). E2-SEC1b added
+//              the per-region lock MATRIX (C03 §5). FABulous blank-before-write red
 //              line (C03 §0) is respected at the protocol level: a region must be
 //              blanked before its first config WRITE — enforced by the BMC, not
 //              by occ_top v0.  [SUPERSEDED in E0-FAB5: blank-before-write is
 //              now HARDWARE-ENFORCED in occ_top via a per-region dirty bit and
 //              the S_NEEDS_BLANK status -- see dirty_r / region_id_r below.]
+//              Lock storage lives in emri_regfile (LKM_CMD/LKM_STATUS, spec
+//              §3.10); occ_top holds only the gate. The lock is sampled at
+//              command accept, so an accepted frame is atomic w.r.t. the lock
+//              (C03 §2.3 frame-level atomicity) — a mid-frame lock assertion
+//              does not truncate an in-flight frame.
 //              ASSUMPTION (TBD 2026-07-24): DATA_W must equal 32 — crc32_next is
 //              a fixed 32-bit/4-byte tableless function (matches the frozen
 //              DATA_W=32 frame word width, C03 §1.1). Parameterized for interface
@@ -77,7 +90,13 @@ module occ_top #(
     // status + lock
     output logic [2:0]            status_o,        // 0=IDLE 1=BUSY 2=DONE 3=ERROR 4=LOCKED
     output logic                  crc_error_o,     // sticky; set on readback CRC mismatch
-    input  logic                  region_locked_i, // 1 = current region locked (blocks WRITE/BLANK)
+    // Lock matrix (C03 §5 / spec §3.10): one bit per region + a global lock
+    // that ORs into every region's gate. Both reset to 0 by the regfile. The
+    // width matches the LKM_STATUS bitmap (8 regions); the frame-address
+    // region field is 4 bits, so ids 8..15 alias the lock of (id-8) — the gate
+    // can only ever close MORE, never less (v0 fabric: regions 0..1).
+    input  logic [7:0]            region_locks_i,  // bit r = region r locked
+    input  logic                  global_lock_i,   // 1 = every region locked
     // v0.5 spec §3.1.1 expected-CRC gate: READBACK compares its stream CRC
     // against expect_crc_i latched at command accept; crc_result_o exposes the
     // running/streaming CRC (= the final WRITE/BLANK stream CRC after completion).
@@ -172,6 +191,10 @@ module occ_top #(
     logic              c_read_word;     // READBACK: a word is being read
     logic              c_cmp_mismatch;  // CMP: crc_r != expect_crc_latched_r
 
+    // lock matrix gate (E2-SEC1b, C03 §5): a locked region's frame-bus write
+    // enable is closed at the column decode. Sampled at command accept.
+    logic        region_locked_w;   // global OR this region's lock bit
+
     // blank-before-write (E0-FAB5, C03 sec3): per-region dirty tracking
     logic [3:0]  region_id_w;       // current cmd region = frame_addr top 4 bits
     logic [3:0]  region_id_r;       // latched region of the in-flight op
@@ -203,7 +226,7 @@ module occ_top #(
                 if (cmd_valid_i) begin
                     case (cmd_i)
                         CMD_WRITE: begin
-                            if (region_locked_i) begin
+                            if (region_locked_w) begin
                                 status_c = S_LOCKED;          // reject: region locked
                             end else if (dirty_r[region_id_w]) begin
                                 status_c = S_NEEDS_BLANK;     // E0-FAB5: must BLANK first
@@ -214,7 +237,7 @@ module occ_top #(
                             end
                         end
                         CMD_BLANK: begin
-                            if (region_locked_i) begin
+                            if (region_locked_w) begin
                                 status_c = S_LOCKED;
                             end else begin
                                 cmd_ready = 1'b1;
@@ -362,6 +385,7 @@ module occ_top #(
     assign crc_error_o  = crc_error_r;
     assign crc_result_o = crc_r;
     assign region_id_w  = frame_addr_i[ADDR_W-1 -: 4];   // E0-FAB5: top-4-bit region id
+    assign region_locked_w = global_lock_i | region_locks_i[region_id_w[2:0]];  // C03 §5 gate
 
 endmodule
 

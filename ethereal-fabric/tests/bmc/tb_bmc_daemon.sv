@@ -220,7 +220,9 @@ module tb_bmc_daemon;
   logic [31:0] occ_wdata;
   logic        occ_wdata_valid, occ_wdata_ready;
   logic [2:0]  occ_status;
-  logic        occ_crc_error, occ_region_locked;
+  logic        occ_crc_error;
+  logic [7:0]  occ_region_locks;
+  logic        occ_global_lock;
 
   logic [15:0] fbus_addr;
   logic [31:0] fbus_wdata;
@@ -258,7 +260,7 @@ module tb_bmc_daemon;
       .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
       .occ_wdata_ready_i(occ_wdata_ready),
       .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-      .occ_region_locked_o(occ_region_locked),
+      .occ_region_locks_o(occ_region_locks), .occ_global_lock_o(occ_global_lock),
       // frame_decoder trigger unused in the v0 cfg-addr frame format
       .dec_start_o(), .dec_col_o(), .dec_busy_i(1'b0),
       .occ_expect_crc_o(occ_expect_crc_w),
@@ -276,7 +278,7 @@ module tb_bmc_daemon;
       .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata),
       .fbus_we_o(fbus_we), .fbus_re_o(fbus_re), .fbus_rdata_i(fbus_rdata),
       .status_o(occ_status), .crc_error_o(occ_crc_error),
-      .region_locked_i(occ_region_locked),
+      .region_locks_i(occ_region_locks), .global_lock_i(occ_global_lock),
       .expect_crc_i(occ_expect_crc_w),
       .crc_result_o(occ_crc_result_w)
   );
@@ -381,6 +383,9 @@ module tb_bmc_daemon;
   // v0.7 sec 3.9 context stages (E2-FAB3b): freeze-window probe locals.
   integer ctx_k;
   logic   ctx_ref, ctx_frozen_bad;
+  // v0.8 sec 3.10 lock-matrix stage locals (E2-SEC1b).
+  logic [31:0] lkm_shadow;
+  integer      lkm_to;
   task automatic chk(input logic cond, input logic [511:0] msg);
       begin
           if (cond) $display("  ok: %0s", msg);
@@ -697,6 +702,38 @@ module tb_bmc_daemon;
       chk(rd[7:0] == EFP_ERR_CTX_ERROR,
           "ctx negative: save on FREE region -> ctx_error (13)");
       host_wr(R_EFP_REGION, 32'h0000_0000);   // restore the region selector
+
+      // ---- 1d. v0.8 §3.10: region lock matrix (E2-SEC1b) ---------------------
+      // The running region is write-protected in hardware; a raw OCC WRITE from
+      // any bus master is refused with done_code LOCKED and touches no config.
+      $display("[1d] region lock matrix — running region is write-protected");
+      host_rd(R_LKM_STATUS, rd);
+      chk(rd[0] == 1'b1, "lock: region 0 auto-locked while RUNNING");
+      lkm_shadow = u_cfgram.mem[16'h0000];   // region-0 frame word 0 (image A)
+      host_wr(R_OCC_FRAME_ADDR, 32'h0000_0000);
+      host_wr(R_OCC_WORD_COUNT, 32'd1);
+      host_wr(R_OCC_CMD, 32'h0000_0101);     // start | region0 | WRITE
+      lkm_to = 0;
+      host_rd(R_OCC_STATUS, rd);
+      while ((rd[3] == 1'b0) && (lkm_to < 4000)) begin
+          host_rd(R_OCC_STATUS, rd);
+          lkm_to = lkm_to + 1;
+      end
+      chk(rd[3] == 1'b1, "lock: raw WRITE completed (done_flag)");
+      chk(rd[5:4] == 2'd3, "lock: raw WRITE refused with done_code LOCKED (3)");
+      chk(u_cfgram.mem[16'h0000] === lkm_shadow,
+          "lock: config RAM unchanged by the refused raw write");
+      // Global lock gates the same way, and clearing it restores LKM_STATUS.
+      host_wr(R_LKM_CMD, 32'h0000_0003);     // op 3 = lock all
+      host_rd(R_LKM_STATUS, rd);
+      chk(rd[8] == 1'b1, "lock: global lock set (LKM_STATUS[8])");
+      host_wr(R_LKM_CMD, 32'h0000_0004);     // op 4 = clear global ONLY (§3.10)
+      host_rd(R_LKM_STATUS, rd);
+      chk(rd[8] == 1'b0, "lock: global unlock clears the global bit");
+      chk(rd[0] == 1'b1, "lock: global unlock leaves region 0 locked (§3.10)");
+      host_wr(R_LKM_CMD, 32'h0000_0022);     // op 2, region 0 = explicit unlock
+      host_rd(R_LKM_STATUS, rd);
+      chk(rd[8:0] == 9'h0, "lock: explicit region unlock clears LKM_STATUS");
 
       // ---- 2. restart (stop + re-run last staged metadata) -------------------
       // Also the "subsequent good deploy" after the §3.7 refusal: a full

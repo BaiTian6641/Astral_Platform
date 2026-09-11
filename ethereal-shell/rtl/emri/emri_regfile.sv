@@ -49,17 +49,36 @@
 //              the regfile invents no error code — it only declines to pulse
 //              start, leaving done/busy/err at 0 and CTX_WORDS readable.
 //              The engine itself ignores a start while busy (ctx-scan §4).
-//              Region lock (occ_region_locked_o) is hardwired 0 in v0: blank-before-
-//              write is already hardware-enforced inside occ_top (E0-FAB5 dirty bit
-//              + S_NEEDS_BLANK), and v0 has no per-region lifecycle lock yet.
+//
+//              v0.8 (spec §3.10, E2-SEC1b): the REGION LOCK MATRIX surface.
+//                * LKM_CMD (0x2A, W, reads 0): opcode [3:0] 1=lock region,
+//                  2=unlock region, 3=set global lock, 4=clear global lock;
+//                  region index [7:4] for 1/2. Opcodes 3/4 touch ONLY the
+//                  global bit (regions are cleared by opcode 2 only). Any
+//                  other opcode is a no-op.
+//                * LKM_STATUS (0x29, R): [7:0] = per-region lock bitmap,
+//                  [8] = global lock, rest 0. It reads back the SAME flops that
+//                  are driven to occ_top's gate (occ_region_locks_o /
+//                  occ_global_lock_o), so the register surface and the hardware
+//                  gate can never disagree (no software copy to drift).
+//              The lock bits are plain storage here; the ENFORCEMENT is in
+//              occ_top (the frame-bus write gate, C03 §5). Power-on reset
+//              clears all locks; every later transition comes from LKM_CMD
+//              (the daemon owns the lifecycle policy: lock on RUNNING, unlock
+//              before the per-column BLANK of stop/abort — spec §3.10).
+//              A refused OCC command (occ_top reports LOCKED / NEEDS_BLANK
+//              instead of accepting it with cmd_ready) releases the held host
+//              transaction on that terminal status; see occ_refused_w.
 // Maintainer:  BaiTian6641
 // Created:     2026-07-29
 // Modified:    2026-09-11 - v0.6 capability gate (§3.7) + anomaly monitor (§3.8)
 //              2026-09-12 - v0.7 context surface: CTX_CMD/CTX_WORDS/CTX_STATUS
 //                           (§3.9, E2-FAB3b) + engine command/status ports
+//              2026-09-12 - v0.8 region lock matrix (§3.10, E2-SEC1b):
+//                           LKM_STATUS/LKM_CMD + occ lock-matrix outputs
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4 (§3.7/§3.8 v0.6,
-//              §3.9 context save/restore v0.7)
+//              §3.9 context save/restore v0.7, §3.10 region lock matrix v0.8)
 // Notes:       G1: default_nettype none, always_ff non-blocking, no latches
 //              (read mux is combinational with a default). Single host slave port
 //              (fabric clock domain); the SPI slave / BMC bus feeds this port.
@@ -96,7 +115,9 @@ module emri_regfile #(
   input  logic        occ_wdata_ready_i,
   input  logic [2:0]  occ_status_i,
   input  logic        occ_crc_error_i,
-  output logic        occ_region_locked_o,  // v0: hardwired 0 (see Details)
+  // v0.8 §3.10 (E2-SEC1b): lock matrix -> occ_top frame-bus write gate (C03 §5).
+  output logic [7:0]  occ_region_locks_o,   // bit r = region r locked (LKM_STATUS[7:0])
+  output logic        occ_global_lock_o,    // 1 = every region locked (LKM_STATUS[8])
   output logic [31:0] occ_expect_crc_o,     // v0.5 §3.1.1: expected READBACK CRC (regfile storage)
   input  logic [31:0] occ_crc_result_i,     // v0.5 §3.1.1: occ_top running/streaming CRC
 
@@ -170,6 +191,16 @@ module emri_regfile #(
   localparam int          CTX_STATUS_DONE  = emri_pkg::CTX_STATUS_DONE;
   localparam int          CTX_STATUS_BUSY  = emri_pkg::CTX_STATUS_BUSY;
   localparam int          CTX_STATUS_ERR   = emri_pkg::CTX_STATUS_ERR;
+  // v0.8 §3.10 region lock matrix (E2-SEC1b)
+  localparam logic [15:0] R_LKM_STATUS     = emri_pkg::R_LKM_STATUS;
+  localparam logic [15:0] R_LKM_CMD        = emri_pkg::R_LKM_CMD;
+  localparam int          LKM_CMD_OP_LSB     = emri_pkg::LKM_CMD_OP_LSB;
+  localparam int          LKM_CMD_REGION_LSB = emri_pkg::LKM_CMD_REGION_LSB;
+  localparam logic [3:0]  LKM_OP_LOCK         = emri_pkg::LKM_OP_LOCK;
+  localparam logic [3:0]  LKM_OP_UNLOCK       = emri_pkg::LKM_OP_UNLOCK;
+  localparam logic [3:0]  LKM_OP_GLOBAL_SET   = emri_pkg::LKM_OP_GLOBAL_SET;
+  localparam logic [3:0]  LKM_OP_GLOBAL_CLEAR = emri_pkg::LKM_OP_GLOBAL_CLEAR;
+  localparam int          LKM_REGIONS       = emri_pkg::LKM_REGIONS;
   localparam logic [15:0] R_EFP_CMD        = emri_pkg::R_EFP_CMD;
   localparam logic [15:0] R_EFP_REGION     = emri_pkg::R_EFP_REGION;
   localparam logic [15:0] R_EFP_IMG_WORDS  = emri_pkg::R_EFP_IMG_WORDS;
@@ -315,6 +346,16 @@ module emri_regfile #(
                                   ((host_op_i == SPI_OP_OCC_PUSH) ||
                                    ((host_op_i == SPI_OP_WR) && (host_addr_i == R_OCC_WDATA)));
 
+  // A refused OCC command completes WITHOUT cmd_ready: occ_top reports a
+  // terminal status (LOCKED for the §3.10 lock gate, NEEDS_BLANK for the
+  // E0-FAB5 dirty gate) and never accepts the command. The regfile must
+  // release the host transaction on that status, otherwise the held command
+  // blocks the single host port forever and the host can never read
+  // OCC_STATUS.done_code (spec §3.10 rule 2 / §3.2 step 5).
+  logic occ_refused_w;
+  assign occ_refused_w = (occ_status_i == OCC_S_LOCKED) ||
+                         (occ_status_i == OCC_S_NEEDS_BLANK);
+
   // ------------------------------------------------------------------
   // OCC command valid: hold while start pending until accepted
   // ------------------------------------------------------------------
@@ -329,8 +370,8 @@ module emri_regfile #(
         occ_cmd_r    <= host_wdata_i[1:0];
         occ_region_r <= host_wdata_i[5:2];
         occ_start_r  <= 1'b1;
-      end else if (occ_start_r && occ_cmd_ready_i) begin
-        occ_start_r <= 1'b0;  // accepted
+      end else if (occ_start_r && (occ_cmd_ready_i || occ_refused_w)) begin
+        occ_start_r <= 1'b0;  // accepted, or refused (terminal status)
       end
     end
   end
@@ -339,7 +380,6 @@ module emri_regfile #(
   assign occ_frame_addr_o = occ_frame_addr_r;
   assign occ_word_count_o = occ_word_count_r;
   assign occ_expect_crc_o = occ_expect_crc_r;
-  assign occ_region_locked_o = 1'b0;  // v0 (see Details)
 
   // ------------------------------------------------------------------
   // OCC wdata staging: a host OCC_PUSH write loads the skid buffer; the
@@ -365,6 +405,51 @@ module emri_regfile #(
   end
   assign occ_wdata_o       = occ_wdata_r;
   assign occ_wdata_valid_o = occ_wdata_pending_r;
+
+  // ------------------------------------------------------------------
+  // v0.8 §3.10 region lock matrix (E2-SEC1b, C03 §5)
+  //   LKM_CMD is write-only; LKM_STATUS reads back the SAME flops that feed
+  //   occ_top's gate, so the register surface and the hardware gate cannot
+  //   disagree (no software copy to drift). Power-on reset clears every lock;
+  //   all later transitions come from LKM_CMD — the daemon owns the lifecycle
+  //   policy (lock on RUNNING, unlock before the stop/abort per-column BLANK,
+  //   spec §3.10 lifecycle row).
+  //   Region index [7:4] >= LKM_REGIONS has no LKM_STATUS bit, so the command
+  //   is a no-op — a lock bit the surface could never report is never stored.
+  // ------------------------------------------------------------------
+  logic [LKM_REGIONS-1:0] region_locks_r;
+  logic                   global_lock_r;
+  logic                   lkm_cmd_write_w;
+  logic [3:0]             lkm_op_w;
+  logic [3:0]             lkm_region_w;
+
+  assign lkm_cmd_write_w = host_req_i && host_we_i &&
+                           (host_op_i == SPI_OP_WR) && (host_addr_i == R_LKM_CMD);
+  assign lkm_op_w        = host_wdata_i[LKM_CMD_OP_LSB     +: 4];
+  assign lkm_region_w    = host_wdata_i[LKM_CMD_REGION_LSB +: 4];
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      region_locks_r <= '0;
+      global_lock_r  <= 1'b0;
+    end else if (lkm_cmd_write_w) begin
+      // lkm_region_w is the full 4-bit field; LKM_REGIONS == 8 means bit [3] of
+      // the field selects "no such lock bit" (no-op, see the block comment).
+      case (lkm_op_w)
+        LKM_OP_LOCK: begin
+          if (!lkm_region_w[3]) region_locks_r[lkm_region_w[2:0]] <= 1'b1;
+        end
+        LKM_OP_UNLOCK: begin
+          if (!lkm_region_w[3]) region_locks_r[lkm_region_w[2:0]] <= 1'b0;
+        end
+        LKM_OP_GLOBAL_SET:   global_lock_r <= 1'b1;
+        LKM_OP_GLOBAL_CLEAR: global_lock_r <= 1'b0;  // regions untouched (§3.10)
+        default: ;  // opcode 0 / reserved: no-op
+      endcase
+    end
+  end
+  assign occ_region_locks_o = region_locks_r;
+  assign occ_global_lock_o  = global_lock_r;
 
   // ------------------------------------------------------------------
   // Plain RW registers
@@ -914,9 +999,12 @@ module emri_regfile #(
       R_CTX_CMD:        host_rdata_o = 32'h0;  // write-only (reads 0, spec §3.9)
       R_CTX_WORDS:      host_rdata_o = {16'h0, ctx_words_r};
       R_CTX_STATUS:     host_rdata_o = ctx_status_w;
+      // ---- v0.8 §3.10 region lock matrix ----
+      R_LKM_STATUS:     host_rdata_o = {23'h0, global_lock_r, region_locks_r};
+      R_LKM_CMD:        host_rdata_o = 32'h0;  // write-only (reads 0, spec §3.10)
       default: begin
         // IMG_DIGEST (0x18-0x1F) / IMG_SIG (0x50-0x5F) word windows; every other
-        // offset is reserved and reads as 0 (v0.7 map: 0x07, 0x25, 0x29-0x2F,
+        // offset is reserved and reads as 0 (v0.8 map: 0x07, 0x25, 0x2B-0x2F,
         // 0x3A-0x3E, 0x3F = SPI_CRC front-end intercept, 0x60+ — spec §2).
         if ((host_addr_i >= R_IMG_DIGEST) &&
             (host_addr_i < (R_IMG_DIGEST + 16'(IMG_DIGEST_WORDS)))) begin
@@ -951,8 +1039,9 @@ module emri_regfile #(
     end else begin
       // Write
       if (addr_is_occ_cmd_start) begin
-        // Ready when the latched command is accepted by OCC.
-        host_ready_o = occ_start_r && occ_cmd_ready_i;
+        // Ready when the latched command is accepted by OCC — or when OCC
+        // refused it (LOCKED/NEEDS_BLANK terminal status; see occ_refused_w).
+        host_ready_o = occ_start_r && (occ_cmd_ready_i || occ_refused_w);
       end else if (addr_is_occ_wdata_push) begin
         host_ready_o = !occ_wdata_pending_r || occ_wdata_ready_i;
       end else if (host_addr_i == R_OCC_DECODE) begin

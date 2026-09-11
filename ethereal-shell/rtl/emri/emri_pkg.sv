@@ -9,9 +9,11 @@
 //              offsets, sim allowed masks, monitor tick divider, event codes 4/5.
 //              2026-09-12 - v0.7 §3.9 context save/restore surface: CTX_CMD/
 //              CTX_WORDS/CTX_STATUS offsets (0x26-0x28) + their bit fields.
+//              2026-09-12 - v0.8 §3.10 region lock matrix (E2-SEC1b): LKM_STATUS/
+//              LKM_CMD offsets (0x29/0x2A) + opcode/bitfield encodings.
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4/§7 (§3.7/§3.8 v0.6,
-//              §3.9 context save/restore v0.7)
+//              §3.9 context save/restore v0.7, §3.10 region lock matrix v0.8)
 // Notes:       v0 scope: minimum for the sim-complete minimal loop (mFSM → OCC).
 package emri_pkg;
 
@@ -78,6 +80,26 @@ package emri_pkg;
   localparam int CTX_STATUS_DONE = 0;   // CTX_STATUS bit index (latched)
   localparam int CTX_STATUS_BUSY = 1;   // CTX_STATUS bit index (live)
   localparam int CTX_STATUS_ERR  = 2;   // CTX_STATUS bit index (sticky)
+  // v0.8 §3.10 region lock matrix (E2-SEC1b, C03 §5). LKM_STATUS is the
+  // read-only mirror of the lock bits the regfile drives into occ_top
+  // (region_locks_o[7:0] + global_lock_o — the same flops are both the gate
+  // input and the readback source, so no software copy can drift); LKM_CMD is
+  // the write-only lock command (opcode [3:0], region index [7:4], reads 0).
+  // The opcodes/bit positions mirror ethereal-runtime/bmc-fw/drivers/emri.h.
+  localparam logic [15:0] R_LKM_STATUS = 16'h29;  // R: [7:0] region bitmap, [8] global
+  localparam logic [15:0] R_LKM_CMD    = 16'h2A;  // W: [3:0] opcode, [7:4] region, reads 0
+  localparam int LKM_CMD_OP_LSB     = 0;  // opcode field LSB
+  localparam int LKM_CMD_REGION_LSB = 4;  // region-index field LSB (for op 1/2)
+  localparam logic [3:0] LKM_OP_LOCK         = 4'd1;  // lock region [7:4]
+  localparam logic [3:0] LKM_OP_UNLOCK       = 4'd2;  // unlock region [7:4]
+  // Opcodes 3/4 touch ONLY the global bit (spec §2/§3.10): per-region locks are
+  // cleared by opcode 2 explicitly, never as a side effect of a global clear.
+  localparam logic [3:0] LKM_OP_GLOBAL_SET   = 4'd3;  // set global lock
+  localparam logic [3:0] LKM_OP_GLOBAL_CLEAR = 4'd4;  // clear global lock (regions untouched)
+  // Lockable-region capacity = the LKM_STATUS bitmap width (spec §2). Region
+  // indices >= LKM_REGIONS have no status bit, so LKM_CMD 1/2 on them is a
+  // no-op: a lock the surface could never report is never stored.
+  localparam int LKM_REGIONS = 8;
 
   // v0.6 §3.8 anomaly monitoring v1: real-time per-region counters + per-window
   // spike thresholds in the regfile (1 monitor tick = EMRI_MON_TICK_DIV

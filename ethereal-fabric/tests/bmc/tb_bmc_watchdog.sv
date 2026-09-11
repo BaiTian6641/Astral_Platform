@@ -208,7 +208,9 @@ module tb_bmc_watchdog;
   logic [31:0] occ_wdata;
   logic        occ_wdata_valid, occ_wdata_ready;
   logic [2:0]  occ_status;
-  logic        occ_crc_error, occ_region_locked;
+  logic        occ_crc_error;
+  logic [7:0]  occ_region_locks;
+  logic        occ_global_lock;
   logic        dec_start;
   logic [7:0]  dec_col;
 
@@ -241,7 +243,7 @@ module tb_bmc_watchdog;
       .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
       .occ_wdata_ready_i(occ_wdata_ready),
       .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-      .occ_region_locked_o(occ_region_locked),
+      .occ_region_locks_o(occ_region_locks), .occ_global_lock_o(occ_global_lock),
       .dec_start_o(dec_start), .dec_col_o(dec_col), .dec_busy_i(dec_busy),
       .occ_expect_crc_o(occ_expect_crc_w),
       .occ_crc_result_i(occ_crc_result_w)
@@ -256,7 +258,7 @@ module tb_bmc_watchdog;
       .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata),
       .fbus_we_o(fbus_we), .fbus_re_o(fbus_re), .fbus_rdata_i(fbus_rdata),
       .status_o(occ_status), .crc_error_o(occ_crc_error),
-      .region_locked_i(occ_region_locked),
+      .region_locks_i(occ_region_locks), .global_lock_i(occ_global_lock),
       .expect_crc_i(occ_expect_crc_w),
       .crc_result_o(occ_crc_result_w)
   );
