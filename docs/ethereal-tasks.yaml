@@ -580,7 +580,7 @@ tasks:
     est_days: 8
     deliverable: astral-os/ 最小运行时 + 聚合 demo
     acceptance: WASM 容器与 vFPGA 逻辑双向数据通路演示
-    status: todo   # 2026-09-12 环境核查: `astral-os/` 仅为脚手架（README/LICENSE），本机**无 Zephyr/west/WAMR/wasmtime**（`find / -maxdepth 4` 全空）→ 需外部 SDK 与多 GB 依赖，属环境门控；sim 内的 Type-F 逻辑容器路径（EFP 调 vFPGA）已在 E1-RUN3/E1-DMO2 可跑，缺的是固件侧 WASM 运行时
+    status: blocked   # 2026-09-12 环境核查: `astral-os/` 仅为脚手架（README/LICENSE），本机**无 Zephyr/west/WAMR/wasmtime** → 需外部 SDK 与多 GB 依赖，属环境门控。**2026-09-12 已按 phase-2 §3 熔断条款交付降级演示「MCU 脚本部署」**：Flash 常驻脚本格式（CRC32 门 + 9 操作码 + 硬预算）+ 无 malloc 解释器（daemon 扩展钩子 `EFP_CMD_SCRIPT=10`，生产固件仍回 `bad_cmd` ⇒ 无需 spec 变更）+ 生成器 + `tb_bmc_script`（真实链路：启动→CRC 门→DEPLOY→**Ed25519 验签**→区域 0 RUNNING→LOOP×2→STOPPED；外加 CRC 损坏/签名篡改两条拒绝路径）⇒ **TEST PASSED，0 FAIL**，`tb_bmc_fw` 回归 PASSED；报告 `docs/reports/report-E2-AST1-mcu-script-deploy-20260912.md`；发现 DMEM 增长侵蚀 Ed25519 验签栈（移交 E2-BMC）。⇒ **剩余为 WASM 组件验收**（容器与 vFPGA 双向数据通路），仍待运行时环境
 
   - id: E2-DOC1
     title: 规范冻结（EBI/镜像/BoardManifest/EFP v1.0）

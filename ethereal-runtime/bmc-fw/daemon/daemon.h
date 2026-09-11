@@ -35,6 +35,14 @@
                                * (requires the region RUNNING) */
 #define EFP_CMD_CTX_RESTORE 9u /* v0.7 sec 3.9: restore FF context + resume
                                * (requires the region PAUSED) */
+#define EFP_CMD_SCRIPT     10u /* E2-AST1 SIM-DEMO (NOT yet in emri-v0.md): run
+                               * the flash-resident deployment script selected
+                               * by EFP_REGION. Only a firmware that installs
+                               * an extension handler (daemon_set_ext_handler)
+                               * answers it; the production daemon and any
+                               * variant without a handler answer bad_cmd —
+                               * the same convention as FWUPDATE/REBOOT (6/7,
+                               * spec sec 3.6). */
 #define EFP_REGION_AUTO 0xFFu /* auto-allocate first free (run only) */
 
 #define EFP_S_IDLE     0u
@@ -110,5 +118,21 @@ void daemon_init(void);
  * runs to completion (single outstanding command, spec sec 3.2). Never
  * returns. */
 void daemon_spin(void);
+
+/* Dispatch ONE accepted EFP command to its handler (the daemon_spin command
+ * table, spec sec 3.2) with NO doorbell framing — the caller owns accept /
+ * busy / squelch. A firmware-side script interpreter (E2-AST1 script/script.c)
+ * calls this once per script DEPLOY/STOP op, so a scripted deployment drives
+ * the SAME handlers as a host doorbell. */
+void daemon_dispatch(uint8_t cmd, uint8_t region_sel);
+
+/* Optional handler for SIM-DEMO commands that are not in daemon_dispatch
+ * (E2-AST1 EFP_CMD_SCRIPT): receives EFP_REGION and returns an EFP_ERR_*
+ * code (EFP_ERR_NONE on success), which the dispatcher applies via the
+ * regular error path. NULL (the default, and the production firmware) means
+ * such a command fails with bad_cmd. Install from main() after
+ * daemon_init(). */
+typedef uint8_t (*daemon_ext_fn)(uint8_t region_sel);
+void daemon_set_ext_handler(daemon_ext_fn fn);
 
 #endif /* BMC_FW_DAEMON_DAEMON_H */

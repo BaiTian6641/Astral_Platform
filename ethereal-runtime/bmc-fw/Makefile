@@ -151,6 +151,56 @@ $(BUILD)/slot_v2.hex: $(BUILD)/slot_v2.elf bin2hex.py
 
 slots: $(BUILD)/slot_v1.hex $(BUILD)/slot_v2.hex
 
+# ----------------------------------------------------------------------
+# E2-AST1 sim-demo firmware: MCU scripted deployment (script/, EFP_CMD_SCRIPT
+# — NOT yet in emri-v0.md). SIM-SCOPED: the production daemon + the
+# firmware-side deployment-script interpreter (script/script.c) registered as
+# the EFP_CMD_SCRIPT extension handler; a variant without script_register()
+# answers that command bad_cmd, like the production main.c build.
+# It links the NO-OP EFP-SPI front-end (script/spi_none.c): the AXI host path
+# is what this demo drives, and the 16 KiB sim DMEM has no room for the real
+# front-end plus the deploy's ~2 KiB Ed25519-verify stack (see spi_none.c).
+# ----------------------------------------------------------------------
+SCRIPT_OBJS := $(BUILD)/crt0.o $(BUILD)/main_script.o $(BUILD)/uart.o \
+               $(BUILD)/sha512.o $(BUILD)/ed25519.o $(BUILD)/daemon.o \
+               $(BUILD)/script.o $(BUILD)/spi_none.o
+
+$(BUILD)/main_script.o: script/main_script.c drivers/uart.h drivers/emri.h \
+                        efp-spi/efp_spi.h daemon/daemon.h script/script.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/script.o: script/script.c script/script.h drivers/emri.h \
+                   drivers/uart.h daemon/daemon.h efp-spi/efp_spi.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# No-op EFP-SPI front-end: this variant drives the AXI host path only and has
+# no DMEM headroom for the real front-end (see script/spi_none.c).
+$(BUILD)/spi_none.o: script/spi_none.c efp-spi/efp_spi.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/script.elf: $(SCRIPT_OBJS) link.ld
+	$(CC) $(LDFLAGS) $(SCRIPT_OBJS) -o $@
+
+$(BUILD)/script_boot.bin: $(BUILD)/script.elf
+	$(OBJCOPY) -O binary --only-section=.boot $< $@
+
+$(BUILD)/script_boot.hex: $(BUILD)/script_boot.bin bin2hex.py
+	python3 bin2hex.py $< $@ 256
+
+$(BUILD)/script_dmem.bin: $(BUILD)/script.elf
+	$(OBJCOPY) -O binary --only-section=.text --only-section=.data $< $@
+
+$(BUILD)/script_dmem_lane0.hex: $(BUILD)/script_dmem.bin bin2hex.py
+	python3 bin2hex.py --lanes 4 4096 $< $(BUILD)/script_dmem_lane
+
+.PHONY: script scripts
+script: $(BUILD)/script_boot.hex $(BUILD)/script_dmem_lane0.hex
+
+# Assemble the flash-resident deployment-script window (slot 0 = deploy,
+# slot 1 = reject); the TB copies it into generated/bmc/.
+scripts: script/gen_deploy_scripts.py
+	python3 script/gen_deploy_scripts.py --out $(BUILD)/script_window.hex
+
 # Regenerate the trusted-key keyring (deterministic; also used for TB vectors).
 vectors: daemon/gen_daemon_vectors.py
 	python3 daemon/gen_daemon_vectors.py --keyring daemon/keyring.h

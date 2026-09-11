@@ -1116,6 +1116,69 @@ void daemon_init(void)
     efp_status_sync();
 }
 
+/* ------------------------------------------------------------------ */
+/* Command dispatch (spec sec 3.2). daemon_spin owns the doorbell        */
+/* framing (accept -> busy -> squelch -> idle); daemon_dispatch is the   */
+/* command table itself, also driven by firmware-side script             */
+/* interpreters (E2-AST1 script/script.c) for their DEPLOY/STOP ops.     */
+/* ------------------------------------------------------------------ */
+
+/* Optional SIM-DEMO command handler (daemon.h): NULL = bad_cmd. */
+static daemon_ext_fn g_ext_handler;
+
+void daemon_set_ext_handler(daemon_ext_fn fn)
+{
+    g_ext_handler = fn;
+}
+
+void daemon_dispatch(uint8_t cmd, uint8_t region_sel)
+{
+    switch (cmd) {
+    case EFP_CMD_RUN:
+        uart_puts("cmd run\n");
+        do_run(region_sel);
+        break;
+    case EFP_CMD_STOP:
+        uart_puts("cmd stop\n");
+        do_stop(region_sel);
+        break;
+    case EFP_CMD_RESTART:
+        uart_puts("cmd restart\n");
+        do_restart();
+        break;
+    case EFP_CMD_ABORT:
+        uart_puts("cmd abort\n");
+        do_abort();
+        break;
+    case EFP_CMD_RUN_PACKED:
+        uart_puts("cmd run_packed\n");
+        do_run_packed(region_sel);
+        break;
+    case EFP_CMD_CTX_SAVE:
+        uart_puts("cmd ctx_save\n");
+        do_ctx_save(region_sel);
+        break;
+    case EFP_CMD_CTX_RESTORE:
+        uart_puts("cmd ctx_restore\n");
+        do_ctx_restore(region_sel);
+        break;
+    default:
+        /* SIM-DEMO commands (E2-AST1 EFP_CMD_SCRIPT) are outside the spec
+         * command table: route to the installed extension handler, else
+         * bad_cmd — which is the production firmware's answer (same
+         * convention as FWUPDATE/REBOOT, spec sec 3.6). */
+        if (cmd == EFP_CMD_SCRIPT && g_ext_handler != 0) {
+            uint8_t err = g_ext_handler(region_sel);
+            if (err != EFP_ERR_NONE) {
+                fail(err);
+            }
+        } else {
+            fail(EFP_ERR_BAD_CMD);
+        }
+        break;
+    }
+}
+
 void daemon_spin(void)
 {
     for (;;) {
@@ -1149,39 +1212,7 @@ void daemon_spin(void)
         efp_status_sync();
         uint8_t region_sel = (uint8_t)(emri_read(EMRI_EFP_REGION_WORD) & 0xFFu);
 
-        switch (cmd) {
-        case EFP_CMD_RUN:
-            uart_puts("cmd run\n");
-            do_run(region_sel);
-            break;
-        case EFP_CMD_STOP:
-            uart_puts("cmd stop\n");
-            do_stop(region_sel);
-            break;
-        case EFP_CMD_RESTART:
-            uart_puts("cmd restart\n");
-            do_restart();
-            break;
-        case EFP_CMD_ABORT:
-            uart_puts("cmd abort\n");
-            do_abort();
-            break;
-        case EFP_CMD_RUN_PACKED:
-            uart_puts("cmd run_packed\n");
-            do_run_packed(region_sel);
-            break;
-        case EFP_CMD_CTX_SAVE:
-            uart_puts("cmd ctx_save\n");
-            do_ctx_save(region_sel);
-            break;
-        case EFP_CMD_CTX_RESTORE:
-            uart_puts("cmd ctx_restore\n");
-            do_ctx_restore(region_sel);
-            break;
-        default:
-            fail(EFP_ERR_BAD_CMD);
-            break;
-        }
+        daemon_dispatch(cmd, region_sel);
 
         /* Doorbell-while-busy squelch (sec 3.2): a command written while
          * busy is ignored and flagged bad_cmd. Checked BEFORE busy clears:
