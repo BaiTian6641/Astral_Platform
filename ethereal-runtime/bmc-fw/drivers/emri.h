@@ -26,6 +26,8 @@
 #define EMRI_CAP_WORD          0x02u  /* R_CAPABILITIES -> bit0 has_bmc */
 #define EMRI_PLATFORM_ID_WORD  0x03u  /* R_PLATFORM_ID */
 #define EMRI_NUM_REGIONS_WORD  0x04u  /* R_NUM_REGIONS  -> v0: 2 */
+#define EMRI_REGION_INFO_WORD  0x05u  /* R_REGION_INFO (windowed by REGION_SEL) */
+#define EMRI_REGION_SEL_WORD   0x06u  /* R_REGION_SEL  (v0.1, sec 6) */
 #define EMRI_OCC_CMD_WORD      0x08u  /* R_OCC_CMD      (sec 3) */
 #define EMRI_OCC_WDATA_WORD    0x09u  /* R_OCC_WDATA    (W stream) */
 #define EMRI_OCC_STATUS_WORD   0x0Au  /* R_OCC_STATUS   (sec 4) */
@@ -41,6 +43,15 @@
 #define EMRI_EFP_STATUS_WORD   0x16u  /* R_EFP_STATUS   {state,busy,done} */
 #define EMRI_EFP_ERR_WORD      0x17u  /* R_EFP_ERR      sticky error */
 #define EMRI_EFP_IMG_COLS_WORD 0x21u  /* R_EFP_IMG_COLS (v0.3, sec 3.3: run_packed column count) */
+/* Context save/restore engine (v0.7, spec sec 3.9). */
+#define EMRI_CTX_CMD_WORD    0x26u /* R_CTX_CMD    W: bit0=start, bit1=mode (0=save) */
+#define EMRI_CTX_WORDS_WORD  0x27u /* R_CTX_WORDS  RW: chain words (N/32; 0 invalid) */
+#define EMRI_CTX_STATUS_WORD 0x28u /* R_CTX_STATUS R: {done[0], busy[1], err[2]} */
+#define EMRI_CTX_CMD_SAVE     0x1u /* start=1, mode=0 */
+#define EMRI_CTX_CMD_RESTORE  0x3u /* start=1, mode=1 */
+#define EMRI_CTX_STATUS_DONE  (1u << 0)
+#define EMRI_CTX_STATUS_BUSY  (1u << 1)
+#define EMRI_CTX_STATUS_ERR   (1u << 2)
 /* Capability-declaration gate (v0.6 sec 3.7): the host stages the compact
  * capabilities.yaml bitmap before EFP_CMD; CAP_STATUS is the RTL verdict
  * (read-only — cap_decl_* are plain RW staging, CAP_STATUS is produced by the

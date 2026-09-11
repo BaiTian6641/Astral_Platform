@@ -55,6 +55,7 @@
 typedef enum {
     REGION_FREE = 0, /* no image loaded (or stopped + blanked) */
     REGION_RUNNING,  /* image deployed and running            */
+    REGION_PAUSED,   /* v0.7 sec 3.9: context saved, fabric frozen */
 } region_state_e;
 
 typedef struct {
@@ -150,6 +151,7 @@ static void print_err(uint8_t err)
     case EFP_ERR_FWUPDATE:       uart_puts("fwupdate"); break;
     case EFP_ERR_CAPABILITY_DENIED: uart_puts("capability_denied"); break;
     case EFP_ERR_RATE_LIMITED:   uart_puts("rate_limited"); break;
+    case EFP_ERR_CTX_ERROR:      uart_puts("ctx_error"); break;
     default:                     uart_puts("unknown"); break;
     }
 }
@@ -238,6 +240,7 @@ static uint8_t wdt_drain(uint16_t words)
 static uint8_t occ_blank_region(uint8_t region, uint16_t words);
 static uint8_t occ_blank_column(uint8_t region, uint32_t col, uint16_t words);
 static uint8_t occ_check(uint32_t status);
+static uint8_t ctx_issue(uint8_t ctx_cmd); /* v0.7 sec 3.9 (stop releases a pause) */
 
 
 /* Watchdog abort (sec 3.5): report, then (WRITE ops only — BLANK/READBACK
@@ -766,7 +769,14 @@ static void do_stop(uint8_t region_sel)
         fail(EFP_ERR_BAD_CMD);
         return;
     }
-    if (g_regions[region_sel].state == REGION_RUNNING) {
+    /* sec 3.9 rule 4: a PAUSED region must release the armed freeze before it
+     * can be blanked (a restore drops the context and unfreezes the fabric). */
+    if (g_regions[region_sel].state == REGION_PAUSED) {
+        if (ctx_issue(EMRI_CTX_CMD_RESTORE) != 0u) {
+            return;
+        }
+    }
+    if (g_regions[region_sel].state != REGION_FREE) {
         uint8_t err;
         if (g_regions[region_sel].img_cols != 0u) {
             err = occ_blank_packed(region_sel, g_regions[region_sel].img_cols,
@@ -798,6 +808,12 @@ static void do_restart(void)
         return;
     }
     uint8_t region = g_last_region;
+    if (g_regions[region].state == REGION_PAUSED) {
+        /* sec 3.9 rule 5: the live state is in the context window, not in the
+         * image — a restart cannot reproduce it. Restore or stop instead. */
+        fail(EFP_ERR_CTX_ERROR);
+        return;
+    }
     if (g_regions[region].state == REGION_RUNNING) {
         uint8_t err;
         if (g_regions[region].img_cols != 0u) {
@@ -826,12 +842,114 @@ static void do_restart(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Context save/restore (v0.7 sec 3.9): drive the FF scan-chain engine  */
+/* through the EMRI CTX_* registers so a container can be paused and    */
+/* resumed without re-deploying its image. The chain is fabric-global   */
+/* in v0; a context op never touches configuration (no BLANK).          */
+/* ------------------------------------------------------------------ */
+#define CTX_POLL_BUDGET (1u << 20) /* bounded engine wait (matches sec 3.5) */
+
+/* Chain word count (sec 3.9 step 0): the scan chain covers every eLUT vff of
+ * the whole fabric -> words = total_tiles * 8 bits / 32. Derived from the EMRI
+ * geometry registers (REGION_SEL windowing REGION_INFO) so it tracks the
+ * build-time fabric instead of a hardcoded constant; the host's REGION_SEL
+ * value is restored afterwards. */
+static uint32_t ctx_chain_words(void)
+{
+    uint32_t saved = emri_read(EMRI_REGION_SEL_WORD) & 0xFFu;
+    uint32_t tiles = 0u;
+    for (uint32_t i = 0u; i < DAEMON_NUM_REGIONS; i++) {
+        emri_write(EMRI_REGION_SEL_WORD, i);
+        tiles += emri_read(EMRI_REGION_INFO_WORD) & 0xFFFFu;
+    }
+    emri_write(EMRI_REGION_SEL_WORD, saved);
+    return (tiles * 8u) / 32u;
+}
+
+/* Program CTX_WORDS, pulse CTX_CMD and wait for the engine. Returns 1 on
+ * failure after reporting EFP_ERR_CTX_ERROR (sec 3.9 rule 3). */
+static uint8_t ctx_issue(uint8_t ctx_cmd)
+{
+    emri_write(EMRI_CTX_WORDS_WORD, ctx_chain_words());
+    emri_write(EMRI_CTX_CMD_WORD, (uint32_t)ctx_cmd);
+    for (uint32_t i = 0u; i < CTX_POLL_BUDGET; i++) {
+        uint32_t st = emri_read(EMRI_CTX_STATUS_WORD);
+        if ((st & EMRI_CTX_STATUS_ERR) != 0u) {
+            fail(EFP_ERR_CTX_ERROR);
+            return 1u;
+        }
+        if (((st & EMRI_CTX_STATUS_DONE) != 0u) &&
+            ((st & EMRI_CTX_STATUS_BUSY) == 0u)) {
+            return 0u;
+        }
+    }
+    fail(EFP_ERR_CTX_ERROR); /* engine never completed */
+    return 1u;
+}
+
+/* ctx_save: RUNNING -> freeze + save state -> PAUSED (sec 3.9 step 1a). */
+static void do_ctx_save(uint8_t region_sel)
+{
+    if (region_sel >= DAEMON_NUM_REGIONS) {
+        fail(EFP_ERR_BAD_CMD);
+        return;
+    }
+    if (g_regions[region_sel].state != REGION_RUNNING) {
+        /* sec 3.9 rule 3: save requires a running region */
+        fail(EFP_ERR_CTX_ERROR);
+        return;
+    }
+    uart_puts("st CTXSAVE r");
+    uart_putc((char)('0' + (int32_t)region_sel));
+    uart_puts("\n");
+    if (ctx_issue(EMRI_CTX_CMD_SAVE) != 0u) {
+        return;
+    }
+    g_regions[region_sel].state = REGION_PAUSED;
+    g_done = 0u;
+    set_state(EFP_S_PAUSED); /* busy stays 1; the dispatcher clears it */
+    uart_puts("st PAUSED r");
+    uart_putc((char)('0' + (int32_t)region_sel));
+    uart_puts("\n");
+}
+
+/* ctx_restore: PAUSED -> restore state + unfreeze -> RUNNING (sec 3.9 step 1b). */
+static void do_ctx_restore(uint8_t region_sel)
+{
+    if (region_sel >= DAEMON_NUM_REGIONS) {
+        fail(EFP_ERR_BAD_CMD);
+        return;
+    }
+    if (g_regions[region_sel].state != REGION_PAUSED) {
+        fail(EFP_ERR_CTX_ERROR);
+        return;
+    }
+    uart_puts("st CTXRESTORE r");
+    uart_putc((char)('0' + (int32_t)region_sel));
+    uart_puts("\n");
+    if (ctx_issue(EMRI_CTX_CMD_RESTORE) != 0u) {
+        return;
+    }
+    g_regions[region_sel].state = REGION_RUNNING;
+    g_done = 0u;
+    set_state(EFP_S_RUNNING);
+    uart_puts("st RESUMED r");
+    uart_putc((char)('0' + (int32_t)region_sel));
+    uart_puts("\n");
+}
+
 /* abort: best-effort BLANK of running regions, state IDLE (sec 3.2). */
 static void do_abort(void)
 {
 
     for (uint32_t i = 0u; i < DAEMON_NUM_REGIONS; i++) {
-        if (g_regions[i].state == REGION_RUNNING) {
+        if (g_regions[i].state == REGION_PAUSED) {
+            /* sec 3.9 rule 4: a paused region must be unfrozen (restore drops
+             * the armed context) before it can be blanked. */
+            (void)ctx_issue(EMRI_CTX_CMD_RESTORE);
+        }
+        if (g_regions[i].state != REGION_FREE) {
             if (g_regions[i].img_cols != 0u) {
                 (void)occ_blank_packed((uint8_t)i, g_regions[i].img_cols,
                                        g_regions[i].img_words);
@@ -1017,6 +1135,14 @@ void daemon_spin(void)
         case EFP_CMD_RUN_PACKED:
             uart_puts("cmd run_packed\n");
             do_run_packed(region_sel);
+            break;
+        case EFP_CMD_CTX_SAVE:
+            uart_puts("cmd ctx_save\n");
+            do_ctx_save(region_sel);
+            break;
+        case EFP_CMD_CTX_RESTORE:
+            uart_puts("cmd ctx_restore\n");
+            do_ctx_restore(region_sel);
             break;
         default:
             fail(EFP_ERR_BAD_CMD);

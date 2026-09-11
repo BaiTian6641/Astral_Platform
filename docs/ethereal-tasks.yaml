@@ -448,7 +448,15 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/dsp_t/
     acceptance: FIR16 DSP-T 链实测 Fmax 与吞吐达标（vs LUT 版 ≥10x 吞吐）
-    status: in_progress   # 2026-09-11 对账: 吞吐结构性达标（real-tap fir16 → 16 $macc_v2 级联 + 0 eLUT 数据通路，32 向量 bit-true；vs 124-eLUT 拥堵 LUT 版）；**缺**：DSP 链单独实测 Fmax 数字（het VPR arch 的 c432 188.7 MHz 不能替代）——需 nextpnr/实板单列表征后可关
+    status: done   # 2026-09-11: ① 吞吐结构性达标（real-tap fir16 → 16 $macc_v2 级联 + 0 eLUT 数据通路；vs 124-eLUT LUT 版）；② **实测 Fmax（GW5AST-138，E1-PLT4 nextpnr 流程，post-route STA）**：单 MAC 93.77 MHz（cross-check 85.7）、整 dsp_t tile（config 驱动）69.35、fir16 16 级联 99.09 MHz（目标 50 MHz）；RTL↔综合网表等价 400 周期 0 diff、gowin_pack 出 34.7 MB 比特流；③ 新增实测：**开源 yosys/nextpnr 流程对 gw5a 不做 DSP 推断**（synth_gowin 的 mul2dsp 仅 gw1n/gw2a，dsp_map.v 无 27x18 模板）→ 上述数字为 LUT 映射下界，非 DSP 原语实现（器件 298 个 MULTALU27X18 全部未用）→ 原语映射缺口另立 E2-FAB2b。局部报告：docs/reports/report-E2-FAB2-fmax-20260912.md
+  - id: E2-FAB2b
+    title: GW5A DSP 原语映射缺口（开源流程 mul2dsp/dsp_map 无 27x18 模板）
+    phase: phase-2
+    deps: [E2-FAB2]
+    est_days: 3
+    deliverable: scratch mul2dsp 模板 + $__MUL27X18 → nextpnr MULTALU27X18 的强制映射，或 Gowin EDA 交叉核对
+    acceptance: dsp_t tile 在真实 DSP 原语上的 post-route Fmax（并给出与 LUT 映射下界的差值）
+    status: todo   # 证据: yosys synth_gowin 对 -family gw5a 直接跳过 mul2dsp（techlibs/gowin/synth_gowin.cc 仅 gw1n/gw2a），share/yosys/gowin/dsp_map.v 只有 $__MUL9X9/18X18/36X36；而 GW5A 库声明了 MULTALU27X18 且 nextpnr 有对应 bel+pack_dsp —— 原理上可强制映射
 
   - id: E2-FAB3
     title: SSM-T tile + 上下文保存 v1（FF 状态扫描读/写，BMC 编排）
@@ -465,7 +473,7 @@ tasks:
     est_days: 3
     deliverable: emri CTX_* register block + bmc-fw context orchestration
     acceptance: BMC 驱动的容器暂停/恢复（多字链 ≥2 字）位精确
-    status: todo
+    status: done   # 2026-09-12: EMRI v0.7 §3.9 冻结 + 四面落地 —— ① RTL: ctx_engine_wrap（新，持有 ctx_scan + PAUSED 冻结，终结周期桥接/释放）+ emri_regfile CTX 面（无引擎/织物/窗口）+ **ctx_scan 多字链 restore 字序修复**（原仅 W=1 正确，tb_ctx_multiword 抓出，变异双证）；② 固件: ctx_chain_words()（EMRI 几何推导）、ctx_issue()（有界轮询）、do_ctx_save/restore、stop/abort 先解冻再 BLANK、PAUSED restart 拒绝；③ 主机: emri_constants v0.7 + ABI 配对；④ 证据: lint/formal 3 证/test-model 2724+2xfail/tb_ctx_multiword(2 字链位精确)+tb_emri_regfile+tb_mon_anomaly+tb_ctx_scan(W=1 回归) PASS/**tb_bmc_daemon 83 ok 0 FAIL**（阶段 1c: RUNNING→PAUSED(9)+512 周期冻结→RUNNING(6)+恢复翻转 + 两个 ctx_error 负例）。report-E2-FAB3b-ctx-orchestration-20260912。**遗留**：同一测试内"BMC + ≥2 字链"需 ≥2 列/区构建（区域↔列映射参数化）
 
   - id: E2-FAB4
     title: fabric.yaml v2（异构 region 组合 + supertile）
@@ -492,7 +500,7 @@ tasks:
     est_days: 8
     deliverable: tools/mapper v2
     acceptance: 含 RAM/DSP 的基准端到端 bit-true
-    status: in_progress
+    status: done   # 2026-09-11 对账: 交付物与验收均在位 —— synth_ethereal.py（异构 Yosys flow: memory -nomap + alumacc）在 arch_ethereal.xml（+mult_27x18/+mem_2Kx32 tiles）上推断 RAM→$mem_v2 / mult→$macc_v2，既有基准仍路由（c432 CPD 5.30ns / 188.7MHz）（report-P1-het-map-infra-20260728）；端到端 bit-true 由异构链兑现：fir16 real-tap → 16 $macc_v2 级联 0 eLUT 数据通路、AES S-box 4779→290 eLUT+16 MEM-T（report-P1-het-acceptance-20260728）+ het frame_map/fabric_top/packed capstone TB（shell_tb_het_packed PASS，本轮亦复跑）
 
   - id: E2-IO1
     title: L2 代理库扩展（SPI/I2C master/PWM/QEI）+ RFC-004 冻结

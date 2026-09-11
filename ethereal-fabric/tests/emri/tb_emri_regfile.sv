@@ -4,9 +4,12 @@
 // Description: Exercises the EMRI register file: identity reads, RW config,
 //              REGION_INFO windowing, OCC command passthrough (cmd_valid +
 //              accept), OCC wdata streaming with backpressure, OCC_STATUS mirror,
-//              reserved-read-as-0, the EFP staging block, the event-log ring, and
-//              the v0.6 register file's reset defaults / RW behaviour (§3.7
-//              capability staging, §3.8 monitor counters+window+thresholds).
+//              reserved-read-as-0, the EFP staging block, the event-log ring, the
+//              v0.6 register file's reset defaults / RW behaviour (§3.7
+//              capability staging, §3.8 monitor counters+window+thresholds), and
+//              the v0.7 §3.9 context surface (CTX_CMD start/mode pulse, CTX_WORDS
+//              RW, CTX_STATUS done/busy/err with the latch + clear-on-CTX_CMD
+//              semantics and the CTX_WORDS=0 no-start rule).
 //              The full v0.6 semantics are covered by tb_mon_anomaly.sv.
 // Details:     Uses a minimal OCC stub (NOT the real occ_top) so the test stays
 //              focused on EMRI's register/passthrough behavior. The stub:
@@ -18,7 +21,7 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-29
 // Tags:        TESTBENCH
-// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4
+// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4 (§3.9 v0.7 CTX surface)
 // Notes:       iverilog -g2012. Self-checking; prints "TEST PASSED" on success.
 `timescale 1ns/1ps
 module tb_emri_regfile;
@@ -61,6 +64,16 @@ module tb_emri_regfile;
   // ---- DUT ----
   logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
   logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
+
+  // ---- CTX engine stub (v0.7 §3.9): the TB drives busy/done/err; the regfile
+  //      must pulse start/mode and latch the completion. ----
+  logic        ctx_start, ctx_mode;
+  logic [15:0] ctx_words;
+  logic        ctx_busy = 1'b0;
+  logic        ctx_done = 1'b0;
+  logic        ctx_err  = 1'b0;
+  logic        ctx_start_seen = 1'b0;
+  logic        ctx_mode_seen  = 1'b0;
   emri_regfile #(
     .HAS_BMC(HAS_BMC), .NUM_REGIONS(NUM_REGIONS),
     .PLATFORM_ID(PLATFORM_ID),
@@ -78,7 +91,10 @@ module tb_emri_regfile;
     .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
     .occ_region_locked_o(occ_region_locked),
     .occ_expect_crc_o(),
-    .occ_crc_result_i(32'h0)
+    .occ_crc_result_i(32'h0),
+    // v0.7 §3.9 context engine command/status (stub-driven; see ctx_* above)
+    .ctx_start_o(ctx_start), .ctx_mode_o(ctx_mode), .ctx_words_o(ctx_words),
+    .ctx_busy_i(ctx_busy), .ctx_done_i(ctx_done), .ctx_err_i(ctx_err)
   );
 
   // ============================================================
@@ -210,6 +226,22 @@ module tb_emri_regfile;
       host_req=1'b1; host_we=1'b1; host_op=SPI_OP_OCC_PUSH; host_addr=R_OCC_WDATA; host_wdata=d;
       @(posedge clk);
       while (!host_ready) @(posedge clk);
+      @(negedge clk);
+      host_req=1'b0;
+    end
+  endtask
+
+  // CTX_CMD write + capture the one-cycle engine start pulse it produces.
+  // The write is a plain-RW accept (host_ready high), so one posedge suffices;
+  // the pulse is visible 1 ns after that posedge (non-blocking update).
+  task automatic host_ctx_cmd(input logic [31:0] d);
+    begin
+      @(negedge clk);
+      host_req=1'b1; host_we=1'b1; host_op=SPI_OP_WR; host_addr=R_CTX_CMD; host_wdata=d;
+      @(posedge clk);
+      #1;
+      ctx_start_seen = ctx_start;
+      ctx_mode_seen  = ctx_mode;
       @(negedge clk);
       host_req=1'b0;
     end
@@ -393,6 +425,66 @@ module tb_emri_regfile;
     host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'd4, "EVT oldest dropped -> first pop = push #4");
     host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'd5, "EVT second pop = push #5");
     host_write(R_EVT_LOG_CTRL, 32'h0001_0000);   // clean up for nothing after
+
+    // ---- 12. v0.7 §3.9 context engine surface (CTX_CMD/CTX_WORDS/CTX_STATUS).
+    //      Uses the ctx stub above: the TB drives busy/done/err, the regfile
+    //      pulses start/mode and latches the completion. ----
+    host_read(R_CTX_CMD, rd);      chk(rd == 32'h0, "CTX_CMD reads 0 (write-only)");
+    host_read(R_CTX_WORDS, rd);    chk(rd == 32'h0, "CTX_WORDS resets to 0");
+    host_read(R_CTX_STATUS, rd);
+    chk(rd == 32'h0, "CTX_STATUS resets to {done,busy,err}=0");
+    chk(ctx_words == 16'h0, "ctx_words_o mirrors the 0 reset");
+
+    host_write(R_CTX_WORDS, 32'h0000_0002);
+    host_read(R_CTX_WORDS, rd);    chk(rd == 32'd2, "CTX_WORDS RW");
+    chk(ctx_words == 16'd2, "ctx_words_o mirrors CTX_WORDS");
+
+    // start=save (mode=0) with a non-zero word count pulses the engine
+    ctx_busy = 1'b1;                                  // stub: engine accepted
+    host_ctx_cmd(32'h0000_0001);
+    chk(ctx_start_seen == 1'b1, "CTX_CMD start pulses ctx_start_o");
+    chk(ctx_mode_seen == 1'b0, "CTX_CMD mode=0 latched (save)");
+    host_read(R_CTX_STATUS, rd);
+    chk(rd[1] == 1'b1 && rd[0] == 1'b0, "CTX_STATUS busy=1, done=0 while engine busy");
+
+    // engine completion: 1-cycle done -> latched; CTX_STATUS is read-only
+    @(negedge clk); ctx_busy = 1'b0; ctx_done = 1'b1;
+    @(negedge clk); ctx_done = 1'b0;
+    @(negedge clk);
+    host_read(R_CTX_STATUS, rd);
+    chk(rd[0] == 1'b1 && rd[1] == 1'b0 && rd[2] == 1'b0, "CTX_STATUS done latched, busy low");
+    host_write(R_CTX_STATUS, 32'h0000_00FF);          // RO: write ignored
+    host_read(R_CTX_STATUS, rd);
+    chk(rd[0] == 1'b1, "CTX_STATUS is read-only (write has no effect)");
+
+    // engine error is sticky too
+    @(negedge clk); ctx_err = 1'b1;
+    @(negedge clk); ctx_err = 1'b0;
+    host_read(R_CTX_STATUS, rd);
+    chk(rd[2] == 1'b1 && rd[0] == 1'b1, "CTX_STATUS err latched (sticky)");
+
+    // the next CTX_CMD write clears done+err and re-arms (restore, mode=1)
+    ctx_busy = 1'b1;
+    host_ctx_cmd(32'h0000_0003);
+    chk(ctx_start_seen == 1'b1, "second CTX_CMD start pulses ctx_start_o");
+    chk(ctx_mode_seen == 1'b1, "CTX_CMD mode=1 latched (restore)");
+    host_read(R_CTX_STATUS, rd);
+    chk(rd[0] == 1'b0 && rd[2] == 1'b0, "CTX_CMD write clears latched done+err");
+    @(negedge clk); ctx_busy = 1'b0; ctx_done = 1'b1;
+    @(negedge clk); ctx_done = 1'b0;
+
+    // CTX_WORDS=0: the engine must NOT be started (no pulse, no status)
+    host_write(R_CTX_WORDS, 32'h0);
+    host_ctx_cmd(32'h0000_0001);
+    chk(ctx_start_seen == 1'b0, "CTX_CMD with CTX_WORDS=0 does not start the engine");
+    host_read(R_CTX_STATUS, rd);
+    chk(rd == 32'h0, "refused start leaves CTX_STATUS {done,busy,err}=0");
+
+    // start=0 (no trigger bit) never pulses
+    host_write(R_CTX_WORDS, 32'h0000_0001);
+    host_ctx_cmd(32'h0000_0002);
+    chk(ctx_start_seen == 1'b0, "CTX_CMD without the start bit does not pulse");
+    host_read(R_CTX_STATUS, rd);   chk(rd == 32'h0, "start=0 leaves CTX_STATUS clean");
 
     // ---- report ----
     if (errors == 0) $display("TEST PASSED: emri_regfile (EMRI v0 register ABI + OCC passthrough)");

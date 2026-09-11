@@ -59,6 +59,14 @@ R_EFP_IMG_COLS = 0x21  # v0.3 (spec sec 3.3): fabric columns a run_packed image 
 R_CAP_DECL_IO = 0x22  # declared pin-group bitmap: bit g = L1 pin group g
 R_CAP_DECL_SVC = 0x23  # declared service bitmap: bit k = proxy index k
 R_CAP_STATUS = 0x24  # [0]checked [1]denied [2]throttled [15:8]denied_io bitmap
+R_CTX_CMD = 0x26  # v0.7 (spec sec 3.9): bit0=start, bit1=mode (0=save, 1=restore); reads 0
+R_CTX_WORDS = 0x27  # chain word count (N/32; 0 invalid)
+R_CTX_STATUS = 0x28  # {done[0], busy[1], err[2]}; done/err latched, cleared by CTX_CMD write
+CTX_CMD_SAVE = 0x1  # start=1, mode=0
+CTX_CMD_RESTORE = 0x3  # start=1, mode=1
+CTX_STATUS_DONE = 1 << 0
+CTX_STATUS_BUSY = 1 << 1
+CTX_STATUS_ERR = 1 << 2
 R_IMG_DIGEST = 0x18  # base; +0..7 (32-byte manifest digest)
 R_IMG_SIG = 0x50  # base; +0..15 (64-byte Ed25519 signature)
 IMG_DIGEST_WORDS = 8
@@ -73,6 +81,8 @@ EFP_CMD_ABORT = 4
 EFP_CMD_RUN_PACKED = 5  # v0.3: bit-packed production-frame deploy (spec sec 3.3)
 EFP_CMD_FWUPDATE = 6  # v0.4 (spec sec 3.6): SIM-DEMO dual-partition fw update
 EFP_CMD_REBOOT = 7  # v0.4 (spec sec 3.6): SIM-DEMO re-enter boot stub
+EFP_CMD_CTX_SAVE = 8  # v0.7 (spec sec 3.9): freeze fabric + save FF context
+EFP_CMD_CTX_RESTORE = 9  # v0.7 (spec sec 3.9): restore FF context + resume
 EFP_REGION_AUTO = 0xFF
 # EFP daemon lifecycle states (EFP_STATUS.state)
 EFP_S_IDLE = 0
@@ -84,6 +94,7 @@ EFP_S_READBACK = 5
 EFP_S_RUNNING = 6
 EFP_S_ERROR = 7
 EFP_S_STOPPED = 8
+EFP_S_PAUSED = 9  # v0.7 (spec sec 3.9): context saved, fabric frozen
 
 # EFP sticky error codes (EFP_ERR)
 EFP_ERR_NONE = 0
@@ -99,6 +110,7 @@ EFP_ERR_WATCHDOG_TIMEOUT = 9  # v0.4 (spec sec 3.5): OCC op watchdog fired
 EFP_ERR_FWUPDATE = 10  # v0.4 (spec sec 3.6): sim-demo fw-update CRC mismatch
 EFP_ERR_CAPABILITY_DENIED = 11  # v0.6 (spec sec 3.7): declared caps exceed grantable
 EFP_ERR_RATE_LIMITED = 12  # v0.6 (spec sec 3.8): region throttled by anomaly monitor
+EFP_ERR_CTX_ERROR = 13  # v0.7 (spec sec 3.9): context save/restore refused or failed
 
 # ---- Event-log ring (spec sec 3.4, v0.4) ----
 # 16-entry ring in the regfile: write 0x39 pushes, read 0x39 pops-oldest,

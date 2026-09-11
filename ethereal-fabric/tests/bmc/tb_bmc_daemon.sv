@@ -26,6 +26,9 @@
 //                  1a. MON_RECFG_COUNT.region0 == 1 (deploy notify, v0.6 §3.8)
 //                  1b. CAP_DECL_IO over-declared -> EFP_ERR=11, no BLANK,
 //                      no fabric mutation; the next deploy still succeeds
+//                  1c. ctx_save/ctx_restore (v0.7) -> PAUSED + frozen for 512
+//                      cycles, restore -> RUNNING + toggling; restore while
+//                      RUNNING / save on FREE -> EFP_ERR=13
 //                2. restart                       -> re-verify+reload, toggles
 //                3. stop r0                       -> STOPPED, output blanked
 //                4. run image B (const1) auto     -> RUNNING, clb_out[0] == 1
@@ -230,8 +233,20 @@ module tb_bmc_daemon;
 
   logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
   logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
+  // v0.7 §3.9 context engine (E2-FAB3b): ctx_engine_wrap owns ctx_scan + the
+  // PAUSED freeze; the context window is a 1-word RAM (2x2 fabric = 32 bits).
+  logic        ctx_start, ctx_mode;
+  logic [15:0] ctx_words;
+  logic        ctx_busy, ctx_done, ctx_err;
+  logic        ctx_scan_en, ctx_scan_in, ctx_scan_out;
+  logic        ctx_ram_we;
+  logic [0:0]  ctx_ram_addr;
+  logic [31:0] ctx_ram_wdata, ctx_ram_rdata;
   emri_regfile #(
-      .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0)
+      .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0),
+      // v0.7 §3.9: the daemon derives CTX_WORDS from the geometry registers —
+      // this TB's fabric is 2x2 (4 tiles), so each region owns 2 tiles.
+      .REGION0_INFO(32'h0202_0002), .REGION1_INFO(32'h0202_0002)
   ) u_emri (
       .clk_i(clk), .rst_ni(rst_n),
       .host_req_i(host_req), .host_we_i(host_we), .host_op_i(host_op),
@@ -247,7 +262,9 @@ module tb_bmc_daemon;
       // frame_decoder trigger unused in the v0 cfg-addr frame format
       .dec_start_o(), .dec_col_o(), .dec_busy_i(1'b0),
       .occ_expect_crc_o(occ_expect_crc_w),
-      .occ_crc_result_i(occ_crc_result_w)
+      .occ_crc_result_i(occ_crc_result_w),
+      .ctx_start_o(ctx_start), .ctx_mode_o(ctx_mode), .ctx_words_o(ctx_words),
+      .ctx_busy_i(ctx_busy), .ctx_done_i(ctx_done), .ctx_err_i(ctx_err)
   );
 
   occ_top #(.ADDR_W(16), .DATA_W(32)) u_occ (
@@ -279,9 +296,25 @@ module tb_bmc_daemon;
       .clb_out_obs_o(clb_out_obs),
       .mem_vd_obs_o(mem_vd_obs),
       .dsp_vp_obs_o(dsp_vp_obs),
-      .scan_en_i(1'b0),
-      .scan_in_i(1'b0),
-      .scan_out_o()
+      .scan_en_i(ctx_scan_en),
+      .scan_in_i(ctx_scan_in),
+      .scan_out_o(ctx_scan_out)
+  );
+
+  // v0.7 §3.9: context engine + window (E2-FAB3b). The freeze is folded into
+  // the wrapper (a completed save holds scan_en until the restore completes).
+  ctx_engine_wrap #(.AW(1)) u_ctx_engine (
+      .clk_i(clk), .rst_ni(rst_n),
+      .start_i(ctx_start), .mode_i(ctx_mode), .words_i(ctx_words),
+      .busy_o(ctx_busy), .done_o(ctx_done), .err_o(ctx_err),
+      .scan_en_o(ctx_scan_en), .scan_in_o(ctx_scan_in), .scan_out_i(ctx_scan_out),
+      .ram_we_o(ctx_ram_we), .ram_addr_o(ctx_ram_addr),
+      .ram_wdata_o(ctx_ram_wdata), .ram_rdata_i(ctx_ram_rdata)
+  );
+
+  column_cfg_ram #(.ADDR_W(1), .DATA_W(32), .DEPTH(1)) u_ctxram (
+      .clk(clk), .we(ctx_ram_we), .re(1'b0),
+      .addr(ctx_ram_addr), .wdata(ctx_ram_wdata), .rdata(ctx_ram_rdata)
   );
 
   // -- Clock ---------------------------------------------------------------------
@@ -345,6 +378,9 @@ module tb_bmc_daemon;
   // Check helpers
   // ============================================================================
   integer errors = 0;
+  // v0.7 sec 3.9 context stages (E2-FAB3b): freeze-window probe locals.
+  integer ctx_k;
+  logic   ctx_ref, ctx_frozen_bad;
   task automatic chk(input logic cond, input logic [511:0] msg);
       begin
           if (cond) $display("  ok: %0s", msg);
@@ -607,6 +643,61 @@ module tb_bmc_daemon;
       host_rd(R_CAP_STATUS, rd);
       chk(rd[1] == 1'b0, "cap: CAP_STATUS.denied clears when undeclared");
 
+      // ---- 1c. v0.7 §3.9: BMC-driven context save/restore (E2-FAB3b) ----------
+      // Region 0 is RUNNING with image A (TFF). Pause it, prove the fabric is
+      // frozen for the whole PAUSED period, then restore and prove it resumes.
+      $display("[1c] context save/restore — pause freezes, restore resumes");
+      host_wr(R_EFP_REGION, 32'h0000_0000);
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_CTX_SAVE});
+      expect_uart("cmd ctx_save\n", "ctx_save: command dispatched");
+      expect_uart("st CTXSAVE r0\n", "ctx_save: daemon entered the context path");
+      expect_uart("st PAUSED r0\n", "ctx_save: region 0 PAUSED");
+      host_wait_idle();
+      host_rd(R_EFP_STATUS, rd);
+      chk(rd[3:0] == EFP_S_PAUSED, "ctx_save: EFP_STATUS = PAUSED (9)");
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_NONE, "ctx_save: no error");
+      // Frozen for the whole PAUSED period (spec §3.9 step 2).
+      ctx_ref        = clb_out_obs[0];
+      ctx_frozen_bad = 1'b0;
+      for (ctx_k = 0; ctx_k < 512; ctx_k = ctx_k + 1) begin
+          @(negedge clk);
+          if (clb_out_obs[0] !== ctx_ref) ctx_frozen_bad = 1'b1;
+      end
+      chk(!ctx_frozen_bad, "ctx_save: fabric frozen for 512 cycles while PAUSED");
+      // Restore: unfreeze + resume.
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_CTX_RESTORE});
+      expect_uart("cmd ctx_restore\n", "ctx_restore: command dispatched");
+      expect_uart("st CTXRESTORE r0\n", "ctx_restore: daemon entered the context path");
+      expect_uart("st RESUMED r0\n", "ctx_restore: region 0 resumed");
+      host_wait_idle();
+      host_rd(R_EFP_STATUS, rd);
+      chk(rd[3:0] == EFP_S_RUNNING, "ctx_restore: EFP_STATUS = RUNNING (6)");
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_NONE, "ctx_restore: no error");
+      observe_toggle("ctx_restore: clb_out_obs[0] toggling again after resume");
+      // Negative: restore while RUNNING -> ctx_error, no state change.
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_CTX_RESTORE});
+      expect_uart("cmd ctx_restore\nerr ctx_error\nst ERROR\n",
+                  "ctx negative: restore while RUNNING refused (13)");
+      host_wait_idle();
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_CTX_ERROR,
+          "ctx negative: restore while RUNNING -> ctx_error (13)");
+      host_rd(R_EFP_STATUS, rd);
+      chk(rd[3:0] == EFP_S_ERROR, "ctx negative: EFP_STATUS = ERROR");
+      observe_toggle("ctx negative: fabric still running (no state change)");
+      // Negative: save on a FREE region (region 1) -> ctx_error.
+      host_wr(R_EFP_REGION, 32'h0000_0001);
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_CTX_SAVE});
+      expect_uart("cmd ctx_save\nerr ctx_error\nst ERROR\n",
+                  "ctx negative: save on FREE region refused (13)");
+      host_wait_idle();
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_CTX_ERROR,
+          "ctx negative: save on FREE region -> ctx_error (13)");
+      host_wr(R_EFP_REGION, 32'h0000_0000);   // restore the region selector
+
       // ---- 2. restart (stop + re-run last staged metadata) -------------------
       // Also the "subsequent good deploy" after the §3.7 refusal: a full
       // VERIFY->ALLOC->BLANK->LOAD->READBACK->RUNNING completes, so the
@@ -715,7 +806,7 @@ module tb_bmc_daemon;
 
       // ---- report ---------------------------------------------------------------
       if (errors == 0)
-          $display("TEST PASSED: E1-RUN2 daemon — EFP run/restart/stop/abort on real fabric, bad_sig + region_full rejected, v0.6 cap-gate (11) + anomaly throttle (12) enforced, MON_RECFG_COUNT notified, UART log exact-matched");
+          $display("TEST PASSED: E1-RUN2 daemon — EFP run/restart/stop/abort on real fabric, bad_sig + region_full rejected, v0.6 cap-gate (11) + anomaly throttle (12) enforced, MON_RECFG_COUNT notified, v0.7 ctx pause/resume (frozen while PAUSED, resumed after restore, ctx_error refusals), UART log exact-matched");
       else
           $display("TEST FAILED: %0d errors", errors);
       $finish;

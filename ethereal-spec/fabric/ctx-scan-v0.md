@@ -60,6 +60,11 @@ Shift protocol (one clock per shift, `scan_en_i` held 1 throughout):
 Context buffer = **the SSM-T window** (C02 §3): a word-addressed RAM window. v0 sim uses a
 behavioral word RAM (the real SSRAM/BSRAM mapping is C02 §3 ASSUMPTION #1 — if SSRAM is
 not written frequently enough, the window degrades to a reserved BSRAM pool).
+**Management (v0.7):** the engine is driven through EMRI — `CTX_CMD`/`CTX_WORDS`/
+`CTX_STATUS` @ `0x26`-`0x28` and the daemon's `EFP_CMD=8 ctx_save` / `9 ctx_restore`
+lifecycle (frozen fabric = `EFP_STATUS=9 PAUSED`, refusals = `EFP_ERR=13`); see
+`ethereal-spec/control/emri-v0.md` §3.9. The chain is fabric-global in v0, so one
+context operation covers the whole fabric.
 
 Engine interface (v0):
 

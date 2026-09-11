@@ -1,8 +1,8 @@
-# EMRI — Ethereal Management Register Interface (v0.6, draft)
+# EMRI — Ethereal Management Register Interface (v0.7, draft)
 
-> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.6** (v0.6 adds the **capability-declaration gate** (`CAP_DECL_IO` @ `0x22` / `CAP_DECL_SVC` @ `0x23` / `CAP_STATUS` @ `0x24`, §3.7) + **anomaly monitoring v1** (per-region reconfig/watchdog counters @ `0x32`/`0x33`, spike flags + throttle mask @ `0x34`, window/threshold config @ `0x35`/`0x36`, §3.8) + `EFP_ERR=11 capability_denied` / `12 rate_limited` + event codes 4/5, and **re-maps `OCC_FRAME_ADDR`** to `{region_id[15:12], col_id[11:8], word[7:0]}` — v0.5's 4-bit column field/16-word stride aliased adjacent columns of a multi-column packed image in the readback store (E1-DMO2b; `capabilities.yaml` schema in `ethereal-spec/security/capabilities-v0.md`). v0.5 added the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
+> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.7** (v0.7 adds the **context save/restore orchestration** surfaces — `CTX_CMD`/`CTX_WORDS`/`CTX_STATUS` @ `0x26`-`0x28` (§3.9), `EFP_CMD=8 ctx_save` / `9 ctx_restore`, `EFP_STATUS=9 PAUSED`, `EFP_ERR=13 ctx_error` — for the E2-FAB3 scan-chain engine (`ethereal-spec/fabric/ctx-scan-v0.md`); v0.6 added the **capability-declaration gate** (`CAP_DECL_IO` @ `0x22` / `CAP_DECL_SVC` @ `0x23` / `CAP_STATUS` @ `0x24`, §3.7) + **anomaly monitoring v1** (per-region reconfig/watchdog counters @ `0x32`/`0x33`, spike flags + throttle mask @ `0x34`, window/threshold config @ `0x35`/`0x36`, §3.8) + `EFP_ERR=11 capability_denied` / `12 rate_limited` + event codes 4/5, and **re-maps `OCC_FRAME_ADDR`** to `{region_id[15:12], col_id[11:8], word[7:0]}` — v0.5's 4-bit column field/16-word stride aliased adjacent columns of a multi-column packed image in the readback store (E1-DMO2b; `capabilities.yaml` schema in `ethereal-spec/security/capabilities-v0.md`). v0.5 added the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
 > Plan-Ref: `ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.3`, `ethereal-plan/components/C05-BMC组件.md §3/§4`
-> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · v0.6: 2026-09-11 · Implements: ADR-013/014/015/016
+> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · v0.6: 2026-09-11 · v0.7: 2026-09-11 · Implements: ADR-013/014/015/016
 
 The **unified management register ABI** exposed to the host by **both** the BMC
 (NEORV32 soft-core) and the **mFSM** (register-based small-device fallback).
@@ -73,11 +73,11 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x10` | `SESSION_CMD` | RW | 8 | mFSM session FSM control. `0=nop, 1=begin_rx, 2=verify(host-done), 3=occ_go, 4=abort`. BMC mode: ignored (BMC drives OCC directly). |
 | `0x11` | `SESSION_STATUS` | R | 8 | `{state[3:0], done[4], err[7:4]}`. See §5. |
 | `0x12` | `RX_BUF_CTRL` | RW | 32 | `{wr_ptr[31:16], depth[15:0]}`. Image-staging buffer (mFSM rx_buf). v0: depth ≤ 16KB. |
-| `0x13` | `EFP_CMD` | W | 8 | **Daemon doorbell (v0.2, BMC mode)**. `0=nop, 1=run, 2=stop, 3=restart, 4=abort, 5=run_packed` (v0.3, §3.3), `6=fwupdate, 7=reboot` (v0.4, §3.6 — **sim-demo only**; the production daemon answers `6/7` with `bad_cmd`). See §3.2. |
+| `0x13` | `EFP_CMD` | W | 8 | **Daemon doorbell (v0.2, BMC mode)**. `0=nop, 1=run, 2=stop, 3=restart, 4=abort, 5=run_packed` (v0.3, §3.3), `6=fwupdate, 7=reboot` (v0.4, §3.6 — **sim-demo only**; the production daemon answers `6/7` with `bad_cmd`). `8=ctx_save`, `9=ctx_restore` (v0.7, §3.9). See §3.2. |
 | `0x14` | `EFP_REGION` | RW | 8 | Target region for the next `EFP_CMD`. `0xFF` = auto-allocate first free (run only). |
 | `0x15` | `EFP_IMG_WORDS` | RW | 16 | Frame-word count of the image being deployed (incl. CRC tail words). |
-| `0x16` | `EFP_STATUS` | R | 8 | Daemon lifecycle: `{state[3:0], busy[4], done[5]}`. States: `0=IDLE,1=VERIFY,2=ALLOC,3=BLANK,4=LOAD,5=READBACK,6=RUNNING,7=ERROR,8=STOPPED`. |
-| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch,8=crc_transport` (§7.1, SPI-transport CRC16 mismatch), `9=watchdog_timeout` (§3.5, v0.4), `10=fwupdate` (§3.6, v0.4 sim-demo CRC mismatch). `11=capability_denied` (§3.7, v0.6 — declared capability set exceeds what the platform can grant), `12=rate_limited` (§3.8, v0.6 — target region throttled by anomaly monitoring). Cleared on next `EFP_CMD` write. |
+| `0x16` | `EFP_STATUS` | R | 8 | Daemon lifecycle: `{state[3:0], busy[4], done[5]}`. States: `0=IDLE,1=VERIFY,2=ALLOC,3=BLANK,4=LOAD,5=READBACK,6=RUNNING,7=ERROR,8=STOPPED`. `9=PAUSED` (v0.7, §3.9: context saved, fabric frozen).|
+| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch,8=crc_transport` (§7.1, SPI-transport CRC16 mismatch), `9=watchdog_timeout` (§3.5, v0.4), `10=fwupdate` (§3.6, v0.4 sim-demo CRC mismatch). `11=capability_denied` (§3.7, v0.6 — declared capability set exceeds what the platform can grant), `12=rate_limited` (§3.8, v0.6 — target region throttled by anomaly monitoring). `13=ctx_error` (§3.9, v0.7 — context save/restore refused or failed: wrong lifecycle state, engine error, or `CTX_WORDS` = 0). Cleared on next `EFP_CMD` write. |
 | `0x18-0x1F` | `IMG_DIGEST[0..7]` | RW | 8×32 | 32-byte manifest digest (SHA-256). Word `i` holds digest bytes `[4i+3:4i]` (little-endian in-word). |
 | `0x50-0x5F` | `IMG_SIG[0..15]` | RW | 16×32 | 64-byte Ed25519 signature over the digest. Same in-word byte order as `IMG_DIGEST`. |
 | `0x20` | `HEALTH_STATUS` | R | 32 | bit-per-region health: bit0=region0 ok, bit8=region1 ok, … v0: all-ok = `0x0000_0101`. |
@@ -85,6 +85,9 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x22` | `CAP_DECL_IO` | RW | 32 | **Declared IO pin-group bitmap** (v0.6, §3.7): bit `g` = the staged image declares L1 pin group `g` (one group = 8 physical pins, S06:24). Plain RW staging storage, written by the host from `capabilities.yaml` before `EFP_CMD`. |
 | `0x23` | `CAP_DECL_SVC` | RW | 32 | **Declared service bitmap** (v0.6, §3.7): bit `k` = declares L2 proxy/virtual-device instance `k` (RFC-004 device-class index, S06:39). |
 | `0x24` | `CAP_STATUS` | R | 32 | **Capability-check verdict** (v0.6, §3.7): `[0]=checked`, `[1]=denied`, `[2]=throttled`, `[15:8]=denied_io` (low 8 bits of the offending group bitmap), rest reserved-0. Cleared on the next `EFP_CMD` write. |
+| `0x26` | `CTX_CMD` | W | 8 | **Context engine trigger** (v0.7, §3.9): `bit0=start` (one-shot), `bit1=mode` (`0=save`, `1=restore`). Reads 0. The engine ignores a start while busy. |
+| `0x27` | `CTX_WORDS` | RW | 16 | **Chain word count** for the next context operation (v0.7, §3.9): `ceil(N/32)` where `N = R*C*8` (one bit per eLUT vff). `0` → the command is refused with `EFP_ERR=13`. |
+| `0x28` | `CTX_STATUS` | R | 8 | **Context engine status** (v0.7, §3.9): `{done[0], busy[1], err[2]}`. `done` is a latched completion flag cleared by the next `CTX_CMD` write; `err` is sticky until then too. |
 | `0x3F` | `SPI_CRC` | W | 16 | **EFP-SPI transport-CRC16 latch** (§7.1, v0.3): `DATA[15:0]` = expected CRC16 of the session's OCC_PUSH stream. Intercepted by the SPI front-end; not a regfile storage word. RD returns front-end debug `{state[17:16], crc_acc[15:0]}`. |
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
@@ -97,7 +100,7 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x38` | `EVT_LOG_CTRL` | R/W1C | 32 | **Event-log ring control** (v0.4, §3.4): R = `{count[15:0], wr_ptr[31:16]}`; a write with `bit16=1` CLEARS the ring (count/wr_ptr/read-ptr = 0, entries dropped); all other writes are no-ops. |
 | `0x39` | `EVT_LOG_DATA` | push-W / pop-R | 32 | **Event-log ring data** (v0.4, §3.4): a WRITE pushes one entry (the written word, `{code[7:0], region[15:8], stamp[31:16]}`); a READ pops the OLDEST un-read entry (advancing the read pointer; empty reads 0, no advance). Depth 16, overwrite-oldest when full. |
 
-**Reserved ranges** after v0.6 allocations: `0x07`, `0x25-0x2F`,
+**Reserved ranges** after v0.7 allocations: `0x07`, `0x29-0x2F`,
 `0x3A-0x3E`, `0x60+` — read-as-0, write-ignored. Allocation map:
 telemetry @ `0x40-0x4F` (planned), `IMG_SIG` @ `0x50-0x5F` (v0.2), scheduler @
 `0x60+` (planned).
@@ -106,7 +109,8 @@ History: `0x06`=`REGION_SEL` (v0.1, §6), `0x0D`=`OCC_DECODE` (v0.1, §3.1),
 `0x21`=`EFP_IMG_COLS` (v0.3, §3.3), `0x3F`=`SPI_CRC` (v0.3, §7.1),
 `0x0E`=`OCC_EXPECT_CRC` / `0x0F`=`OCC_CRC_RESULT` (v0.5, §3.1.1),
 `0x38-0x39`=event-log ring (v0.4, §3.4),
-`0x22-0x24`=capability gate / `0x32-0x36`=anomaly monitor (v0.6, §3.7/§3.8).
+`0x22-0x24`=capability gate / `0x32-0x36`=anomaly monitor (v0.6, §3.7/§3.8),
+`0x26-0x28`=context engine / `EFP_CMD` 8/9 (v0.7, §3.9).
 
 ---
 
@@ -507,6 +511,38 @@ un-throttling (host-initiated only).
 // ASSUMPTION: window length and thresholds ship with reset defaults
 `0x1000` ticks / `0x10` reconfig / `0x8` watchdog; final values TBD at
 bring-up (TBD, 2026-09-11).
+
+## 3.9 Context save/restore (offsets `0x26`-`0x28` + `EFP_CMD` 8/9, v0.7, E2-FAB3b)
+
+Orchestrates the scan-chain context engine (`ethereal-spec/fabric/ctx-scan-v0.md`)
+so a container can be paused and resumed **without re-deploying its image**.
+
+| Step | Actor | Action |
+| --- | --- | --- |
+| 0 | host/BMC | `CTX_WORDS` ← `ceil(R*C*8 / 32)` (chain bits / 32); `0` is invalid |
+| 1a | daemon | `EFP_CMD=8 ctx_save`: requires the target region RUNNING → `CTX_CMD = {mode=0, start=1}` → wait `CTX_STATUS.busy` low → on `done=1`: `EFP_STATUS = 9 PAUSED` |
+| 1b | daemon | `EFP_CMD=9 ctx_restore`: requires the region PAUSED → `CTX_CMD = {mode=1, start=1}` → on `done=1`: `EFP_STATUS = 6 RUNNING` |
+| 2 | engine | while `CTX_STATUS.busy`: `scan_en` is held high (computation frozen); **a completed `ctx_save` leaves the fabric frozen for the whole PAUSED period** (a pause must not let the container advance); a completed `ctx_restore` releases the freeze and computation resumes from the restored state |
+
+Rules:
+
+1. The chain is **fabric-global** in v0 (every eLUT `vff`, positional order), so one
+   context operation covers the whole fabric: v0 context == the single container
+   that owns the fabric (per-region chains are a later revision).
+2. Neither operation touches configuration: the region's frames, `dirty` state and
+   CRC baselines are unchanged — a pause is **not** a re-configuration and no BLANK
+   occurs.
+3. Refusals (`EFP_ERR=13`, `EFP_STATUS=ERROR`, no state change): save from a
+   non-RUNNING region, restore from a non-PAUSED region, `CTX_WORDS=0`, or
+   `CTX_STATUS.err` set by the engine.
+4. `stop`/`abort` from PAUSED blank the region exactly as from RUNNING, but must
+   **first release the PAUSED freeze** — the daemon issues a `ctx_restore` to drop
+   the armed context and unfreeze the fabric, then performs the per-column BLANK
+   (the saved context is discarded).
+5. A `restart` from PAUSED is refused with `EFP_ERR=13` (the state lives in the
+   context window, not in the image) — restore or stop instead.
+6. The context window is the dedicated context storage (the SSM-T window, C02 §3);
+   v0 exposes no window address register — the engine owns it.
 
 ## 4. OCC_STATUS register (offset `0x0A`)
 

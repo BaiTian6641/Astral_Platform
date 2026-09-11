@@ -6,10 +6,15 @@
 //              Save : assert scan_en_o, sample scan_out_i pre-edge each clock
 //              (element N-1 first), pack element e -> bit e%32 of word e/32,
 //              write words to the context RAM (descending address order).
-//              Restore: read words ascending, drive scan_in_o MSB-first
-//              (element N-1 first — the chain delays one element per shift);
-//              after N shifts deassert scan_en_o so the fabric resumes from
-//              the restored state.
+//              Restore: preload the window's HIGH word and read words
+//              DESCENDING, driving scan_in_o MSB-first (element N-1 first —
+//              the chain delays one element per shift). Element e lives in
+//              word e/32 bit e%32, so element N-1 is the MSB of word
+//              (words_i-1): ascending reads would only be correct for a
+//              single-word chain (E2-FAB3b multi-word fix). After N shifts
+//              deassert scan_en_o so the fabric resumes from the restored
+//              state.
+// Modified:    2026-09-12 - multi-word restore word order (E2-FAB3b)
 //              v0: single clock domain; combinational-read context RAM
 //              (column_cfg_ram model); the real SSRAM window mapping is
 //              C02 §3 ASSUMPTION #1 (hal/glue). Cost: +1 mux per eLUT on the
@@ -81,6 +86,10 @@ module ctx_scan #(
 
         case (state_r)
             ST_IDLE: begin
+                // Restore preloads the HIGH word (element N-1 is word words-1
+                // MSB); the save ignores ram_rdata_i so this address is inert
+                // for it.
+                ram_addr_c = AW'(words_i - 16'd1);
                 if (start_i) state_nxt = ST_SHIFT;
             end
             ST_SHIFT: begin
@@ -98,7 +107,11 @@ module ctx_scan #(
                     // MSB-first: the first driven bit ends at element N-1 after N shifts
                     sreg_nxt = {sreg_r[30:0], 1'b0};
                     if (bits_r[4:0] == 5'd31) begin
-                        ram_addr_c = AW'((bits_r >> 5) + 16'd1);
+                        // Step DOWN one word: the high word's MSB (element N-1)
+                        // is driven first (spec §4), so the window is read
+                        // descending. The wrap on the final bit is a don't-care
+                        // (state_nxt becomes ST_DONE the same cycle).
+                        ram_addr_c = AW'(words_r - (bits_r >> 5) - 16'd2);
                         sreg_nxt   = ram_rdata_i;          // next word (comb read)
                     end
                 end

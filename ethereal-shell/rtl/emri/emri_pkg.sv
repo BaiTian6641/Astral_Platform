@@ -7,8 +7,11 @@
 //              sync with ethereal-spec/control/emri-v0.md (spec-first rule).
 // Modified:    2026-09-11 - v0.6: capability-gate (§3.7) + anomaly-monitor (§3.8)
 //              offsets, sim allowed masks, monitor tick divider, event codes 4/5.
+//              2026-09-12 - v0.7 §3.9 context save/restore surface: CTX_CMD/
+//              CTX_WORDS/CTX_STATUS offsets (0x26-0x28) + their bit fields.
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4/§7 (§3.7/§3.8 v0.6)
+// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4/§7 (§3.7/§3.8 v0.6,
+//              §3.9 context save/restore v0.7)
 // Notes:       v0 scope: minimum for the sim-complete minimal loop (mFSM → OCC).
 package emri_pkg;
 
@@ -62,6 +65,19 @@ package emri_pkg;
   localparam logic [15:0] R_CAP_STATUS     = 16'h24;
   localparam logic [31:0] ALLOWED_IO_GROUPS = 32'h0000_00FF;  // groups 0..7
   localparam logic [31:0] ALLOWED_SERVICES  = 32'h0000_00FF;  // proxies 0..7
+  // v0.7 §3.9 context save/restore engine surface (E2-FAB3b). The engine is
+  // the fabric-side scan-chain `ctx_scan` (ethereal-spec/fabric/ctx-scan-v0.md);
+  // CTX_WORDS = ceil(N/32) chain words, N = R*C*8 eLUT vffs (0 is invalid and
+  // the refusal/EFP_ERR=13 is the daemon's, §3.9 rule 3). CTX_CMD/CTX_STATUS
+  // are the daemon-facing trigger/status words.
+  localparam logic [15:0] R_CTX_CMD     = 16'h26;  // W: {bit1=mode, bit0=start}, reads 0
+  localparam logic [15:0] R_CTX_WORDS   = 16'h27;  // RW: chain word count (reset 0)
+  localparam logic [15:0] R_CTX_STATUS  = 16'h28;  // R: {err[2], busy[1], done[0]}
+  localparam int CTX_CMD_START   = 0;   // CTX_CMD bit index: one-shot start
+  localparam int CTX_CMD_MODE    = 1;   // CTX_CMD bit index: 0=save, 1=restore
+  localparam int CTX_STATUS_DONE = 0;   // CTX_STATUS bit index (latched)
+  localparam int CTX_STATUS_BUSY = 1;   // CTX_STATUS bit index (live)
+  localparam int CTX_STATUS_ERR  = 2;   // CTX_STATUS bit index (sticky)
 
   // v0.6 §3.8 anomaly monitoring v1: real-time per-region counters + per-window
   // spike thresholds in the regfile (1 monitor tick = EMRI_MON_TICK_DIV
@@ -183,7 +199,10 @@ package emri_pkg;
   localparam logic [3:0] EFP_S_READBACK = 4'd5;
   localparam logic [3:0] EFP_S_RUNNING  = 4'd6;
   localparam logic [3:0] EFP_S_ERROR    = 4'd7;
+  localparam logic [7:0] EFP_CMD_CTX_SAVE    = 8'd8;  // v0.7 §3.9 freeze + save context
+  localparam logic [7:0] EFP_CMD_CTX_RESTORE = 8'd9;  // v0.7 §3.9 restore + resume
   localparam logic [3:0] EFP_S_STOPPED  = 4'd8;
+  localparam logic [3:0] EFP_S_PAUSED   = 4'd9;  // v0.7 §3.9 context saved, frozen
 
   // EFP sticky error codes (spec §3.2; EFP_ERR[7:0])
   localparam logic [7:0] EFP_ERR_NONE             = 8'd0;
@@ -199,6 +218,7 @@ package emri_pkg;
   localparam logic [7:0] EFP_ERR_FWUPDATE         = 8'd10;  // v0.4 §3.6 sim-demo CRC mismatch
   localparam logic [7:0] EFP_ERR_CAPABILITY_DENIED = 8'd11;  // v0.6 §3.7 declared ⊄ grantable
   localparam logic [7:0] EFP_ERR_RATE_LIMITED      = 8'd12;  // v0.6 §3.8 region throttled
+  localparam logic [7:0] EFP_ERR_CTX_ERROR         = 8'd13;  // v0.7 §3.9 ctx refused/failed
 
   // ------------------------------------------------------------------
   // Event-log ring entry codes (v0.4, spec §3.4; entry {code[7:0],

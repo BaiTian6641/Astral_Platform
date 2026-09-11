@@ -31,6 +31,10 @@
 #define EFP_CMD_FWUPDATE   6u /* v0.4 sec 3.6: SIM-DEMO (E1-BMC2). The production
                                * daemon answers this (and REBOOT) bad_cmd. */
 #define EFP_CMD_REBOOT     7u /* v0.4 sec 3.6: SIM-DEMO re-enter boot stub */
+#define EFP_CMD_CTX_SAVE    8u /* v0.7 sec 3.9: freeze fabric + save FF context
+                               * (requires the region RUNNING) */
+#define EFP_CMD_CTX_RESTORE 9u /* v0.7 sec 3.9: restore FF context + resume
+                               * (requires the region PAUSED) */
 #define EFP_REGION_AUTO 0xFFu /* auto-allocate first free (run only) */
 
 #define EFP_S_IDLE     0u
@@ -42,6 +46,7 @@
 #define EFP_S_RUNNING  6u
 #define EFP_S_ERROR    7u
 #define EFP_S_STOPPED  8u
+#define EFP_S_PAUSED   9u /* v0.7 sec 3.9: context saved, fabric frozen */
 
 /* EFP_STATUS bit layout: {state[3:0], busy[4], done[5]}. */
 #define EFP_STATUS_BUSY (1u << 4)
@@ -63,6 +68,9 @@
                                        * exceeds the grantable platform set */
 #define EFP_ERR_RATE_LIMITED      12u /* v0.6 sec 3.8: target region throttled by
                                        * the anomaly monitor */
+#define EFP_ERR_CTX_ERROR         13u /* v0.7 sec 3.9: context save/restore refused
+                                       * (wrong lifecycle state, words=0) or the
+                                       * engine reported an error */
 
 /* Event-log entry codes (emri-v0.md sec 3.4; entry = {code, region, stamp}). */
 #define EVT_CODE_WATCHDOG_TIMEOUT 1u /* sec 3.5: op watchdog fired on region */

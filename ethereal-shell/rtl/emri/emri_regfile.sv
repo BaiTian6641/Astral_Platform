@@ -30,14 +30,36 @@
 //              flags [11:8] + throttle mask [7:0], and the first flag 0->1 per
 //              region per window pushes a code-5 event into the §3.4 ring).
 //
+//              v0.7 (spec §3.9, E2-FAB3b): the CONTEXT SAVE/RESTORE SURFACE.
+//                * CTX_CMD (0x26, W): a write pulses ctx_start_o for one cycle
+//                  with ctx_mode_o = bit1 (0=save, 1=restore) and clears the
+//                  latched CTX_STATUS done/err (spec: "cleared by the next
+//                  CTX_CMD write" — any CTX_CMD write, start or not);
+//                * CTX_WORDS (0x27, RW, reset 0): plain storage, driven out as
+//                  ctx_words_o for the engine's words_i;
+//                * CTX_STATUS (0x28, R): {err[2], busy[1], done[0]} — busy is
+//                  the live engine flag, done/err are latched completion/error.
+//              The regfile drives the engine command port and latches its
+//              completion; it does NOT instantiate the engine, the fabric scan
+//              chain, or the context window. ctx_scan + the context RAM are
+//              owned at the integration level (ctx_start_o/ctx_mode_o/
+//              ctx_words_o out, ctx_busy_i/ctx_done_i/ctx_err_i in).
+//              A CTX_CMD write with CTX_WORDS == 0 does NOT start the engine:
+//              §3.9 rule 3 makes that refusal the daemon's (EFP_ERR=13), and
+//              the regfile invents no error code — it only declines to pulse
+//              start, leaving done/busy/err at 0 and CTX_WORDS readable.
+//              The engine itself ignores a start while busy (ctx-scan §4).
 //              Region lock (occ_region_locked_o) is hardwired 0 in v0: blank-before-
 //              write is already hardware-enforced inside occ_top (E0-FAB5 dirty bit
 //              + S_NEEDS_BLANK), and v0 has no per-region lifecycle lock yet.
 // Maintainer:  BaiTian6641
 // Created:     2026-07-29
 // Modified:    2026-09-11 - v0.6 capability gate (§3.7) + anomaly monitor (§3.8)
+//              2026-09-12 - v0.7 context surface: CTX_CMD/CTX_WORDS/CTX_STATUS
+//                           (§3.9, E2-FAB3b) + engine command/status ports
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4 (§3.7/§3.8 v0.6)
+// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4 (§3.7/§3.8 v0.6,
+//              §3.9 context save/restore v0.7)
 // Notes:       G1: default_nettype none, always_ff non-blocking, no latches
 //              (read mux is combinational with a default). Single host slave port
 //              (fabric clock domain); the SPI slave / BMC bus feeds this port.
@@ -81,7 +103,17 @@ module emri_regfile #(
   // -- frame_decoder start trigger (v0.1, emri-v0.md §3.1)
   output logic        dec_start_o,          // 1-cycle pulse on R_OCC_DECODE write
   output logic [7:0]  dec_col_o,            // target fabric column (col_i)
-  input  logic        dec_busy_i            // frame_decoder busy_o (write backpressure)
+  input  logic        dec_busy_i,           // frame_decoder busy_o (write backpressure)
+
+  // -- ctx_scan engine command/status (v0.7 §3.9, E2-FAB3b). The engine and the
+  //    context window live at the integration level (see Details): this block
+  //    only drives the command port and latches the completion.
+  output logic        ctx_start_o,          // 1-cycle pulse on a valid CTX_CMD start
+  output logic        ctx_mode_o,           // 0=save, 1=restore (latched at start)
+  output logic [15:0] ctx_words_o,          // CTX_WORDS storage -> engine words_i
+  input  logic        ctx_busy_i,           // engine busy_o (live)
+  input  logic        ctx_done_i,           // engine done_o (1-cycle pulse -> latched)
+  input  logic        ctx_err_i             // engine error (-> sticky CTX_STATUS.err)
 );
   // emri_pkg constants, aliased via explicit package scoping. (Yosys's
   // default SV frontend used for the formal/sby build does not accept
@@ -130,6 +162,14 @@ module emri_regfile #(
   localparam logic [15:0] MON_ANOM_WINDOW_DEF = emri_pkg::EMRI_MON_ANOM_WINDOW_DEF;
   localparam logic [31:0] MON_ANOM_THRESH_DEF = emri_pkg::EMRI_MON_ANOM_THRESH_DEF;
   localparam logic [7:0]  EVT_CODE_ANOMALY_THROTTLE = emri_pkg::EVT_CODE_ANOMALY_THROTTLE;
+  localparam logic [15:0] R_CTX_CMD        = emri_pkg::R_CTX_CMD;
+  localparam logic [15:0] R_CTX_WORDS      = emri_pkg::R_CTX_WORDS;
+  localparam logic [15:0] R_CTX_STATUS     = emri_pkg::R_CTX_STATUS;
+  localparam int          CTX_CMD_START    = emri_pkg::CTX_CMD_START;
+  localparam int          CTX_CMD_MODE     = emri_pkg::CTX_CMD_MODE;
+  localparam int          CTX_STATUS_DONE  = emri_pkg::CTX_STATUS_DONE;
+  localparam int          CTX_STATUS_BUSY  = emri_pkg::CTX_STATUS_BUSY;
+  localparam int          CTX_STATUS_ERR   = emri_pkg::CTX_STATUS_ERR;
   localparam logic [15:0] R_EFP_CMD        = emri_pkg::R_EFP_CMD;
   localparam logic [15:0] R_EFP_REGION     = emri_pkg::R_EFP_REGION;
   localparam logic [15:0] R_EFP_IMG_WORDS  = emri_pkg::R_EFP_IMG_WORDS;
@@ -169,6 +209,12 @@ module emri_regfile #(
   logic [15:0] occ_frame_addr_r;
   logic [15:0] occ_word_count_r;
   logic [31:0] occ_expect_crc_r;   // v0.5 §3.1.1 (plain RW storage)
+  // v0.7 §3.9: CTX_WORDS plain RW + the engine command/status latches
+  logic [15:0] ctx_words_r;
+  logic        ctx_start_r;        // 1-cycle start pulse to ctx_scan.start_i
+  logic        ctx_mode_r;         // mode latched at start (0=save, 1=restore)
+  logic        ctx_done_r;         // sticky completion (cleared by a CTX_CMD write)
+  logic        ctx_err_r;          // sticky engine error (cleared by a CTX_CMD write)
   logic [7:0]  region_sel_r;
   // OCC command latch (held until occ_cmd_ready pulse)
   logic [1:0]  occ_cmd_r;
@@ -328,6 +374,7 @@ module emri_regfile #(
       occ_frame_addr_r <= 16'h0;
       occ_word_count_r <= 16'h0;
       occ_expect_crc_r <= 32'h0;
+      ctx_words_r      <= 16'h0;
       region_sel_r     <= 8'h0;
       session_cmd_r    <= 8'h0;
       session_status_r <= 8'h0;
@@ -348,6 +395,7 @@ module emri_regfile #(
       case (host_addr_i)
         R_OCC_FRAME_ADDR: occ_frame_addr_r <= host_wdata_i[15:0];
         R_OCC_WORD_COUNT: occ_word_count_r <= host_wdata_i[15:0];
+        R_CTX_WORDS:      ctx_words_r      <= host_wdata_i[15:0];
         R_OCC_EXPECT_CRC: occ_expect_crc_r <= host_wdata_i;
         R_REGION_SEL:     region_sel_r     <= host_wdata_i[7:0];
         R_SESSION_CMD:    session_cmd_r    <= host_wdata_i[7:0];
@@ -364,6 +412,53 @@ module emri_regfile #(
         default: ; // others RO or handled above/below
       endcase
     end
+  end
+
+  // ------------------------------------------------------------------
+  // v0.7 §3.9 context save/restore trigger + status (E2-FAB3b)
+  //   A CTX_CMD write clears the latched done/err, then — when the start bit
+  //   is set AND CTX_WORDS != 0 — emits a one-cycle start pulse carrying the
+  //   mode bit. A CTX_WORDS == 0 write is declined silently: §3.9 rule 3
+  //   assigns the EFP_ERR=13 refusal to the daemon, and the regfile must not
+  //   invent an error code. The pulse is not gated on ctx_busy_i because the
+  //   engine itself ignores a start while busy (ctx-scan-v0.md §4).
+  // ------------------------------------------------------------------
+  logic ctx_cmd_write_w;
+  assign ctx_cmd_write_w = host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                           (host_addr_i == R_CTX_CMD);
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      ctx_start_r <= 1'b0;
+      ctx_mode_r  <= 1'b0;
+      ctx_done_r  <= 1'b0;
+      ctx_err_r   <= 1'b0;
+    end else begin
+      ctx_start_r <= 1'b0;  // default: single-cycle pulse
+      if (ctx_cmd_write_w) begin
+        ctx_done_r <= 1'b0;  // spec §3.9: cleared by the next CTX_CMD write
+        ctx_err_r  <= 1'b0;
+        if (host_wdata_i[CTX_CMD_START] && (ctx_words_r != 16'h0)) begin
+          ctx_start_r <= 1'b1;
+          ctx_mode_r  <= host_wdata_i[CTX_CMD_MODE];
+        end
+      end else begin
+        if (ctx_done_i) ctx_done_r <= 1'b1;  // latch the 1-cycle engine pulse
+        if (ctx_err_i)  ctx_err_r  <= 1'b1;
+      end
+    end
+  end
+
+  assign ctx_start_o = ctx_start_r;
+  assign ctx_mode_o  = ctx_mode_r;
+  assign ctx_words_o = ctx_words_r;
+
+  logic [31:0] ctx_status_w;
+  always_comb begin
+    ctx_status_w = 32'h0;
+    ctx_status_w[CTX_STATUS_DONE] = ctx_done_r;
+    ctx_status_w[CTX_STATUS_BUSY] = ctx_busy_i;   // live engine flag
+    ctx_status_w[CTX_STATUS_ERR]  = ctx_err_r;    // sticky
   end
 
   // IMG_DIGEST / IMG_SIG word storage (one always_ff per word via genvar —
@@ -815,9 +910,13 @@ module emri_regfile #(
       R_MON_ANOM_WINDOW: host_rdata_o = {16'h0, mon_anom_window_r};
       R_MON_ANOM_THRESH: host_rdata_o = mon_anom_thresh_r;
       R_MON_NOTIFY:      host_rdata_o = 32'h0;  // write-only (spec §3.8)
+      // ---- v0.7 §3.9 context save/restore surface ----
+      R_CTX_CMD:        host_rdata_o = 32'h0;  // write-only (reads 0, spec §3.9)
+      R_CTX_WORDS:      host_rdata_o = {16'h0, ctx_words_r};
+      R_CTX_STATUS:     host_rdata_o = ctx_status_w;
       default: begin
         // IMG_DIGEST (0x18-0x1F) / IMG_SIG (0x50-0x5F) word windows; every other
-        // offset is reserved and reads as 0 (v0.6 map: 0x07, 0x25-0x2F,
+        // offset is reserved and reads as 0 (v0.7 map: 0x07, 0x25, 0x29-0x2F,
         // 0x3A-0x3E, 0x3F = SPI_CRC front-end intercept, 0x60+ — spec §2).
         if ((host_addr_i >= R_IMG_DIGEST) &&
             (host_addr_i < (R_IMG_DIGEST + 16'(IMG_DIGEST_WORDS)))) begin
