@@ -420,7 +420,7 @@ tasks:
     est_days: 2
     deliverable: pack_tb_frames 多列镜像 + tb_bmc_daemon_packed 逐列流式/逐列 CRC 回读
     acceptance: 2 列部署 READBACK 逐列通过（v0.6 在真实 daemon 路径上无别名）
-    status: todo   # 测试基建目前只产出单列 --frame-hex；E1-DMO1 的 4 列 uart 会话回放同属此项
+    status: in_progress   # 2026-09-12: **发现并修复真实产品缺陷** —— `occ_top` 的 blank-before-write 脏位原为 per-REGION（`frame_addr[15:12]`），而 v0.6 列映射把同一 packed 镜像的各列放在同一 region ⇒ col0 的 WRITE 弄脏 region 后 col1 的 WRITE 被拒（`NEEDS_BLANK`），`§3.1` 与 `§3.3`（逐列 BLANK→LOAD）在 cols>1 时自相矛盾（此前所有 packed TB 都是 IMG_COLS=1，故不可达）。已裁决并落地**方案 (a)**：脏位改为 per-frame-window 位图 `dirty_r[255:0]`（索引 `frame_addr[15:8]` = {region,col}，逐字流式置位/清零，region-wide 命令覆盖其触及的所有窗口，accept 时检查起始窗口），规范 §3.1 措辞同步为"per-frame-window dirty bit"；tb_blank 新增 packed 双列用例（`BLANK 0x0000 + 0x0100` → 两列 `WRITE` 均 DONE；未 BLANK 的活跃窗口仍 `NEEDS_BLANK` 且 RAM 不变；512 字 region-wide BLANK 清两窗口）。Dmo2cMulti 的双列 TB（帧生成/向量/TB 阶段）待其重跑验收后并入。E1-DMO1 的 4 列 uart 会话回放同属此项
 
   - id: E1-DMO3
     title: v0.1.0 里程碑发布（视频+博客+文档站）

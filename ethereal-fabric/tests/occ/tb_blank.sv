@@ -2,16 +2,21 @@
 // SPDX-License-Identifier: MIT
 // Module:      tb_blank
 // Description: Self-checking SV testbench for occ_top blank-before-write enforcement (E0-FAB5).
-// Details:     Validates the per-region dirty-bit / S_NEEDS_BLANK mechanism added in
-//              E0-FAB5 (C03 sec3):
-//                1. First WRITE to a clean region is accepted (DONE).
-//                2. Re-WRITE to a now-dirty region is REJECTED: status=NEEDS_BLANK(5),
+// Details:     Validates the dirty-bit / S_NEEDS_BLANK mechanism added in
+//              E0-FAB5 (C03 sec3), at its E1-DMO2c granularity — PER FRAME
+//              WINDOW (frame_addr[15:8] = {region, col}):
+//                1. First WRITE to a clean window is accepted (DONE).
+//                2. Re-WRITE to a now-dirty window is REJECTED: status=NEEDS_BLANK(5),
 //                   cmd_ready never pulses, target RAM unchanged.
-//                3. BLANK cleans the region (DONE, RAM zeroed, dirty cleared).
+//                3. BLANK cleans the window (DONE, RAM zeroed, dirty cleared).
 //                4. WRITE works again after BLANK (no longer NEEDS_BLANK).
 //                5. Region isolation: writing region 0 does not touch region 1 storage;
-//                   region 0 being dirty does NOT block a clean region 1 WRITE.
+//                   a dirty window in region 0 does NOT block a clean region 1 WRITE.
 //                6. LOCK still blocks WRITE (priority over the dirty check).
+//                7. Packed 2-column sequence (spec §3.3 step 2/3: BLANK every
+//                   covered column, then WRITE per column) works; an unblanked
+//                   live window is still refused; a region-wide BLANK clears
+//                   every window it covers.
 //              Frame-bus target = column_cfg_ram DEPTH=8192 (regions 0..1 in range).
 //              Run: iverilog -g2012 -o /tmp/tb_blank tb_blank.sv column_cfg_ram.sv \
 //                              ../../rtl/occ/occ_top.sv && vvp /tmp/tb_blank
@@ -22,8 +27,10 @@
 // Notes:       Self-checking: maintains `errors`, prints TEST PASSED / TEST FAILED.
 //              Drives inputs at negedge, samples combinational outputs after a #1
 //              settle. iverilog -g2012 compatible (no SV-2017-only constructs).
-//              Region id = frame_addr[ADDR_W-1 -: 4]; for ADDR_W=16 that is
-//              frame_addr[15:12], so 0x0100->region 0, 0x1100->region 1.
+//              Region id = frame_addr[ADDR_W-1 -: 4] (= frame_addr[15:12] for
+//              ADDR_W=16): 0x0100/0x0000 -> region 0, 0x1100 -> region 1.
+//              Dirty window = frame_addr[15:8]: 0x0000 -> {r0,col0},
+//              0x0100 -> {r0,col1}, 0x1100 -> {r1,col0}.
 module tb_blank;
     localparam int ADDR_W = 16;
     localparam int DATA_W = 32;
@@ -142,6 +149,50 @@ module tb_blank;
     task run_blank(input logic [ADDR_W-1:0] a, input logic [15:0] n);
         begin
             occ_cmd(CMD_BLANK, a, n);
+        end
+    endtask
+
+    // Issue a WRITE expected to be refused with NEEDS_BLANK (E0-FAB5): both the
+    // pre- and post-posedge status must read 5, cmd_ready must stay 0 (no
+    // transition), and the target range must be RAM-identical afterwards.
+    task expect_needs_blank(input logic [ADDR_W-1:0] a, input logic [15:0] n);
+        logic [DATA_W-1:0] snap [0:N-1];
+        integer k;
+        begin
+            for (k = 0; k < N; k = k + 1) snap[k] = u_ram.mem[a + k];
+            @(negedge clk);
+            cmd        = CMD_WRITE;
+            frame_addr = a;
+            word_count = n;
+            cmd_valid  = 1'b1;
+            #1;   // pre-posedge combinational sample (IDLE evaluates the reject)
+            if (status !== S_NEEDS_BLANK) begin
+                $display("FAIL: dirty WRITE 0x%04h status=%0d (expected NEEDS_BLANK=5)", a, status);
+                errors = errors + 1;
+            end
+            if (cmd_ready !== 1'b0) begin
+                $display("FAIL: dirty WRITE 0x%04h cmd_ready=1 (expected rejected)", a);
+                errors = errors + 1;
+            end
+            @(posedge clk);
+            #1;
+            if (status !== S_NEEDS_BLANK) begin
+                $display("FAIL: dirty WRITE 0x%04h post-posedge status=%0d (not accepted)", a, status);
+                errors = errors + 1;
+            end
+            @(negedge clk);
+            cmd_valid = 1'b0;
+            cmd       = CMD_NOP;
+            #1;
+            if (status !== S_IDLE) begin
+                $display("FAIL: post-reject 0x%04h status=%0d (expected IDLE=0)", a, status);
+                errors = errors + 1;
+            end
+            for (k = 0; k < N; k = k + 1)
+                if (u_ram.mem[a + k] !== snap[k]) begin
+                    $display("FAIL: refused WRITE 0x%04h clobbered RAM[0x%04h]", a, a + k);
+                    errors = errors + 1;
+                end
         end
     endtask
 
@@ -424,6 +475,86 @@ module tb_blank;
             errors = errors + 1;
         end else begin
             $display("PASS: post-lock status=IDLE");
+        end
+
+        // ================================================================
+        $display("== check 7: packed 2-column per-window dirty (E1-DMO2c) ==");
+        // ================================================================
+        // Spec §3.3 step 2/3 order: BLANK every covered column FIRST, then WRITE
+        // per column. Window = frame_addr[15:8] = {region[15:12], col[11:8]}, so
+        // region 0's col 0 / col 1 are 0x0000 / 0x0100 (a column frame is 256
+        // words = frame_addr[7:0], spec §2). With the pre-E1-DMO2c per-region
+        // dirty bit, the WRITE of col 1 here is refused with NEEDS_BLANK because
+        // col 0's WRITE dirtied the whole region.
+        run_blank(16'h0000, N);
+        wait_done;
+        run_blank(16'h0100, N);
+        wait_done;
+        run_write(16'h0000, N);
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: packed WRITE col0 status=%0d (expected DONE=2)", status);
+            errors = errors + 1;
+        end else begin
+            $display("PASS: packed WRITE col0 status=DONE");
+        end
+        run_write(16'h0100, N);
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: packed WRITE col1 status=%0d (expected DONE=2; BLANKed col must stay writable)", status);
+            errors = errors + 1;
+        end else begin
+            $display("PASS: packed WRITE col1 status=DONE (per-window dirty)");
+        end
+        begin : c7_ram
+            integer k, bad;
+            bad = 0;
+            for (k = 0; k < N; k = k + 1) begin
+                if (u_ram.mem[16'h0000 + k] !== cfg[k]) bad = bad + 1;
+                if (u_ram.mem[16'h0100 + k] !== cfg[k]) bad = bad + 1;
+            end
+            if (bad !== 0) begin
+                $display("FAIL: packed WRITE RAM mismatch (%0d words)", bad);
+                errors = errors + 1;
+            end else begin
+                $display("PASS: packed WRITE filled both column windows");
+            end
+        end
+
+        // ---- 7b. negative control: a live window is still refused; it becomes
+        //          writable only after its own BLANK ----
+        expect_needs_blank(16'h0000, N);          // col 0 was written, not re-blanked
+        run_blank(16'h0000, N);
+        wait_done;
+        run_write(16'h0000, N);
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: re-WRITE col0 after BLANK status=%0d (expected DONE=2)", status);
+            errors = errors + 1;
+        end
+        expect_needs_blank(16'h0100, N);          // col 1 still live (not re-blanked)
+        $display("PASS: per-window dirty still refuses an unblanked live window");
+
+        // ---- 7c. a region-wide BLANK clears every window it covers ----
+        run_blank(16'h0000, 16'd512);             // spans windows 0x00 and 0x01
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: region-wide BLANK status=%0d (expected DONE=2)", status);
+            errors = errors + 1;
+        end
+        run_write(16'h0000, N);
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: post-region-BLANK WRITE col0 status=%0d (expected DONE=2)", status);
+            errors = errors + 1;
+        end
+        run_write(16'h0100, N);
+        wait_done;
+        if (status !== S_DONE) begin
+            $display("FAIL: post-region-BLANK WRITE col1 status=%0d (expected DONE=2)", status);
+            errors = errors + 1;
+        end else begin
+            $display("PASS: region-wide BLANK cleared both covered windows");
         end
 
         // ================================================================

@@ -37,6 +37,11 @@
 //              2026-09-12 - v0.8 §3.10 region lock matrix (E2-SEC1b): scalar
 //                           region_locked_i replaced by region_locks_i[7:0] +
 //                           global_lock_i (per-region gate, C03 §5)
+//              2026-09-12 - blank-before-write dirty bit is now PER FRAME
+//                           WINDOW (frame_addr[15:8] = region+col) instead of
+//                           per region (E1-DMO2c): the packed per-column
+//                           BLANK→WRITE order of spec §3.3 step 2/3 works, and a
+//                           region-wide command covers every window it touches.
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C03-OCC组件.md §2/§5 (C03 §5 lock
 //              matrix: v0.8 spec §3.10, E2-SEC1b)
@@ -47,8 +52,10 @@
 //              line (C03 §0) is respected at the protocol level: a region must be
 //              blanked before its first config WRITE — enforced by the BMC, not
 //              by occ_top v0.  [SUPERSEDED in E0-FAB5: blank-before-write is
-//              now HARDWARE-ENFORCED in occ_top via a per-region dirty bit and
-//              the S_NEEDS_BLANK status -- see dirty_r / region_id_r below.]
+//              now HARDWARE-ENFORCED in occ_top via a dirty bitmap and the
+//              S_NEEDS_BLANK status; the unit is the FRAME WINDOW
+//              (frame_addr[15:8] = region+col) since E1-DMO2c — see dirty_r /
+//              win_start_w below.]
 //              Lock storage lives in emri_regfile (LKM_CMD/LKM_STATUS, spec
 //              §3.10); occ_top holds only the gate. The lock is sampled at
 //              command accept, so an accepted frame is atomic w.r.t. the lock
@@ -195,12 +202,30 @@ module occ_top #(
     // enable is closed at the column decode. Sampled at command accept.
     logic        region_locked_w;   // global OR this region's lock bit
 
-    // blank-before-write (E0-FAB5, C03 sec3): per-region dirty tracking
-    logic [3:0]  region_id_w;       // current cmd region = frame_addr top 4 bits
-    logic [3:0]  region_id_r;       // latched region of the in-flight op
-    logic [15:0] dirty_r;           // 1 = region has live config (must BLANK before WRITE)
-    logic        c_write_done;      // WRITE completion cycle
-    logic        c_blank_done;      // BLANK completion cycle
+    // blank-before-write (E0-FAB5, C03 sec3; E1-DMO2c 2026-09-12): PER
+    // FRAME-WINDOW dirty bitmap. A window is {region[15:12], col[11:8]} of the
+    // frame address (C03 §1.1) — the unit that the packed per-column sequence
+    // (spec §3.3 step 2/3: BLANK every covered column, then WRITE per column)
+    // blanks and writes, so a WRITE to a window BLANKed since its last WRITE is
+    // legal while a re-WRITE of a live window is not. The stream updates the bit
+    // of every window it covers, so a region-wide command (several windows in
+    // one frame) sets/clears all of them; the accept-time check examines the
+    // command's START window (v0 commands are single-window: a column frame is
+    // 256 words = frame_addr[7:0], spec §2 OCC_FRAME_ADDR v0.6).
+    // ASSUMPTION (TBD 2026-09-12): ADDR_W >= 8 (WIN_W).
+    localparam int WIN_W = 8;                    // window index = frame_addr[15:8]
+    localparam int WIN_N = 1 << WIN_W;           // 256 windows = 16 regions x 16 cols
+    logic [WIN_N-1:0] dirty_r;                   // 1 = window has live config
+    logic [WIN_W-1:0] win_start_w;               // window of the commanded start address
+    logic [WIN_W-1:0] win_cur_w;                 // window of the word on the frame bus
+    assign win_start_w = frame_addr_i[ADDR_W-1 -: WIN_W];
+    assign win_cur_w   = fbus_addr[ADDR_W-1 -: WIN_W];
+
+    // Lock-gate region select = region_id[2:0] (= frame_addr[14:12]; the region
+    // field is frame_addr[15:12], C03 §1.1). The lock bitmap is 8 regions wide
+    // (LKM_STATUS[7:0], spec §2), so region ids 8..15 alias onto (id-8): the gate
+    // can only ever close MORE, never less.
+    logic [2:0]  region_sel_w;
 
     always_comb begin
         // ---- defaults (no latches) ----
@@ -217,8 +242,6 @@ module occ_top #(
         c_blank_word   = 1'b0;
         c_read_word    = 1'b0;
         c_cmp_mismatch = 1'b0;
-        c_write_done   = 1'b0;
-        c_blank_done   = 1'b0;
 
         case (state_r)
             ST_IDLE: begin
@@ -228,7 +251,7 @@ module occ_top #(
                         CMD_WRITE: begin
                             if (region_locked_w) begin
                                 status_c = S_LOCKED;          // reject: region locked
-                            end else if (dirty_r[region_id_w]) begin
+                            end else if (dirty_r[win_start_w]) begin
                                 status_c = S_NEEDS_BLANK;     // E0-FAB5: must BLANK first
                             end else begin
                                 cmd_ready = 1'b1;
@@ -261,7 +284,6 @@ module occ_top #(
                 if (idx_r == word_count_r) begin
                     // completion cycle: all words streamed
                     status_c     = S_DONE;
-                    c_write_done = 1'b1;
                     state_nxt    = ST_IDLE;
                 end else begin
                     status_c   = S_BUSY;
@@ -279,7 +301,6 @@ module occ_top #(
             ST_BLANK: begin
                 if (idx_r == word_count_r) begin
                     status_c     = S_DONE;
-                    c_blank_done = 1'b1;
                     state_nxt    = ST_IDLE;
                 end else begin
                     status_c     = S_BUSY;
@@ -341,8 +362,7 @@ module occ_top #(
             crc_r        <= 32'hFFFF_FFFF;
             expect_crc_latched_r <= 32'hFFFF_FFFF;
             crc_error_r  <= 1'b0;
-            region_id_r  <= '0;
-            dirty_r      <= '0;            // E0-FAB5: regions start CLEAN
+            dirty_r      <= '0;            // E0-FAB5: all windows start CLEAN
         end else begin
             if (c_accept) begin
                 // latch command context, (re)seed CRC, clear sticky error
@@ -352,7 +372,6 @@ module occ_top #(
                 crc_r        <= 32'hFFFF_FFFF;
                 expect_crc_latched_r <= expect_crc_i;   // v0.5 §3.1.1
                 crc_error_r  <= 1'b0;
-                region_id_r  <= region_id_w;   // E0-FAB5: latch region of in-flight op
             end else if (c_write_word) begin
                 idx_r   <= idx_r + 16'd1;
                 crc_r   <= crc32_next(crc_r, wdata_i);
@@ -365,10 +384,12 @@ module occ_top #(
             end else if (c_cmp_mismatch) begin
                 crc_error_r <= 1'b1;            // sticky until next accepted cmd
             end
-            // E0-FAB5: mark region dirty on WRITE completion, clean on BLANK
-            // completion. Independent of the word-level chain above.
-            if (c_write_done) dirty_r[region_id_r] <= 1'b1;
-            if (c_blank_done) dirty_r[region_id_r] <= 1'b0;
+            // E0-FAB5 / E1-DMO2c: every streamed word marks its own frame window
+            // dirty (WRITE) or clean (BLANK) — a single region-wide command
+            // therefore covers all of the windows it touches. Independent of the
+            // word-level chain above.
+            if (c_write_word) dirty_r[win_cur_w] <= 1'b1;
+            if (c_blank_word) dirty_r[win_cur_w] <= 1'b0;
         end
     end
 
@@ -384,8 +405,8 @@ module occ_top #(
     assign status_o     = status_c;
     assign crc_error_o  = crc_error_r;
     assign crc_result_o = crc_r;
-    assign region_id_w  = frame_addr_i[ADDR_W-1 -: 4];   // E0-FAB5: top-4-bit region id
-    assign region_locked_w = global_lock_i | region_locks_i[region_id_w[2:0]];  // C03 §5 gate
+    assign region_sel_w    = frame_addr_i[ADDR_W-2 -: 3];  // region_id[2:0] = frame_addr[14:12]
+    assign region_locked_w = global_lock_i | region_locks_i[region_sel_w];  // C03 §5 gate
 
 endmodule
 

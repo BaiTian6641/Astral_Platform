@@ -731,7 +731,7 @@ module tb_bmc_daemon;
       host_rd(R_LKM_STATUS, rd);
       chk(rd[8] == 1'b0, "lock: global unlock clears the global bit");
       chk(rd[0] == 1'b1, "lock: global unlock leaves region 0 locked (§3.10)");
-      host_wr(R_LKM_CMD, 32'h0000_0022);     // op 2, region 0 = explicit unlock
+      host_wr(R_LKM_CMD, 32'h0000_0002);     // op 2, region index [7:4] = 0
       host_rd(R_LKM_STATUS, rd);
       chk(rd[8:0] == 9'h0, "lock: explicit region unlock clears LKM_STATUS");
 
