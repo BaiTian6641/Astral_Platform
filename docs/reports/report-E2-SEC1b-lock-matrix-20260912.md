@@ -45,7 +45,9 @@
   `tb_ctx_multiword`（FAB3b 回归）→ 全部 `TEST PASSED`（本人独立复跑）。
 - ✅ `tb_lock_matrix` 覆盖：LKM_CMD lock → LKM_STATUS 逐区位；锁定区 WRITE/BLANK 被拒（`done_code=LOCKED`）
   且配置 RAM 逐字节不变；READBACK 在锁定下仍可用；unlock → 写恢复；全局锁对全区生效、opcode 4 清除。
-- ✅ BMC daemon 端到端（`tb_bmc_daemon` 阶段 1d + 既有 stop/restart/abort 的"BLANK 前解锁"回归）：首轮跑出
+- ✅ **BMC daemon 端到端最终判定：`exit=0`、91 ok / 0 FAIL、`TEST PASSED`**（$finish 7 s sim / 1375 s wall）——
+  在锁修复 + per-frame-window 脏位修复后的**已提交状态**上跑（含全部既有阶段）。
+- 📋 历史（首轮）：BMC daemon 端到端（`tb_bmc_daemon` 阶段 1d + 既有 stop/restart/abort 的"BLANK 前解锁"回归）：首轮跑出
   **真实语义缺陷**（`LKM_CMD=4` 连逐区锁一起清）→ 规范澄清为"仅清全局位"、RTL 修复（`LKM_OP_GLOBAL_CLEAR` 只动
   `global_lock_r`），失败断言即本 TB 的 `lock: global unlock leaves region 0 locked (§3.10)`；同轮其余断言全过 ——
   RUNNING 自动锁、**裸 WRITE 被硬件门拒（done_code=LOCKED(3)）且配置 RAM 逐字节不变**、全局锁置位/清位、
