@@ -98,4 +98,18 @@
   负控：`--uart-fault 0:1` 轨迹仍 MATCH 但 UART 校验 FAIL（载荷被改）、`--uart-fault 3:9` 抓到帧错。
   `make verif-rv` **176 passed**（147+29 新增 `test_rv_uart.py`）；lint 干净（无新豁免）；`eth_rv_core.sby` 仍 PASS（新外设不在被证明状态内）。
 - **CLINT 延后（有据）**：Spike 的 mtime 由自身指令计数推进，任何程序都读不到一致值 ⇒ 检查点 5 也不需要它。
-- **遗留（agent 如实列出）**：D 口尚**无错误响应**（UART 页内未实现偏移会卡住而非像 Spike 那样陷阱 —— 归入 AXI 错误响应增量）；CLINT/PLIC + 中断交付（RV-C）；UART RX 路径；可选的 `eth_rv_uart.sby`。
+- ~~遗留：D 口尚**无错误响应**（UART 页内未实现偏移会卡住）~~ → **增量 5 已修**（见 §8）；CLINT/PLIC + 中断交付（RV-C）；UART RX 路径；可选的 `eth_rv_uart.sby`。
+
+## 8. 增量 5（同日完成）：D 口/取指口错误响应（access-fault 陷阱）
+
+- **以 Spike 为裁判先测，再改 RTL**：一次性探针确认了 13 组语义（load/store access fault → `mcause 5/7` + `mtval`=访问地址；
+  取指越界 → `mcause 1` 且 `mtval=mepc=0x2000_0000`；**页内非字节宽度**是 UART 页唯一陷阱来源；页内偏移**别名**（ns16550 `addr &= 7`）不陷阱；
+  落在 Spike 2 GiB DRAM 内的地址不陷阱）。
+- **修正增量 4 的假设**：并非"未实现偏移陷阱"，而是**宽度不匹配 + 页内别名**；mux 两者都对齐 ⇒ 旧"卡死"路径不可能再现。
+- **语料** `cor_fault.S`：11 个陷阱（7 load / 3 store / 1 fetch access fault）逐项在程序内断言 `mcause/mtval/mepc`（取指项要求 `mepc=mtval`），
+  并以 `s11 == 11` 收尾；**RTL 侧 `MATCH: 323 commits compared, 0 divergence`**（memory active 16 次访问），`ETH_RV_TB: PASS … 11 traps (11 access faults, last mcause=1)`。
+- **8/8 程序全绿**（本人复跑）：拍路径、AXI/DRAM（cor_fault：11 AR(7 多拍)/4 AW —— 未声明地址抵达插座得 DECERR，UART 访问被 mux 门在核内）、`--memlat 2`、`--axi-line-beats 1`
+  → `[rv-rtl] OK: 8 corpus program(s), MATCH vs Spike + console asserted`；`make verif-rv` **181 passed**；lint 干净；`eth_rv_core.sby` 仍 PASS。
+- **两条负控（本人复核的机制）**：`+starve_dmem=1`（复制旧卡死）→ 看门狗式 FAIL「the D port never answered … wedge」；
+  `+no_dmem_err=1`（静默成功）→ DiffTest 在 commit #20 抓到分歧（golden 已在陷阱处理程序、DUT 仍在退休故障指令）⇒ 比对确实"活着"。
+- **顺带修复的仓库卫生**：`sby -f` 会重写 `*_cover/` 下约 46 个**被追踪**文件（`.gitignore` 原只覆盖 `*_prove/`）⇒ 已加规则并取消追踪其可再生内容（`.sby` 源仍追踪，7 个）。

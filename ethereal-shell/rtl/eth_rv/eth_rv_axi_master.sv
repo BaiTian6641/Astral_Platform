@@ -41,9 +41,21 @@
 //              requested beat; if a slave ends a read early with an error
 //              response (allowed for an erroring burst, eth-axi-v0.md §9.4),
 //              the master still hands the core a beat on RLAST so the pipeline
-//              cannot wedge. Non-OKAY responses and ID mismatches are recorded
-//              in `axi_err_o` (sticky) — RV-B has no bus-error exception, so a
-//              bus error is observable at the port rather than architectural.
+//              cannot wedge.
+//
+//              ERROR RESPONSE (E2-RV1 increment 5): a beat is acknowledged with
+//              `dmem_ready_o` and, when the transaction failed, `dmem_err_o` in
+//              the SAME cycle — a non-OKAY R/B response (the DRAM socket's DECERR
+//              for an address outside its window) or an address the AXI window
+//              cannot carry at all (`!addr_reachable`: answered immediately,
+//              without a transaction, because a truncated address could land
+//              inside the window and quietly succeed). The core turns that pair
+//              into the architectural load/store access fault (mcause 5/7,
+//              mtval = the address) — an error is never a silent success and
+//              never a wedge. An erroring read burst never validates the read
+//              line either, so a poisoned line buffer cannot serve wrong bytes to
+//              the following sequential loads. `axi_err_o` (sticky) remains the
+//              SoC-level observability of non-OKAY responses and ID mismatches.
 //
 //              The core's D port holds its request until accepted and cannot be
 //              abandoned mid-transaction (a younger EX trap implies !ex_stall,
@@ -53,6 +65,7 @@
 //              AXI_DW must equal the core's beat width (64).
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
+// Modified:    2026-09-12 - E2-RV1 increment 5: per-transaction error response (dmem_err_o)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (D port), §6 (eth_axi master) ·
 //              ethereal-spec/control/eth-axi-v0.md §2 (VALID/READY rules 1-2), §9 (DRAM socket) ·
@@ -81,6 +94,7 @@ module eth_rv_axi_master #(
     input  logic [7:0]              dmem_wstrb_i,
     output logic                    dmem_ready_o,
     output logic [63:0]             dmem_rdata_o,
+    output logic                    dmem_err_o,     // with dmem_ready_o: access fault
 
     // ---- AXI4 master (to eth_dram_ctrl / the eth_axi fabric) ----
     output logic                    m_axi_awvalid,
@@ -146,6 +160,7 @@ module eth_rv_axi_master #(
     logic [3:0]        beat_r,  beat_nxt;   // beat counter of the read burst
     logic              fill_r,  fill_nxt;   // the read fills (and then caches) a whole line
     logic              served_r, served_nxt;// the core's beat has been handed over
+    logic              rd_err_r, rd_err_nxt;// this read burst saw a non-OKAY response
     logic [AXI_DW-1:0] wdata_r, wdata_nxt;  // latched store payload (stable while VALID)
     logic [7:0]        wstrb_r, wstrb_nxt;
 
@@ -225,17 +240,32 @@ module eth_rv_axi_master #(
     // ends an erroring burst early, so the beat is always handed over once.
     logic r_beat_here;
     logic b_beat_here;
+    logic unreachable_beat;
 
     assign r_beat_here = (state_r == E_R) && m_axi_rvalid
                          && ((beat_r == word_r) || (m_axi_rlast && !served_r));
     assign b_beat_here = (state_r == E_B) && m_axi_bvalid;
 
-    assign dmem_ready_o = b_beat_here || r_beat_here
+    // An address the AXI window cannot even carry is answered here and now, with
+    // an error response and WITHOUT starting a transaction: the alternative is
+    // truncating the address to `AXI_AW` bits, and a 64-bit address whose low
+    // bits happen to land inside the socket's window would then quietly succeed —
+    // a silent wrong answer, exactly what the error response exists to rule out.
+    // The core takes its access fault either way.
+    assign unreachable_beat = (state_r == E_IDLE) && dmem_req_i && !addr_reachable;
+
+    assign dmem_ready_o = unreachable_beat || b_beat_here || r_beat_here
                           || ((state_r == E_IDLE) && dmem_req_i && !dmem_we_i && line_hit);
     assign dmem_rdata_o = r_beat_here ? m_axi_rdata
                         : ((state_r == E_IDLE) && line_hit)
                           ? line_mem[req_line_idx]
                           : 64'd0;
+    // The error travels WITH the accept, so the core never has to tell "not ready
+    // yet" from "failed": a non-OKAY read/write response, or an address outside
+    // the AXI window, is an access fault on that beat.
+    assign dmem_err_o   = unreachable_beat
+                          || (r_beat_here && (m_axi_rresp != 2'b00))
+                          || (b_beat_here && (m_axi_bresp != 2'b00));
 
     // ------------------------------------------------------------------
     // Next-state logic (combinational segment; defaults first)
@@ -250,16 +280,20 @@ module eth_rv_axi_master #(
         served_nxt   = served_r;
         wdata_nxt    = wdata_r;
         wstrb_nxt    = wstrb_r;
+        rd_err_nxt   = rd_err_r;
         line_we      = 1'b0;
         line_valid_d = line_valid_r;
         line_base_d  = line_base_r;
 
         case (state_r)
             E_IDLE: begin
-                // a cached load is answered combinationally and stays in idle
-                if (dmem_req_i && !(!dmem_we_i && line_hit)) begin
+                // a cached load is answered combinationally and stays in idle, and
+                // so is an address the AXI window cannot carry (answered as an
+                // error, see `unreachable_beat`): neither starts a transaction
+                if (dmem_req_i && !unreachable_beat && !(!dmem_we_i && line_hit)) begin
                     served_nxt = 1'b0;
                     beat_nxt   = 4'd0;
+                    rd_err_nxt = 1'b0;
                     if (dmem_we_i) begin
                         addr_nxt     = req_beat;
                         wdata_nxt    = dmem_wdata_i[AXI_DW-1:0];
@@ -292,6 +326,9 @@ module eth_rv_axi_master #(
             E_R: begin
                 if (m_axi_rvalid) begin
                     beat_nxt = beat_r + 4'd1;
+                    if (m_axi_rresp != 2'b00) begin
+                        rd_err_nxt = 1'b1;
+                    end
                     if (beat_r == word_r) begin
                         served_nxt = 1'b1;
                     end
@@ -299,7 +336,11 @@ module eth_rv_axi_master #(
                         state_nxt = E_IDLE;
                         if (fill_r) begin
                             line_we      = 1'b1;
-                            line_valid_d = 1'b1;
+                            // an erroring burst never validates the line: a
+                            // poisoned line buffer would serve wrong bytes
+                            // silently to every following sequential load
+                            line_valid_d = !rd_err_r && !(m_axi_rresp != 2'b00)
+                                           && (m_axi_rid == AXI_ID);
                             line_base_d  = addr_r;
                         end
                     end
@@ -338,6 +379,7 @@ module eth_rv_axi_master #(
             beat_r       <= 4'd0;
             fill_r       <= 1'b0;
             served_r     <= 1'b0;
+            rd_err_r     <= 1'b0;
             wdata_r      <= {AXI_DW{1'b0}};
             wstrb_r      <= 8'd0;
             line_base_r  <= {AXI_AW{1'b0}};
@@ -351,6 +393,7 @@ module eth_rv_axi_master #(
             beat_r   <= beat_nxt;
             fill_r   <= fill_nxt;
             served_r <= served_nxt;
+            rd_err_r <= rd_err_nxt;
             wdata_r  <= wdata_nxt;
             wstrb_r  <= wstrb_nxt;
 

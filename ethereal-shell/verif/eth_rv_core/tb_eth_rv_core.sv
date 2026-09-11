@@ -23,6 +23,34 @@
 //                N idle cycles before `ready`, which exercises the core's stall
 //                path (the core holds its request until the transfer is accepted).
 //
+//              ERROR RESPONSES (E2-RV1 increment 5): an address outside the
+//              mapped memory window (see `in_mem`) is answered with `ready` AND
+//              `err` in the same cycle — this build's image of the address map
+//              Spike and `eth_dram_ctrl` agree on, where such an address is
+//              claimed by nobody and raises an access fault (mcause 1/5/7,
+//              `mtval` = the address). The core turns the pair into that trap;
+//              a build where the error never reaches the core as a trap shows up
+//              as a trace divergence from Spike (Spike does not commit the
+//              faulting instruction, and neither may the DUT) *and* as the
+//              trap-count check in `cor_fault.S`. The console UART's own width
+//              check (a non-byte access to its page) is inside
+//              `eth_rv_mmio_mux.sv`, in front of this memory model.
+//              `+no_dmem_err=1` is the negative control for that contract: it
+//              drops the error response so the access looks successful, and the
+//              DiffTest must then report a divergence at the instruction Spike
+//              traps on (see verif/eth_rv/README.md).
+//
+//              WEDGE GUARD: the D port (and the I port) must be answered on every
+//              request — the RV-B D port used to hang forever on an access it
+//              could not serve. A request still unanswered after
+//              PORT_STARVE_CYCLES is a hard FAIL naming the address, so "the old
+//              wedge cannot come back" is asserted inside every run rather than
+//              inferred from the cycle budget. `+starve_dmem=1` is the negative
+//              control for that guard: it makes the memory model withhold the
+//              acknowledge for an out-of-window access, reproducing the old hang,
+//              and the run must then FAIL with the wedge message (see
+//              verif/eth_rv/README.md).
+//
 //              Termination mirrors the golden generator: the run ends at the
 //              commit whose store covers the HTIF `tohost` mailbox (crt0.S'
 //              final `sd`), so both streams stop at the same instruction. The
@@ -59,6 +87,7 @@
 //              self-describing without reading the trace file.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
+// Modified:    2026-09-12 - E2-RV1 increment 5: port error responses + wedge guard
 // Tags:        TESTBENCH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (I/D/RVFI ports), §5 (DiffTest)
 //              ethereal-shell/verif/eth_rv/README.md (trace protocol)
@@ -67,7 +96,9 @@
 module tb_eth_rv_core;
 
     // ------------------------------------------------------------------ params
-    localparam int unsigned MEM_WORDS = 32_768;   // 256 KiB @ 8 B/word
+`ifndef ETH_RV_DRAM_AXI
+    localparam int unsigned MEM_WORDS = 32_768;   // 256 KiB @ 8 B/word (behavioral build)
+`endif
 
     // Console UART of the SoC data map (rtl/eth_rv/eth_rv_mmio_mux.sv): the same
     // page Spike's ns16550 answers on, with a 16-cycle bit cell, so a queued
@@ -117,6 +148,20 @@ module tb_eth_rv_core;
     int unsigned uart_drain_cycles;
     int          uart_fault_frame;
     int          uart_fault_bit;
+    // Wedge negative control (WEDGE GUARD below): `+starve_dmem=1` makes the
+    // memory model answer NOTHING outside the mapped window, which is exactly the
+    // old RV-B D-port wedge (the access is never acknowledged). The guard must
+    // then FAIL the run, naming the address — the control that shows the guard is
+    // live rather than decorative. Only the behavioral (non-AXI) build implements
+    // it; the AXI build refuses it loudly instead of silently ignoring it.
+    int unsigned starve_dmem;
+    // Silent-success negative control: `+no_dmem_err=1` drops the error response,
+    // so an access the platform cannot serve looks like an ordinary successful
+    // beat. The core then RETIRES the access instead of trapping, and the DiffTest
+    // must catch it as a divergence from Spike (which does not commit the faulting
+    // instruction) — the control that shows the error response is load-bearing
+    // rather than decorative.
+    int unsigned no_dmem_err;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -165,6 +210,7 @@ module tb_eth_rv_core;
     logic [63:0] imem_addr;
     logic        imem_ready;
     logic [31:0] imem_rdata;
+    logic        imem_err;
 
     // The core's own D port (`core_dmem_*`) goes through the SoC MMIO decode,
     // which re-drives the memory-side `dmem_*` group below — so the behavioral
@@ -177,6 +223,8 @@ module tb_eth_rv_core;
     logic [7:0]  core_dmem_wstrb;
     logic        core_dmem_ready;
     logic [63:0] core_dmem_rdata;
+    logic [1:0]  core_dmem_size;
+    logic        core_dmem_err;
 
     logic        dmem_req;
     logic        dmem_we;
@@ -185,6 +233,8 @@ module tb_eth_rv_core;
     logic [7:0]  dmem_wstrb;
     logic        dmem_ready;
     logic [63:0] dmem_rdata;
+    logic        dmem_err;
+    logic        dmem_err_raw;   // per-access error, before the `+no_dmem_err` control
 
     logic        uart_tx;
     logic        uart_busy;
@@ -215,13 +265,16 @@ module tb_eth_rv_core;
         .imem_addr_o     (imem_addr),
         .imem_ready_i    (imem_ready),
         .imem_rdata_i    (imem_rdata),
+        .imem_err_i      (imem_err),
         .dmem_req_o      (core_dmem_req),
         .dmem_we_o       (core_dmem_we),
         .dmem_addr_o     (core_dmem_addr),
         .dmem_wdata_o    (core_dmem_wdata),
         .dmem_wstrb_o    (core_dmem_wstrb),
+        .dmem_size_o     (core_dmem_size),
         .dmem_ready_i    (core_dmem_ready),
         .dmem_rdata_i    (core_dmem_rdata),
+        .dmem_err_i      (core_dmem_err),
         .rvfi_valid_o    (rvfi_valid),
         .rvfi_order_o    (rvfi_order),
         .rvfi_pc_o       (rvfi_pc),
@@ -257,8 +310,10 @@ module tb_eth_rv_core;
         .addr_i         (core_dmem_addr),
         .wdata_i        (core_dmem_wdata),
         .wstrb_i        (core_dmem_wstrb),
+        .size_i         (core_dmem_size),
         .ready_o        (core_dmem_ready),
         .rdata_o        (core_dmem_rdata),
+        .err_o          (core_dmem_err),
         .mem_req_o      (dmem_req),
         .mem_we_o       (dmem_we),
         .mem_addr_o     (dmem_addr),
@@ -266,12 +321,34 @@ module tb_eth_rv_core;
         .mem_wstrb_o    (dmem_wstrb),
         .mem_ready_i    (dmem_ready),
         .mem_rdata_i    (dmem_rdata),
+        .mem_err_i      (dmem_err),
         .uart_tx_o      (uart_tx),
         .uart_busy_o    (uart_busy),
         .uart_overflow_o(uart_overflow)
     );
 
     // ------------------------------------------------------------------ I port
+    // The mapped-memory window of this build. A fetch or data access outside it
+    // is answered with an ERROR RESPONSE (ready + err in the same cycle), which
+    // is the RTL's image of the address map Spike and `eth_dram_ctrl` agree on:
+    // Spike's `bus_t` has no device for such an address (`mmio_load/fetch`
+    // returns false) and the DRAM socket answers DECERR outside its window, so
+    // both raise an access fault. An in-window address is served as before.
+    // Known, deliberate deviation: Spike's boot ROM (0x1000) and its ns16550
+    // register file have no counterpart on this instruction port, so a FETCH from
+    // those pages faults here (it is what Spike does for the UART page too, since
+    // the 4-byte fetch is rejected by `reg_io_width != len`); no corpus program
+    // fetches there.
+`ifdef ETH_RV_DRAM_AXI
+    function automatic logic in_mem(input logic [63:0] addr);
+        in_mem = (addr >= 64'(DRAM_BASE)) && (addr < (64'(DRAM_BASE) + 64'(DRAM_BYTES)));
+    endfunction
+`else
+    function automatic logic in_mem(input logic [63:0] addr);
+        in_mem = (addr >= base_addr) && (addr < (base_addr + 64'(MEM_WORDS * 8)));
+    endfunction
+`endif
+
     logic        imem_pend;
     logic [63:0] imem_addr_q;
     int unsigned imem_wait;
@@ -298,9 +375,11 @@ module tb_eth_rv_core;
                             || (imem_pend && (imem_addr_q == imem_addr)
                                 && (imem_wait >= mem_lat)));
     assign imem_rdata = imem_req ? read_bytes32(imem_addr) : 32'd0;
+    // the error rides the accept, so the core can never mistake "not ready yet"
+    // for "this address has no instruction"
+    assign imem_err   = imem_ready && !in_mem(imem_addr);
 
     // ------------------------------------------------------------------ D port
-    logic        dmem_pend;
 `ifdef ETH_RV_DRAM_AXI
     // ---- D port through the AXI4 master into the DRAM socket -------------
     logic        m_axi_awvalid;
@@ -351,6 +430,7 @@ module tb_eth_rv_core;
         .dmem_wstrb_i  (dmem_wstrb),
         .dmem_ready_o  (dmem_ready),
         .dmem_rdata_o  (dmem_rdata),
+        .dmem_err_o    (dmem_err_raw),
         .m_axi_awvalid (m_axi_awvalid),
         .m_axi_awready (m_axi_awready),
         .m_axi_awaddr  (m_axi_awaddr),
@@ -464,6 +544,7 @@ module tb_eth_rv_core;
     end
 `else
     // v0 build: the behavioral beat memory, served out of `mem`
+    logic        dmem_pend;
     logic [63:0] dmem_addr_q;
     int unsigned dmem_wait;
 
@@ -484,19 +565,28 @@ module tb_eth_rv_core;
         end
     end
 
+    // `+starve_dmem=1` (the wedge negative control) withholds the acknowledge
+    // for an out-of-window access, i.e. it reproduces the old hang on purpose.
     assign dmem_ready = dmem_req
+                        && !((starve_dmem != 0) && !in_mem(dmem_addr))
                         && ((mem_lat == 0)
                             || (dmem_pend && (dmem_addr_q == dmem_addr)
                                 && (dmem_wait >= mem_lat)));
-    // aligned beat: the eight bytes of the window at (addr & ~7)
-    assign dmem_rdata = dmem_req ? mem[word_of(dmem_addr & ~64'd7)] : 64'd0;
+    // aligned beat: the eight bytes of the window at (addr & ~7) — read through
+    // `mem_word`, which bounds-checks, so an out-of-window beat reads zero rather
+    // than an arbitrary array slot (it is an ERROR response anyway).
+    assign dmem_rdata = dmem_req ? mem_word(dmem_addr & ~64'd7) : 64'd0;
+    // Outside the mapped window the access is an error response, in the same
+    // cycle it is accepted — the same "ready + err" shape the DRAM socket's
+    // DECERR produces through `eth_rv_axi_master` in the other build.
+    assign dmem_err_raw = dmem_ready && !in_mem(dmem_addr);
 
     // byte-lane write, at the cycle the access is accepted
     integer      lane;
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             // nothing to reset: the array is filled from +mem at time 0
-        end else if (dmem_req && dmem_we && dmem_ready) begin
+        end else if (dmem_req && dmem_we && dmem_ready && in_mem(dmem_addr)) begin
             for (lane = 0; lane < 8; lane = lane + 1) begin
                 if (dmem_wstrb[lane]) begin
                     // lane `lane` of the aligned beat holds the byte for (addr & ~7) + lane
@@ -507,6 +597,13 @@ module tb_eth_rv_core;
         end
     end
 `endif
+
+    // The `+no_dmem_err` silent-success control: with it set, an unservable access
+    // looks like an ordinary successful beat, so the core retires it instead of
+    // taking the access fault. Nothing inside the DUT knows about the control —
+    // what the DiffTest compares is the DUT's trace against Spike's, which is
+    // exactly the "no silent success" property under test.
+    assign dmem_err = dmem_err_raw && (no_dmem_err == 0);
 
     // ------------------------------------------------------------------ console
     // Receiver-side model of the SoC UART's serial line (a standard 8N1 mid-bit
@@ -618,6 +715,26 @@ module tb_eth_rv_core;
     int unsigned n_loads;
     int unsigned n_stores;
     int unsigned traps;
+    int unsigned n_access_faults;   // traps taken with mcause 1/5/7
+
+    // ---- WEDGE GUARD: a port request must be answered ----------------------
+    // The RV-B D port used to hang on an access it could not serve (an
+    // unimplemented offset inside the claimed console page): the decoder simply
+    // never answered, and only the cycle budget ended the run. The error-response
+    // contract (rtl/eth_rv/eth_rv_core.sv, eth_rv_mmio_mux.sv) is that EVERY
+    // request is answered in the cycle it is made — with `ready` and, when the
+    // access cannot be served, with `err` at the same time. This is the bounded
+    // negative control for that: a request that stays unanswered for
+    // PORT_STARVE_CYCLES is a hard FAIL naming the address, long before the
+    // (much looser) cycle budget. The bound cannot trip on a legitimate wait: the
+    // slowest allowed round trip is an AXI read line fill plus the socket's read
+    // latency, well under a hundred cycles, and the optional `+memlat` stall
+    // counter is `mem_lat` (1..2 in every run the runner makes).
+    localparam int unsigned PORT_STARVE_CYCLES = 4096;
+    int unsigned dport_wait;        // consecutive cycles with an unanswered D-port request
+    int unsigned iport_wait;
+    int unsigned dport_wait_max;    // ... and the longest such wait in the whole run
+    int unsigned iport_wait_max;
     logic [3:0]  last_trap_cause;
     logic [63:0] last_mem_addr;
     logic [63:0] last_store_data;
@@ -689,6 +806,11 @@ module tb_eth_rv_core;
             n_loads         <= 0;
             n_stores        <= 0;
             traps           <= 0;
+            n_access_faults <= 0;
+            dport_wait      <= 0;
+            iport_wait      <= 0;
+            dport_wait_max  <= 0;
+            iport_wait_max  <= 0;
             last_trap_cause <= 4'd0;
             last_mem_addr   <= 64'd0;
             last_store_data <= 64'd0;
@@ -698,6 +820,25 @@ module tb_eth_rv_core;
             failed          <= 1'b0;
         end else begin
             cycle_cnt <= cycle_cnt + 1;
+
+            // ---- wedge guard: every port request is answered (see the comment
+            // on PORT_STARVE_CYCLES) ------------------------------------------
+            if (core_dmem_req && !core_dmem_ready) begin
+                dport_wait <= dport_wait + 1;
+                if ((dport_wait + 1) > dport_wait_max) begin
+                    dport_wait_max <= dport_wait + 1;
+                end
+            end else begin
+                dport_wait <= 0;
+            end
+            if (imem_req && !imem_ready) begin
+                iport_wait <= iport_wait + 1;
+                if ((iport_wait + 1) > iport_wait_max) begin
+                    iport_wait_max <= iport_wait + 1;
+                end
+            end else begin
+                iport_wait <= 0;
+            end
 
             if (rvfi_valid && !stop_now) begin
                 commits <= commits + 1;
@@ -746,9 +887,23 @@ module tb_eth_rv_core;
                 end
             end
 
-            if (core_err && !stop_now) begin
+            if (!stop_now && (dport_wait >= PORT_STARVE_CYCLES)) begin
+                failed   <= 1'b1;
+                stop_now <= 1'b1;
+                $display("ETH_RV_TB: FAIL the D port never answered the access at 0x%016x (%0d cycles, we=%0d) — wedge",
+                         core_dmem_addr, dport_wait + 1, core_dmem_we);
+            end else if (!stop_now && (iport_wait >= PORT_STARVE_CYCLES)) begin
+                failed   <= 1'b1;
+                stop_now <= 1'b1;
+                $display("ETH_RV_TB: FAIL the I port never answered the fetch at 0x%016x (%0d cycles) — wedge",
+                         imem_addr, iport_wait + 1);
+            end else if (core_err && !stop_now) begin
                 traps    <= traps + 1;
                 last_trap_cause <= core_err_code;
+                if ((core_err_code == 4'd1) || (core_err_code == 4'd5)
+                    || (core_err_code == 4'd7)) begin
+                    n_access_faults <= n_access_faults + 1;
+                end
                 if (traps >= max_traps) begin
                     failed   <= 1'b1;
                     stop_now <= 1'b1;
@@ -780,6 +935,8 @@ module tb_eth_rv_core;
         uart_drain_cycles = 20_000;
         uart_fault_frame  = -1;
         uart_fault_bit    = 0;
+        starve_dmem       = 0;
+        no_dmem_err       = 0;
         rst_n        = 1'b0;
 
         void'($value$plusargs("mem=%s", mem_path));
@@ -796,12 +953,18 @@ module tb_eth_rv_core;
         void'($value$plusargs("uart_drain=%d", uart_drain_cycles));
         void'($value$plusargs("uart_fault_frame=%d", uart_fault_frame));
         void'($value$plusargs("uart_fault_bit=%d", uart_fault_bit));
+        void'($value$plusargs("starve_dmem=%d", starve_dmem));
+        void'($value$plusargs("no_dmem_err=%d", no_dmem_err));
 
         if (mem_path == "") begin
             $display("ETH_RV_TB: FAIL no +mem=<file> given");
             $fatal(1);
         end
 `ifdef ETH_RV_DRAM_AXI
+        if (starve_dmem != 0) begin
+            $display("ETH_RV_TB: FAIL +starve_dmem is only implemented by the behavioral build");
+            $fatal(1);
+        end
         // the DRAM stub's array is the one image: preload it so the instruction
         // port (hierarchical read) and the AXI data port see the same memory
         for (int unsigned i = 0; i < DRAM_WORDS; i = i + 1) begin
@@ -883,19 +1046,26 @@ module tb_eth_rv_core;
             $fclose(uart_fd);
         end
 `ifdef ETH_RV_DRAM_AXI
-        if (axi_err) begin
-            $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response");
+        // A non-OKAY response is a legitimate event now: it is the socket's way of
+        // rejecting an out-of-window address, and `eth_rv_axi_master` reports it
+        // per transaction as `dmem_err_o`, which the core turns into an access
+        // fault. What must never happen is a non-OKAY response that does NOT
+        // become an architectural access fault — that would be a silent failure.
+        if (axi_err && (n_access_faults == 0)) begin
+            $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response that never became an access fault");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 last_trap_cause, last_mem_addr, last_store_data, last_insn,
+                 n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 last_mem_addr, last_store_data, last_insn,
                  n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 last_trap_cause, last_mem_addr, last_store_data, last_insn,
+                 n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 last_mem_addr, last_store_data, last_insn,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `endif
         $finish;

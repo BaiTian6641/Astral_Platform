@@ -17,9 +17,15 @@
 //              `addr[63:12] == UART_BASE[63:12]` — the same 4 KiB granularity as
 //              `ns16550_t::load/store` in Spike (`addr + len > PGSIZE`), so the
 //              page boundary the golden model uses is the boundary here. Inside
-//              the page the 16550 register file is the eight byte offsets
-//              `addr[11:3] == 0` (`reg-shift = 0`, `reg-io-width = 1`), which is
-//              what the peripheral decodes as `off_i = addr[2:0]`.
+//              the page the register is `addr[2:0]`: `reg_shift = 0` and
+//              `reg_io_width = 1`, and Spike's device then does `addr >>= 0;
+//              addr &= 7`, so EVERY page offset aliases onto one of the eight
+//              byte registers (0x1000_0010 is the RX/THR register, 0x1000_0FFF
+//              the scratch register). This implementation aliases identically —
+//              not because aliasing is desirable but because the golden model is
+//              what the DiffTest compares against, and a program that read or
+//              wrote an "unimplemented" page offset has to behave the same on
+//              both sides.
 //
 //              BEAT <-> BYTE ADAPTATION lives here, because that is the D port's
 //              shape rather than the peripheral's: the core presents the 64-bit
@@ -39,18 +45,26 @@
 //              and be answered DECERR, so filtering at the decoder is what makes
 //              the MMIO map work in both D-port builds.
 //
-//              Unimplemented register offsets inside the claimed page
-//              (0x1000_0008..0x1000_0FFF) are deliberately NOT acknowledged: the
-//              RV-B D port has no error response yet (`eth_rv_axi_master` records
-//              a bus error on `axi_err_o` rather than raising an exception), so
-//              the alternatives are a silent success the golden model would not
-//              produce or a wedge. The wedge is chosen because the testbench's
-//              cycle budget turns it into a hard FAIL with the faulting pc, and
-//              because it can never turn into a trace that diverges from Spike
-//              quietly. Same reasoning for a non-byte access to the register
-//              file: Spike's ns16550 rejects `len != reg_io_width`, and until the
-//              core can take an access fault the corpus is what keeps the two
-//              sides equal — it uses byte accesses only (see verif/eth_rv/README.md).
+//              ERROR RESPONSE (E2-RV1 increment 5): the ONE thing Spike's
+//              ns16550 rejects inside its page is a width it does not serve —
+//              `load`/`store` return false when `reg_io_width != len`, i.e. for
+//              any access larger than one byte, and `bus_t::find_device` +
+//              `mmu_t` then raise `trap_{load,store}_access_fault` with `mtval` =
+//              the access address. This decoder mirrors exactly that: a
+//              non-byte access to the page (the core reports the width on
+//              `size_i`) is answered with `ready_o = err_o = 1` — the access
+//              completes AS AN ERROR — and the core turns it into the
+//              architectural access fault. The page-crossing case Spike also
+//              rejects (`addr + len > PGSIZE`) cannot be reached with a width of
+//              1, so the width check subsumes it.
+//
+//              The same contract applies to the memory path: `mem_err_i` from
+//              whatever answers the system memory (the v0 testbench's window
+//              check, or the DRAM socket's DECERR through `eth_rv_axi_master`) is
+//              forwarded as this port's `err_o`, so an address no region claims
+//              surfaces as an access fault rather than as zeros. Nothing here
+//              wedges: every request is accepted in the cycle it is made, with or
+//              without an error.
 //
 //              CLINT (mtime/mtimecmp) IS DEFERRED, deliberately: Spike's CLINT
 //              ticks `mtime` from its own instruction counter
@@ -64,7 +78,7 @@
 //              in RV-B's checkpoint 5 needs it.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
-// Modified:    2026-09-12 - E2-RV1 increment 4: C14 §8 checkpoint 5 (UART hello)
+// Modified:    2026-09-12 - E2-RV1 increment 5: D-port error response (access faults)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (I/D ports, MMIO via D-port decode),
 //              §6 (eth_axi / eth_dram_ctrl socket) · §8 checkpoint 5 ·
@@ -74,6 +88,9 @@
 //              state. `mem_*` is a straight pass-through of the core's request
 //              (same values, same cycle) when the address is not a device, so
 //              inserting this module cannot change the memory path's behavior.
+//              Every request is answered in its own cycle: `ready_o` is high with
+//              or without `err_o`, so no address inside the page (or outside
+//              every region) can wedge the core's D port.
 module eth_rv_mmio_mux #(
     parameter logic [63:0] UART_BASE       = 64'h0000_0000_1000_0000,  // console page (Spike NS16550_BASE)
     parameter int unsigned UART_BIT_CYCLES = 16,                       // clk / baud (see eth_rv_uart)
@@ -88,8 +105,10 @@ module eth_rv_mmio_mux #(
     input  logic [63:0] addr_i,
     input  logic [63:0] wdata_i,
     input  logic [7:0]  wstrb_i,
+    input  logic [1:0]  size_i,     // eth_rv_pkg::mem_size_e of the access
     output logic        ready_o,
     output logic [63:0] rdata_o,
+    output logic        err_o,      // with ready_o: the access is an ERROR response
 
     // ---- system memory master (DRAM socket / behavioral memory) ----
     output logic        mem_req_o,
@@ -99,6 +118,7 @@ module eth_rv_mmio_mux #(
     output logic [7:0]  mem_wstrb_o,
     input  logic        mem_ready_i,
     input  logic [63:0] mem_rdata_i,
+    input  logic        mem_err_i,  // with mem_ready_i: the memory side faulted
 
     // ---- console UART line + verification status ----
     output logic        uart_tx_o,
@@ -107,19 +127,26 @@ module eth_rv_mmio_mux #(
 );
 
     logic       page_sel;   // access inside the UART page
-    logic       reg_hit;    // ... and inside its byte register file
+    logic       page_byte;  // ... and narrow enough for its byte register file
     logic [2:0] reg_off;
     logic       uart_sel;
     logic       uart_ready;
     logic [7:0] uart_rdata;
 
-    assign page_sel = req_i && (addr_i[63:12] == UART_BASE[63:12]);
-    assign reg_off  = addr_i[2:0];
-    assign reg_hit  = (addr_i[11:3] == 9'd0);
-    assign uart_sel = page_sel && reg_hit;
+    // `reg_off = addr_i[2:0]` is the whole of the peripheral's address decode:
+    // every offset inside the 4 KiB page aliases onto one of the eight byte
+    // registers, exactly like Spike's ns16550 (`addr >>= reg_shift; addr &= 7`).
+    assign page_sel  = req_i && (addr_i[63:12] == UART_BASE[63:12]);
+    assign page_byte = (size_i == 2'd0);          // eth_rv_pkg::SZ_BYTE
+    assign reg_off   = addr_i[2:0];
+    assign uart_sel  = page_sel && page_byte;
 
-    assign ready_o = uart_sel ? uart_ready : mem_ready_i;
+    // In-page accesses are always accepted — with `err_o` when the width is one
+    // the byte register file cannot serve, which is Spike's `reg_io_width != len`
+    // rejection turned into the architectural access fault.
+    assign ready_o = page_sel ? (page_byte ? uart_ready : 1'b1) : mem_ready_i;
     assign rdata_o = uart_sel ? {8{uart_rdata}} : mem_rdata_i;
+    assign err_o   = (page_sel && !page_byte) || (mem_req_o && mem_err_i);
 
     // The memory path sees the core's request verbatim, except that a device
     // access never reaches it (see why in the header).

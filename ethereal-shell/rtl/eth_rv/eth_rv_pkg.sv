@@ -112,12 +112,23 @@ package eth_rv_pkg;
     // (interrupts are not implemented yet, so bit 63 is always clear). The
     // codes double as the core's error-strobe codes: `err_o` is the valid
     // strobe, so CAUSE_INSN_MISALIGN = 0 is distinguishable from "no trap".
+    //
+    // The three ACCESS faults (1/5/7) are the port error responses: a memory
+    // port answers an access the platform cannot serve (no device claims the
+    // address, a device rejects it, or the bus returns DECERR/SLVERR) by
+    // raising `*_err_i` on the cycle it accepts the beat, and the core turns
+    // that into the architectural trap Spike raises for the same access.
+    // `mtval` is always the access address, exactly like Spike's
+    // `trap_{instruction,load,store}_access_fault(virt, addr, 0, 0)`.
     typedef enum logic [3:0] {
         CAUSE_INSN_MISALIGN  = 4'd0,   // instruction address misaligned
+        CAUSE_INSN_ACCESS    = 4'd1,   // instruction access fault (fetch of an unmapped address)
         CAUSE_ILLEGAL        = 4'd2,   // illegal / unimplemented instruction
         CAUSE_BREAKPOINT     = 4'd3,   // ebreak
         CAUSE_LOAD_MISALIGN  = 4'd4,   // load address misaligned
+        CAUSE_LOAD_ACCESS    = 4'd5,   // load access fault (unmapped / rejected / DECERR)
         CAUSE_STORE_MISALIGN = 4'd6,   // store address misaligned
+        CAUSE_STORE_ACCESS   = 4'd7,   // store access fault (unmapped / rejected / DECERR)
         CAUSE_ECALL_M        = 4'd11   // ecall from M-mode
     } trap_cause_e;
 

@@ -56,8 +56,13 @@
 //                  it reads zero. `mstatus`/`mie`/`mtvec`/`mepc` implement the
 //                  architectural write masks (WARL), and an access to any CSR
 //                  number outside the set is an illegal instruction.
-//                * Traps: illegal instruction, ebreak, ecall, and load/store
-//                  address misaligned. The trapping instruction does NOT commit;
+//                * Traps: illegal instruction, ebreak, ecall, load/store address
+//                  misaligned, and the three ACCESS faults (instruction/load/
+//                  store, `mcause` 1/5/7) raised by a port error response — an
+//                  address no device claims, a device that rejects the access,
+//                  or a DECERR/SLVERR bus response. Every one of them carries
+//                  Spike's `mtval`: the access address (the faulting fetch pc for
+//                  cause 1). The trapping instruction does NOT commit;
 //                  `mepc`/`mcause`/`mtval` are written, `mstatus.MPIE <= MIE`,
 //                  `mstatus.MIE <= 0`, `mstatus.MPP <= M`, and the front-end
 //                  redirects to `mtvec & ~1` (mtvec MODE is preserved as data;
@@ -74,24 +79,39 @@
 //              adapter):
 //                I port: `imem_req_o` + `imem_addr_o` (16-bit-aligned PC);
 //                        `imem_ready_i` marks the cycle in which `imem_rdata_i`
-//                        carries the four bytes at that address.
+//                        carries the four bytes at that address, and
+//                        `imem_err_i` — sampled on that same cycle — marks the
+//                        fetch as unservable: the data is void and the
+//                        instruction raises `CAUSE_INSN_ACCESS` at its own pc
+//                        (the fetch of an unmapped address, exactly Spike's
+//                        `trap_instruction_access_fault`). It is never decoded.
 //                D port: `dmem_req_o` + `dmem_addr_o` + `dmem_we_o` +
-//                        `dmem_wstrb_o`/`dmem_wdata_o`; the bus is a **64-bit
-//                        aligned beat**, i.e. exactly the AXI4 data-channel
-//                        shape: `dmem_rdata_i` is the eight bytes at
+//                        `dmem_wstrb_o`/`dmem_wdata_o` + `dmem_size_o`; the bus is
+//                        a **64-bit aligned beat**, i.e. exactly the AXI4
+//                        data-channel shape: `dmem_rdata_i` is the eight bytes at
 //                        `dmem_addr_o & ~7`, and a write stores
 //                        `dmem_wdata_o[8*lane +: 8]` at `(dmem_addr_o & ~7) + lane`
 //                        for every lane `dmem_wstrb_o` marks. `dmem_ready_i` marks
 //                        the cycle the beat is taken; the request is held until
-//                        then. A transfer that one aligned beat cannot serve
-//                        (misaligned halfword/word/dword) is NOT issued and
-//                        raises the core error strobe instead.
+//                        then. `dmem_err_i`, sampled with `dmem_ready_i`, marks
+//                        the beat as an error response: the bytes are void, the
+//                        access raises `CAUSE_LOAD_ACCESS`/`CAUSE_STORE_ACCESS`
+//                        with `mtval` = `dmem_addr_o`, and nothing is written to
+//                        the register file or to memory. A transfer that one
+//                        aligned beat cannot serve (misaligned halfword/word/
+//                        dword) is NOT issued and raises the misaligned trap
+//                        instead. `dmem_size_o` carries the access's byte count
+//                        (`eth_rv_pkg::mem_size_e`) so a byte-register device can
+//                        reject a width it does not serve.
 //                Both ports must tolerate a dropped request before ready (a
 //                redirect or an error abandons an in-flight fetch) and are
 //                idempotent, which is what a following AXI4 adapter needs anyway.
+//                An error response NEVER becomes a silent success and never a
+//                wedge: `dmem_ready_i` and `dmem_err_i` arrive in the same cycle
+//                and the pipeline traps on that beat.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
-// Modified:    2026-09-12 - initial RV-B v0 slice (E2-RV1)
+// Modified:    2026-09-12 - E2-RV1 increment 5: D/I-port error responses (access faults)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §3 (5-stage pipeline, forwarding,
 //              static prediction), §4 (I/D/RVFI port contract), §5 (DiffTest integration)
@@ -111,6 +131,7 @@ module eth_rv_core (
     output logic [63:0] imem_addr_o,
     input  logic        imem_ready_i,
     input  logic [31:0] imem_rdata_i,
+    input  logic        imem_err_i,      // with imem_ready_i: this fetch faulted
 
     // ---- data port ----
     output logic        dmem_req_o,
@@ -118,8 +139,10 @@ module eth_rv_core (
     output logic [63:0] dmem_addr_o,
     output logic [63:0] dmem_wdata_o,
     output logic [7:0]  dmem_wstrb_o,
+    output logic [1:0]  dmem_size_o,     // eth_rv_pkg::mem_size_e: the access's byte count
     input  logic        dmem_ready_i,
     input  logic [63:0] dmem_rdata_i,
+    input  logic        dmem_err_i,      // with dmem_ready_i: this access faulted
 
     // ---- RVFI-style commit trace (C14 §4) ----
     output logic        rvfi_valid_o,
@@ -167,9 +190,16 @@ module eth_rv_core (
     logic [31:0] fetch_insn;
     logic [63:0] fetch_pred_pc;
     logic        fetch_hit;
+    logic        fetch_fault;   // this fetch was answered with an error response
 
     assign fetch_is_c = (imem_rdata_i[1:0] != 2'b11);
     assign fetch_insn = fetch_is_c ? {16'd0, imem_rdata_i[15:0]} : imem_rdata_i;
+    // The fetch port reports an error with its accept (same cycle as
+    // `imem_ready_i`), meaning the platform has no instruction at that address.
+    // The bytes on `imem_rdata_i` are void, so the encoding is NOT decoded: the
+    // fetch-fault marker travels down the pipe instead and raises the
+    // architectural instruction access fault in EX (see `ex_fault_r`).
+    assign fetch_fault = fetch_hit && imem_err_i;
 
     ctrl_t       dec_ctrl;
     logic [4:0]  dec_rd;
@@ -208,6 +238,7 @@ module eth_rv_core (
     logic [31:0] id_insn_r;
     logic        id_is_c_r;
     logic [63:0] id_pred_r;
+    logic        id_fault_r;    // this instruction's fetch was answered with an error
     ctrl_t       id_ctrl_r;
     logic [4:0]  id_rd_r;
     logic [4:0]  id_rs1_r;
@@ -228,6 +259,7 @@ module eth_rv_core (
     logic [31:0] ex_insn_r;
     logic        ex_is_c_r;
     logic [63:0] ex_pred_r;
+    logic        ex_fault_r;    // this instruction's fetch was answered with an error
     ctrl_t       ex_ctrl_r;
     logic [4:0]  ex_rd_r;
     logic [4:0]  ex_rs1_r;
@@ -283,6 +315,7 @@ module eth_rv_core (
     logic [63:0] ex_next_pc;
     logic        ex_target_misaligned;
     logic        mem_misaligned;
+    logic        mem_access_err;
     logic        ex_trap;        // instruction-side exception, taken in EX
     logic        mem_trap;       // data-side exception, taken in MEM
     logic        trap_hit;
@@ -300,6 +333,15 @@ module eth_rv_core (
     assign mem_wait = mem_valid_r && !mem_ctrl_r.illegal
                       && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned
                       && !dmem_ready_i;
+    // A port ERROR RESPONSE is a trap too, and for the same reason: the beat is
+    // accepted (`dmem_ready_i`) and the error arrives with it, so nothing waits.
+    // An error beat means the platform cannot serve the access — an unmapped
+    // address, a device that rejects it, or a DECERR/SLVERR bus response — and
+    // the architectural answer is Spike's `trap_{load,store}_access_fault` with
+    // `mtval` = the access address. Never a silent success, never a wedge.
+    assign mem_access_err = mem_valid_r && !mem_ctrl_r.illegal
+                            && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned
+                            && dmem_ready_i && dmem_err_i;
     assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_load
                       && (ex_rd_r != 5'd0) && id_valid_r
                       && ((ex_rd_r == id_rs1_r) || (ex_rd_r == id_rs2_r));
@@ -308,24 +350,34 @@ module eth_rv_core (
 
     // ---- exception detection -------------------------------------------
     // Instruction-side exceptions are recognised in EX: an unimplemented
-    // encoding, ecall/ebreak, or a control transfer to an odd address. That last
-    // one is structurally unreachable while IALIGN = 16 and JALR clears bit 0 —
-    // it is kept so a future IALIGN = 32 config (or a JALR that stopped masking)
-    // cannot silently fetch from a misaligned address.
+    // encoding, ecall/ebreak, a control transfer to an odd address, or a fetch
+    // the instruction port answered with an error (`ex_fault_r`, the same class
+    // as a data-side error response — see `mem_access_err`). The misaligned
+    // target check is structurally unreachable while IALIGN = 16 and JALR clears
+    // bit 0 — it is kept so a future IALIGN = 32 config (or a JALR that stopped
+    // masking) cannot silently fetch from a misaligned address.
     // Data-side exceptions are recognised in MEM. The older fault wins: MEM is
     // architecturally ahead of EX, so a misaligned data access is taken even when
     // the instruction behind it also faults.
-    assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal && ex_next_pc[0];
+    // A fetch-faulted instruction was never decoded (`ex_ctrl_r` is zeroed for
+    // it), so the fault marker — not the (void) fetched bytes — decides. It still
+    // needs `!ex_stall`, exactly like every other EX-side trap: the trap is taken
+    // in the first cycle the instruction can leave EX.
+    assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal && !ex_fault_r && ex_next_pc[0];
     assign ex_trap = ex_valid_r && !ex_stall
-                     && (ex_ctrl_r.illegal || ex_ctrl_r.is_ecall || ex_ctrl_r.is_ebreak
-                         || ex_target_misaligned);
-    assign mem_trap = mem_misaligned;
+                     && (ex_fault_r || ex_ctrl_r.illegal || ex_ctrl_r.is_ecall
+                         || ex_ctrl_r.is_ebreak || ex_target_misaligned);
+    assign mem_trap = mem_misaligned || mem_access_err;
     assign trap_hit = mem_trap || ex_trap;
     assign trap_pc   = mem_trap ? mem_pc_r   : ex_pc_r;
     assign trap_insn = mem_trap ? mem_insn_r : ex_insn_r;
 
     always_comb begin
-        if (ex_ctrl_r.is_ecall) begin
+        // The fetch fault is checked first: a faulted fetch carries no valid
+        // encoding, so nothing else about it may be interpreted.
+        if (ex_fault_r) begin
+            ex_cause = eth_rv_pkg::CAUSE_INSN_ACCESS;
+        end else if (ex_ctrl_r.is_ecall) begin
             ex_cause = eth_rv_pkg::CAUSE_ECALL_M;
         end else if (ex_ctrl_r.is_ebreak) begin
             ex_cause = eth_rv_pkg::CAUSE_BREAKPOINT;
@@ -337,9 +389,12 @@ module eth_rv_core (
     end
 
     always_comb begin
-        // mtval: the misaligned target (fetch), the pc (breakpoint), zero (ecall)
-        // or the offending instruction word (illegal) — Spike's exact choices.
-        if (ex_ctrl_r.is_ebreak) begin
+        // mtval: the faulting fetch address (access fault), the misaligned target
+        // (fetch), the pc (breakpoint), zero (ecall) or the offending instruction
+        // word (illegal) — Spike's exact choices.
+        if (ex_fault_r) begin
+            ex_trap_value = ex_pc_r;
+        end else if (ex_ctrl_r.is_ebreak) begin
             ex_trap_value = ex_pc_r;
         end else if (ex_target_misaligned) begin
             ex_trap_value = ex_next_pc;
@@ -350,10 +405,16 @@ module eth_rv_core (
         end
     end
 
-    assign trap_cause = mem_trap
+    // The MEM-side cause tells the two trap classes apart: misaligned (4/6) is
+    // decided before the access is issued, an access fault (5/7) is the port's
+    // error response to the issued access. Both report `mtval` = the address.
+    assign trap_cause = mem_misaligned
                         ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_MISALIGN
                                                : eth_rv_pkg::CAUSE_LOAD_MISALIGN)
-                        : ex_cause;
+                        : mem_access_err
+                          ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_ACCESS
+                                                 : eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                          : ex_cause;
     assign trap_mtval = mem_trap ? mem_addr_r : ex_trap_value;
     // Exceptions always go to the direct base, exactly like Spike — mtvec MODE is
     // kept as a data bit but only interrupts would vector, and RV-B has none.
@@ -452,10 +513,11 @@ module eth_rv_core (
 
     // "did the fetched-path assumption hold?" — one condition for every
     // instruction class, so no control transfer can escape the flush. A trapping
-    // instruction must not redirect to its own (possibly misaligned) target: the
-    // trap machinery owns the PC in that cycle.
-    assign ex_redirect = ex_valid_r && !ex_ctrl_r.illegal && !ex_target_misaligned
-                         && (ex_next_pc != ex_pred_r);
+    // instruction must not redirect to its own (possibly misaligned) target, and
+    // a fetch-faulted instruction has no meaningful target at all: the trap
+    // machinery owns the PC in that cycle.
+    assign ex_redirect = ex_valid_r && !ex_ctrl_r.illegal && !ex_fault_r
+                         && !ex_target_misaligned && (ex_next_pc != ex_pred_r);
 
     // ---- writeback value before the memory access ----
     always_comb begin
@@ -575,6 +637,10 @@ module eth_rv_core (
     assign dmem_addr_o  = mem_addr_r;
     assign dmem_wdata_o = mem_ctrl_r.is_store ? lsu_wdata : 64'd0;
     assign dmem_wstrb_o = mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
+    // The access size describes the access, not the beat: it is what lets a
+    // byte-register peripheral (the console UART) reject an access it cannot
+    // serve, exactly as Spike's ns16550 rejects `len != reg_io_width`.
+    assign dmem_size_o  = mem_ctrl_r.mem_size;
 
     // =====================================================================
     // WB stage / commit + trace
@@ -703,6 +769,7 @@ module eth_rv_core (
             id_insn_r  <= 32'd0;
             id_is_c_r  <= 1'b0;
             id_pred_r  <= 64'd0;
+            id_fault_r <= 1'b0;
             id_ctrl_r  <= '0;
             id_rd_r    <= 5'd0;
             id_rs1_r   <= 5'd0;
@@ -719,7 +786,10 @@ module eth_rv_core (
                 id_insn_r <= fetch_insn;
                 id_is_c_r <= fetch_is_c;
                 id_pred_r <= fetch_pred_pc;
-                id_ctrl_r <= dec_ctrl;
+                id_fault_r <= fetch_fault;
+                // a faulted fetch has no encoding to decode: the control word is
+                // zeroed so the fault marker alone decides what happens in EX
+                id_ctrl_r <= fetch_fault ? '0 : dec_ctrl;
                 id_rd_r   <= dec_rd;
                 id_rs1_r  <= dec_rs1;
                 id_rs2_r  <= dec_rs2;
@@ -736,6 +806,7 @@ module eth_rv_core (
             ex_insn_r     <= 32'd0;
             ex_is_c_r     <= 1'b0;
             ex_pred_r     <= 64'd0;
+            ex_fault_r    <= 1'b0;
             ex_ctrl_r     <= '0;
             ex_rd_r       <= 5'd0;
             ex_rs1_r      <= 5'd0;
@@ -761,6 +832,7 @@ module eth_rv_core (
                     ex_insn_r    <= id_insn_r;
                     ex_is_c_r    <= id_is_c_r;
                     ex_pred_r    <= id_pred_r;
+                    ex_fault_r   <= id_fault_r;
                     ex_ctrl_r    <= id_ctrl_r;
                     ex_rd_r      <= id_rd_r;
                     ex_rs1_r     <= id_rs1_r;
@@ -1044,6 +1116,37 @@ module eth_rv_core (
             // ---- P7: a record never reports a write to x0 --------------------
             assert(!rvfi_rd_we_o || (rvfi_valid_o && (rvfi_rd_addr_o != 5'd0)));
 
+            // ---- P8: an error response never retires --------------------------
+            // A D-port beat answered with an error is an access fault: the
+            // instruction cannot commit (no trace record) and the trap machinery
+            // is what reports it, with the access address in `mtval`. That is the
+            // "no silent success on an unmapped or rejected access" half of the
+            // port contract, stated over the free I/D-port environment.
+            if ($past(mem_access_err)) begin
+                assert(!rvfi_valid_o);
+                assert($past(trap_hit));
+                assert(($past(trap_cause) == eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                       || ($past(trap_cause) == eth_rv_pkg::CAUSE_STORE_ACCESS));
+                assert($past(trap_mtval) == $past(dmem_addr_o));
+            end
+            // The instruction side of the same rule: a fetch the port answered
+            // with an error never enters MEM (so it can never be committed) and
+            // is reported as an instruction access fault at its own pc. Two
+            // guards keep the statement about THIS trap: the payload registers of
+            // a flushed EX slot keep their old value (only `ex_valid_r` gates
+            // them, the convention everywhere in this file), so the slot must be
+            // one EX actually holds; and an older MEM-side fault outranks it —
+            // then the reported trap is the data one, which is what the design
+            // says must happen.
+            if ($past(ex_valid_r) && $past(ex_fault_r) && !$past(ex_stall)
+                && !$past(mem_trap)) begin
+                assert(!mem_valid_r);
+                assert($past(ex_trap));
+                assert($past(trap_hit));
+                assert($past(trap_cause) == eth_rv_pkg::CAUSE_INSN_ACCESS);
+                assert($past(trap_mtval) == $past(ex_pc_r));
+            end
+
             // ---- covers: witness the scenarios the safety proof speaks about -
             cover(rvfi_valid_o);
             cover(rvfi_valid_o && rvfi_rd_we_o);
@@ -1056,6 +1159,10 @@ module eth_rv_core (
             cover(ex_redirect);
             cover(mem_wait);
             cover(rvfi_order_o == 64'd8);
+            cover(mem_access_err);
+            cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_LOAD_ACCESS));
+            cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_STORE_ACCESS));
+            cover(ex_valid_r && ex_fault_r && !ex_stall);
         end
     end
 `endif

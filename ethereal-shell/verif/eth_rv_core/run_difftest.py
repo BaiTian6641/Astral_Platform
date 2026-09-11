@@ -17,7 +17,8 @@ Pipeline per corpus ELF (C14 §5):
 5. for the console (C14 §8 checkpoint 5): the testbench decodes the SoC UART's
    serial line at its own divisor and writes what it received to ``+uart=<file>``;
    every program is held to its `EXPECTED_UART` payload — `cor_hello` to its
-   string, every other program to an idle line.
+   string, every other program to an idle line (`cor_fault` included: its
+   rejected stores must never reach the transmit register).
 
 Exit status: ``0`` when every requested ELF MATCHes and every console payload is
 the expected one (and, for ``--fault``/``--uart-fault``, when the injected fault
@@ -25,7 +26,7 @@ is caught), ``1`` otherwise, ``2`` on a setup/toolchain error.
 
 Examples::
 
-    # all seven corpus programs
+    # all eight corpus programs
     python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --all
 
     # one program, with a one-cycle-latency memory (exercises the stall path)
@@ -94,6 +95,7 @@ CORPUS_PROGRAMS = [
     "cor_csr",
     "cor_trap",
     "cor_hello",
+    "cor_fault",
 ]
 
 HELLO_STRING = b"hello, eth_rv!\n"
@@ -107,7 +109,9 @@ so the program and the assertion cannot drift apart."""
 EXPECTED_UART: dict[str, bytes] = {"cor_hello": HELLO_STRING}
 """Expected console output per corpus program: only `hello` uses the UART, and
 the other programs must leave the line completely idle (a stray device access
-would show up here as bytes nobody asked for)."""
+would show up here as bytes nobody asked for). `cor_fault` writes a byte to the
+UART's scratch register, so a line that is NOT idle there means a non-byte store
+was transmitted instead of rejected."""
 
 UART_RECORD_PATTERN = re.compile(
     r"^# eth_rv uart rx v1\n"

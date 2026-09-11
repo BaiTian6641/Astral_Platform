@@ -27,7 +27,15 @@
 #       trace reports;
 #   P6  D-port write discipline: no write with a zero mask, the write mask is a
 #       subset of the addressed beat, and a read never writes;
-#   P7  a record never reports an architectural write to x0.
+#   P7  a record never reports an architectural write to x0;
+#
+#   P8  a port ERROR RESPONSE is an access fault and never a retirement: a D-port
+#       beat answered with `dmem_err_i` produces no trace record and is reported
+#       with mcause 5/7 and mtval = the access address, and a fetch answered with
+#       `imem_err_i` never enters MEM at all and is reported with mcause 1 at its
+#       own pc. Stated over the free port environment, this is the "no silent
+#       success on an unmapped or rejected access" half of the port contract that
+#       the `cor_fault` corpus program drives end to end.
 #
 # Every property is a transition relation over (previous state, current state,
 # inputs) plus one-cycle `$past` lookbacks on registered signals, so the proof
@@ -38,8 +46,10 @@
 # depends on.  Liveness (the core always retires something) is out of scope.
 #
 # The cover task witnesses retirements (with and without a register write, loads,
-# stores, a full-beat store), both trap classes, a mispredict redirect and a
-# stalled D-port access, so the safety proof is non-vacuous.
+# stores, a full-beat store), both trap classes of the pre-increment set, a
+# mispredict redirect, a stalled D-port access, and the three access faults
+# (a D-port error beat, a load fault, a store fault, a faulted fetch), so the
+# safety proof is non-vacuous.
 #
 # Run:  sby -f eth_rv_core.sby     (picked up by `make formal`)
 [tasks]

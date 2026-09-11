@@ -72,7 +72,7 @@ Spike is installed elsewhere, point the harness at it with `--spike PATH` or
 | `rv_dut.py` | DUT adapters (`dump:` / `model:` / `callback:`) + fault injection |
 | `rv_model.py` | Worked-example DUT: RV64IMC interpreter (RV64I + M + integer C subset) |
 | `rv_difftest.py` | CLI + comparator: first divergence with pc/rd/cycle, exit codes |
-| `corpus/` | Bare-metal RV64IMC corpus: `crt0.S`, `link.ld`, seven `cor_*.S` programs, builder |
+| `corpus/` | Bare-metal RV64IMC corpus: `crt0.S`, `link.ld`, eight `cor_*.S` programs, builder |
 | `tests/` | pytest suite; `tests/fixtures/` holds the checked-in golden fixtures |
 
 ## The trace protocol
@@ -194,7 +194,7 @@ produce, memory stream included.
 
 ## Corpus
 
-Seven self-checking bare-metal programs (`-march=rv64imc_zicsr -mabi=lp64 -nostdlib
+Eight self-checking bare-metal programs (`-march=rv64imc_zicsr -mabi=lp64 -nostdlib
 -mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
 `corpus/crt0.S`):
 
@@ -207,6 +207,7 @@ Seven self-checking bare-metal programs (`-march=rv64imc_zicsr -mabi=lp64 -nostd
 | `cor_trap.S` | the exception path: `ecall`, compressed/32-bit `ebreak`, illegal (32-bit + compressed), misaligned load/store (all widths + a compressed store), unimplemented CSR numbers, `mstatus` bookkeeping, trap-aborts-the-access, a MODE=1 `mtvec` |
 | `cor_model.S` | the C forms the example DUT implements — source of the checked-in fixtures |
 | `cor_hello.S` | the C14 §8 checkpoint 5 bring-up vehicle: polls the SoC UART's line-status register and writes a known string to its transmit register at `0x1000_0000`, then exits via HTIF — see "Console" below |
+| `cor_fault.S` | the port error responses (E2-RV1 increment 5): access faults on addresses no region claims (loads *and* stores, incl. a 64-bit address above the AXI window), on a non-byte access to the one-byte-wide console page, and on a fetch outside mapped memory; plus the console page's byte-offset *aliasing* (the offsets that used to wedge) — see "Port error responses" below |
 
 `main` returns 0 on success or the index of the first failed check; `crt0.S`
 turns that into the HTIF exit store, so a corpus bug shows up as a non-zero
@@ -240,7 +241,7 @@ same `0x1000_0000` page Spike's own `ns16550` answers on). The testbench
 asserts the result:
 
 ```bash
-PATH="$HOME/oss-cad-suite/bin:$PATH" make verif-rv-rtl          # all seven programs
+PATH="$HOME/oss-cad-suite/bin:$PATH" make verif-rv-rtl          # all eight programs
 python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_hello
 # -> [rv-rtl] cor_hello: UART 15 bytes 'hello, eth_rv!\n' — 15 frames of 160 cycles
 #            (16-cycle bit cell), gap 160..160, 0 frame error(s)
@@ -273,10 +274,113 @@ string and every other program must leave the line completely idle.
 
 Not implemented on purpose, and the reason: the receiver, the `FCR` FIFO-clear
 bits and `MCR` loopback — each is unobservable in Spike's model for a program
-that only transmits (`rx_queue` stays empty unless the program enables the FIFO,
-and `lsr` stays `0x60`), so a transmit-only console mirrors the golden byte for
-byte. A program that read `RBR`, wrote `FCR.FIFO_ENABLE` or enabled loopback
-would leave that equivalence, and is out of scope until the RX path exists.
+that only transmits (`rx_queue` stays empty unless the program pushes to it, and
+`lsr` stays `0x60`), so a transmit-only console mirrors the golden byte for byte.
+Reading `RBR` with an empty queue is equivalent and is exercised (`cor_fault.S`
+reads the aliased offset `0x1000_0010`, and both sides return 0 — the read's only
+side effect is clearing `LSR.DR`, which is already clear, and no interrupt is
+implemented to observe it). What stays out of scope until the RX path exists is a
+program that enables the FIFO (`FCR`) or loopback (`MCR.LOOP`, which in Spike
+pushes the written byte into `rx_queue`, so a later read would return it).
+
+## Port error responses (E2-RV1 increment 5)
+
+Nothing may hang on an access the platform cannot serve, and nothing may succeed
+silently either. Every request on the core's two memory ports is therefore
+answered **in the cycle it is made**, and when the access cannot be served the
+answer is an *error response*: `eth_rv_core` samples `imem_err_i` with
+`imem_ready_i` (a fetch) and `dmem_err_i` with `dmem_ready_i` (a data access), and
+turns the pair into the architectural trap Spike raises for the same access:
+
+| access | `mcause` | `mtval` |
+|---|---|---|
+| fetch of an address no region claims | 1 (instruction access fault) | the fetch address (`mepc` is the same value) |
+| load the port cannot serve | 5 (load access fault) | the access address |
+| store the port cannot serve | 7 (store access fault) | the access address |
+
+The trapping instruction does not commit — no trace record, no register write,
+for a store no bus transaction — which is exactly Spike's behaviour (it logs the
+exception instead of a commit line), so the two streams still agree.
+
+**What "cannot be served" means, per the golden model** (Spike was run on the
+specific addresses before the RTL was written, not the other way round):
+
+* an address no device and no memory claims — Spike's `bus_t` finds nothing for
+  `0x2000_0000`/`0x4000_0000` (`mmio_load`/`mmio_fetch` return false) — including
+  a 64-bit address above the D port's AXI window (`0x1_8000_0000`), which
+  `eth_rv_axi_master` answers here and now instead of truncating the address into
+  a valid window (a truncated address could land inside the DRAM socket and
+  quietly succeed);
+* inside the console page (`0x1000_0000`, 4 KiB): **a non-byte access**. Spike's
+  `ns16550_t::load/store` return false when `reg_io_width != len`, and the width
+  check also subsumes its page-crossing rejection (`addr + len > PGSIZE`). The
+  RTL knows the access width from the core's `dmem_size_o`, which
+  `eth_rv_mmio_mux.sv` checks;
+* a read or write response the bus did not complete — the DRAM socket's `DECERR`
+  for an address outside its window — reported per transaction by
+  `eth_rv_axi_master.dmem_err_o`. An erroring read burst never validates the
+  master's one-line read cache either, so a poisoned line cannot serve wrong
+  bytes to the following sequential loads.
+
+**The previous increment's note was wrong about one thing, and this is where the
+correction lives**: an *unimplemented* offset inside the claimed console page
+(`0x1000_0008`..`0x1000_0FFF`) is **not** an access fault in Spike. Its device
+does `addr &= 7`, so every page offset aliases onto one of the eight byte
+registers — `0x1000_000F` is the scratch register and `0x1000_0010` the receiver.
+The RTL now aliases identically (a byte access anywhere in the page is answered),
+and `cor_fault.S` checks both directions of that: the scratch register written at
+`0x1000_0007` reads back at `0x1000_000F`, and `0x1000_0010` reads the (empty)
+receiver. Those two offsets are also the regression control for the old wedge:
+the D port used to answer neither.
+
+**Wedge guard.** The testbench FAILs any port request that stays unanswered for
+`PORT_STARVE_CYCLES` (4096) cycles, naming the address — much tighter than the
+cycle budget, and asserted inside every run (the `PASS` line reports the longest
+port wait actually seen: 0 cycles on the beat build, ≤ 13 on the AXI build,
+where it is a real read-burst latency).
+
+**Negative controls** (all sim-only, none of them reachable from the corpus):
+
+| control | what it proves | evidence |
+|---|---|---|
+| `+starve_dmem=1` withholds the acknowledge for an out-of-window access — the old wedge, reproduced on purpose | the wedge guard is live | `ETH_RV_TB: FAIL the D port never answered the access at 0x0000000020000000 (4097 cycles, we=0) — wedge`, exit 1 |
+| `+no_dmem_err=1` drops the error response, so an unservable access looks successful | the error response is load-bearing: the DUT then retires the access and the DiffTest catches it | `DIVERGENCE (pc_mismatch) at commit #20 (cycle 21)` — golden (Spike) is in the trap handler at `0x80000218`, the DUT still committing the faulting `ld` at `0x80000058` |
+| `--fault INDEX:FIELD=VALUE` (the runner's standard control) | the comparator is live on the new program too | `--only cor_fault --fault 12:value=0xdeadbeef` → caught at commit #12 |
+
+To run the first two by hand (the runner drives the trace comparison, these drive
+only the testbench):
+
+```bash
+TB=generated/rv_difftest/rtl/obj_beat_lat0/Veth_rv_tb     # built by make verif-rv-rtl
+$TB +mem=generated/rv_difftest/rtl/cor_fault.mem.hex +trace=/tmp/w.trace \
+    +base=0x80000000 +tohost=0x80001000 +starve_dmem=1     # -> FAIL … wedge
+$TB +mem=generated/rv_difftest/rtl/cor_fault.mem.hex +trace=/tmp/s.trace \
+    +base=0x80000000 +tohost=0x80001000 +no_dmem_err=1     # -> PASS, but the trace diverges
+python3 ethereal-shell/verif/eth_rv/rv_difftest.py --elf generated/rv_difftest/corpus/cor_fault.elf \
+    --dut dump:/tmp/s.trace                                # -> DIVERGENCE at commit #20
+```
+
+### Known deviations from Spike's map (reported, not papered over)
+
+These are address ranges where the two models deliberately differ, none of them
+touched by the corpus:
+
+* **The RTL's mapped memory is smaller than Spike's DRAM.** Spike's DRAM is
+  2048 MiB at `0x8000_0000`; the DUT's socket window is its implemented memory
+  (`MEM_BYTES`: 1 MiB on the AXI build, 256 KiB of behavioral beats on the other),
+  so an access to e.g. `0x8010_0000` *succeeds* under Spike (it reads the
+  uninitialized DRAM as zero — verified with the probe program this increment used
+  as the oracle) and is an access fault on the RTL. A program must stay inside the
+  socket window; closing the difference properly means configuring the golden's
+  memory to the socket's (`spike -m0x80000000:0x40000`), a harness change this
+  increment's scope excludes.
+* **No boot ROM, no CLINT/PLIC.** Spike's ROM page (`0x1000`), its CLINT
+  (`0x0200_0000`) and its PLIC (`0x0c00_0000`) answer accesses; the RTL has none
+  of them, so an access there faults. A *fetch* from the UART page faults on both
+  sides (the 4-byte fetch is a width the ns16550 rejects).
+* **`eth_rv_axi_master.axi_err_o`** (sticky, SoC observability) still reports
+  every non-OKAY response, including the ones that are now legitimate access
+  faults; the testbench only FAILs on it if no access-fault trap was taken.
 
 ## Tests and fixtures
 
@@ -346,12 +450,17 @@ error.
 * **The console UART is transmit-only, byte-register, and mirrored to Spike's
   model.** `LSR`/`IIR`/`MSR` are the ns16550 values Spike's own device returns
   (`0x60`, `0xC1`/`0xC2`, `0xD0`); the receiver, the `FCR` clear bits and `MCR`
-  loopback are not implemented (see "Console" above). The corpus therefore uses
-  byte accesses to offsets 0..7 only.
-* **No D-port error response yet.** An access to an unimplemented offset inside
-  the claimed UART page is not acknowledged (the D port wedges and the testbench's
-  cycle budget reports the pc) rather than diverging from Spike silently; a
-  bus-error exception arrives with the AXI error-response increment.
+  loopback are not implemented (see "Console" above). The corpus therefore only
+  ever uses byte accesses to the page (a wider one is an access fault; any page
+  offset aliases onto register 0..7 — see "Port error responses").
+* **Port error responses are in** (see "Port error responses"): an unservable
+  access is an access fault (mcause 1/5/7, mtval = the address) on both ports, the
+  console page rejects widths it cannot serve and aliases its byte offsets the way
+  Spike's device does, and both the wedge guard and the two negative controls
+  above are asserted in every run. What is still open is the *address map*: the
+  RTL implements fewer regions than Spike's model (no ROM, no CLINT/PLIC, and a
+  smaller DRAM window) — the deliberate deviations are listed at the end of that
+  section.
 * **Single hart, no MMU, no atomics/floating point** in the model; clock-domain
   and reset behaviour are out of scope for a commit diff.
 * **Not a lockstep co-sim yet.** This is a post-hoc commit diff (the standard
@@ -372,7 +481,7 @@ python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_di
 
 The root `Makefile` carries both halves already: `make verif-rv` (build the corpus +
 run this suite) and `make verif-rv-rtl` (run the corpus on the Verilated RTL — all
-seven programs, both D-port builds with `--dram`, and the console assertion). The
+eight programs, both D-port builds with `--dram`, and the console assertion). The
 corpus step needs `riscv64-unknown-elf-gcc`, the RTL step needs Verilator, and the
 tests self-skip when a tool is missing.
 
