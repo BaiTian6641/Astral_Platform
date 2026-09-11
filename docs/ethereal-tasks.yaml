@@ -617,7 +617,7 @@ tasks:
     est_days: 180
     deliverable: ethereal-shell/rtl/eth_rv/ + AXI4 socket wrapper + core.yaml 描述符
     acceptance: spike 锁步比对零分歧跑 bare-metal hello；iverilog/verilator 可仿真
-    status: todo   # 2026-09-12 分阶段: 前置 E2-RV0 **已完成**（Spike + 锁步比对 + 4 ELF 语料 + 121 pytest，`make verif-rv`）；RTL 本体 180 人日量级，需先补 component 级规范（`ethereal-plan/components/` 目前**无 eth_rv 对应 Cxx**），按 S15 §2.2 分阶段（RV-B 起点）；工具链：riscv64-unknown-elf 13.2.0 为 RV64 但**无 rv64imc multilib**（`-nostdlib` 下不影响，语料已证明可用；C 扩展在 rv64imac 库中）
+    status: todo   # 2026-09-12: 两个前置均已就绪 —— **E2-RV0**（Spike 锁步载体，done）与 **`ethereal-plan/components/C14-eth_rv-RV64核心.md`**（本次新写的 HDL 级组件规范：冻结参数包/5 级微架构/I·D 端口/AXI 与 CLINT·PLIC/RVFI 轨迹口契约/DiffTest 集成规则/RV-B 六项验收检查点）。RV-B 实现（RV64IMC 无 MMU，DiffTest 零分歧 + UART hello）可分片开工；工具链：riscv64-unknown-elf 13.2.0 为 RV64 但**无 rv64imc multilib**（`-nostdlib` 下不影响，语料已验证；需要 libc 时用 rv64imac 库）
 
   - id: E2-RV2
     title: eth_rv Stage RV-C（RV64GC + Sv39 MMU → GW5 单核验证 profile，boot Linux）
