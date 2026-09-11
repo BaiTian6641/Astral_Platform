@@ -608,7 +608,7 @@ tasks:
     est_days: 5
     deliverable: ethereal-shell/verif/eth_rv/（Spike 构建于 generated/ + rv_difftest CLI + DUT 适配器 + ≥3 个 RV64IMC bare-metal ELF + pytest）
     acceptance: 零分歧 PASS/注入分歧定位首个 pc/cycle FAIL 双路径可复现
-    status: in_progress   # 2026-09-12: S15 §2.2「验证 >> RTL —— 第一天就上 DiffTest」的载体先行；网络可达（github 可 clone）故 Spike 可构建；本任务不含 eth_rv RTL
+    status: done   # 2026-09-12: 载体落地 `ethereal-shell/verif/eth_rv/`（README + rv_trace/rv_image/rv_spike/rv_dut/rv_model/rv_difftest + corpus 4 个自检 RV64IMC ELF + 121 pytest）。Spike 1.1.1-dev 构建于 generated/（commit 1e05ddac）+ dtc 1.8.1（Spike 运行时 shell-out，缺则无法启动 ELF）。验收双路径：corpus 4 程序 **MATCH 221/169/105/116 commits，0 分歧 exit 0**；`--inject 12:value=0xdeadbeef` → 精确定位首个分歧（pc/cycle/rd）exit 1；畸形输入 exit 2。`make verif-rv` 已加入（corpus 构建 + 121 passed）。差分环自身抓出 5 个真实缺陷（C.J imm bit5、mulh 高半字、c.addi16sp 位映射、hex 字节序、语料自检）→ 工具有效性证据。遗留增量：内存访问比对（Spike mem 日志已在 Commit 留字段）、CSR/trap 流（RV-C 需要）、实时锁步 stepper
 
   - id: E2-RV1
     title: eth_rv Stage RV-B（RV64IMC 顺序 5-6 级，bare-metal/FreeRTOS，DiffTest vs Spike）
@@ -617,7 +617,7 @@ tasks:
     est_days: 180
     deliverable: ethereal-shell/rtl/eth_rv/ + AXI4 socket wrapper + core.yaml 描述符
     acceptance: spike 锁步比对零分歧跑 bare-metal hello；iverilog/verilator 可仿真
-    status: todo   # 2026-09-12 分阶段: 前置 = E2-RV0（DiffTest 载体，进行中）；RTL 本体 180 人日量级，需先补 component 级规范（`ethereal-plan/components/` 目前**无 eth_rv 对应 Cxx**），按 S15 §2.2 分阶段（RV-B 起点）推进；本环境 riscv64-unknown-elf 工具链在位（RV32 已验证，RV64 多库需在 RV0 中确认）
+    status: todo   # 2026-09-12 分阶段: 前置 E2-RV0 **已完成**（Spike + 锁步比对 + 4 ELF 语料 + 121 pytest，`make verif-rv`）；RTL 本体 180 人日量级，需先补 component 级规范（`ethereal-plan/components/` 目前**无 eth_rv 对应 Cxx**），按 S15 §2.2 分阶段（RV-B 起点）；工具链：riscv64-unknown-elf 13.2.0 为 RV64 但**无 rv64imc multilib**（`-nostdlib` 下不影响，语料已证明可用；C 扩展在 rv64imac 库中）
 
   - id: E2-RV2
     title: eth_rv Stage RV-C（RV64GC + Sv39 MMU → GW5 单核验证 profile，boot Linux）
@@ -708,7 +708,7 @@ tasks:
     est_days: 5
     deliverable: tools/registry/
     acceptance: push/pull/版本管理可用
-    status: todo
+    status: done   # 2026-09-12: `ethereal-tools/tools/oci_registry.py`（LayoutStore + 最小 RegistryClient，Store Protocol 抽象；`python -m oci_registry` CLI）+ 48 pytest + `ethctl push/pull` 子命令（S08/S09 承诺的命令面）。映射：layer = `.eth` tar（`application/vnd.ethereal.image.v1+tar`）；config = 清单摘要（`…config.v1+json`，含 manifest_digest/成员摘要/签名指纹/artifact 描述符，并设 artifactType）；tag = index 条目（`ref.name` + `io.ethereal.image.name`）。信任：签名仍由 `ethimg.verify` 校验（pull 时按调用方策略，默认 strict）——无 OCI 专属信任通路。完整性顺序：blob 摘要+尺寸 → config↔layer 匹配 → tar 成员摘要 + manifest_digest → 身份/指纹匹配；目标经 `.part` + `os.replace` 仅在全部通过后落地。证据：48+65 pytest、ruff 干净；假 registry（线程内 HTTP）往返/404/篡改/传输错误；篡改用例覆盖 layer/manifest/全量重摘要图/嫁接 config/身份谎言。边界：RegistryClient 最小化（真实 GHCR/Harbor 还需 token 握手、分块上传、cross-repo mount、referrers、TLS/重试、skopeo/oras 互操作 —— 见 notes）；v1 假设每镜像恰好 1 个 .eth layer（第二个 layer 报错不忽略）
 
   - id: E3-PUB1
     title: 论文投稿（FPL/FCCM/TRETS）

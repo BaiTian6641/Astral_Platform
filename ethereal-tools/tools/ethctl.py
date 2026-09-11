@@ -43,6 +43,7 @@ if _SECURITY_DIR not in sys.path:
 # pi-lens-ignore: E402
 import efp_client
 import ethimg
+import oci_registry
 from emri_constants import (
     EFP_REGION_AUTO,
     OCC_BLANK,
@@ -591,6 +592,22 @@ def _cli(argv: list[str] | None = None) -> int:
     sp_restart.add_argument("--allow-unsigned", action="store_true")
     sp_restart.add_argument("--pubkey", action="append", default=[])
     sp_abort = sub.add_parser("abort", help="best-effort BLANK -> IDLE (efp)")
+    # OCI artifact transport (S09 sec 2.3, E3-REP1): push/pull a .eth image to an
+    # OCI layout or registry. No EMRI transport involved (pure host-side I/O).
+    sp_push = sub.add_parser("push", help="upload a .eth image to an OCI store")
+    sp_push.add_argument("eth", help=".eth logic image")
+    sp_push.add_argument("ref", help="<repository>:<tag> (default tag 'latest')")
+    sp_push.add_argument("--pubkey", action="append", default=[],
+                         help="trusted PEM pubkey (required for a signed image)")
+    sp_pull = sub.add_parser("pull", help="download + verify an image from an OCI store")
+    sp_pull.add_argument("ref", help="<repository>:<tag> or <repository>@<digest>")
+    sp_pull.add_argument("dest", help="output .eth path (or a directory)")
+    sp_pull.add_argument("--pubkey", action="append", default=[])
+    sp_pull.add_argument("--allow-unsigned", action="store_true")
+    for spx in (sp_push, sp_pull):
+        spx.add_argument("--layout", help="local OCI layout directory")
+        spx.add_argument("--registry", help="OCI registry base URL (overrides --layout)")
+        spx.add_argument("--authorization", help="raw Authorization header for --registry")
 
     # allow the transport flags AFTER the subcommand too
     # (`ethctl run img.eth --transport efp --emit-session s.json`)
@@ -600,6 +617,40 @@ def _cli(argv: list[str] | None = None) -> int:
         spx.add_argument("--emit-session", default=argparse.SUPPRESS)
 
     args = p.parse_args(argv)
+    if args.cmd in ("push", "pull"):
+        # OCI artifact transport (S09 sec 2.3, E3-REP1) — host-side I/O only, so
+        # it short-circuits before any EMRI transport/daemon is built.
+        try:
+            store = oci_registry.store_for(
+                layout=args.layout,
+                registry=args.registry,
+                authorization=args.authorization,
+            )
+            keys = [Path(k).read_bytes() for k in args.pubkey] or None
+            if args.cmd == "push":
+                pushed = oci_registry.push(
+                    store, args.ref, Path(args.eth), trusted_pubkeys=keys
+                )
+                print(
+                    f"pushed {pushed.ref} (manifest {pushed.descriptor.digest}, "
+                    f"signed={pushed.signed})"
+                )
+            else:
+                pulled = oci_registry.pull(
+                    store,
+                    args.ref,
+                    Path(args.dest),
+                    trusted_pubkeys=keys,
+                    allow_unsigned=args.allow_unsigned,
+                )
+                print(
+                    f"pulled {pulled.ref} -> {pulled.path} "
+                    f"({pulled.name} v{pulled.version}, target {pulled.target})"
+                )
+            return 0
+        except (oci_registry.OciError, ethimg.EthimgError) as e:
+            print(f"ethctl: error: {e}", file=sys.stderr)
+            return 1
     if args.transport == "efp":
         try:
             return _cli_efp(args)
