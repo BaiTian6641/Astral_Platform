@@ -17,12 +17,17 @@
 //                       lanes, so a downstream memory just stores
 //                       `wdata_o[8*lane +: 8]` at `(addr_o & ~7) + lane`.
 //
+//              `wstrb_o`/`rmask_o` are the same mask rotated to the access
+//              offset — the RVFI byte-lane convention (lanes of the window at
+//              `addr_o & ~7`), which is also what the commit trace reports.
+//
 //              `misaligned_o` flags a transfer that a single aligned beat cannot
 //              serve (a halfword at an odd address, a word crossing the window,
-//              …). The core turns that into its error strobe: the RV-B v0 slice
-//              has no misaligned-access path, and silently splitting or
-//              truncating such an access is exactly the "retired but wrong"
-//              failure mode the trace contract exists to prevent.
+//              …). The core turns that into a load/store address-misaligned trap
+//              (mcause 4/6, mtval = the address), which is exactly what Spike
+//              does for an unaligned access: splitting or truncating it silently
+//              is the "retired but wrong" failure mode the trace contract exists
+//              to prevent.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
 // Tags:        RTL, SYNTH
@@ -39,6 +44,7 @@ module cor_lsu (
     output logic [eth_rv_pkg::XLEN-1:0] load_data_o,
     output logic [eth_rv_pkg::XLEN-1:0] wdata_o,
     output logic [7:0]                  wstrb_o,
+    output logic [7:0]                  rmask_o,      // lanes this access reads
     output logic                        misaligned_o
 );
 
@@ -93,7 +99,10 @@ module cor_lsu (
     end
 
     assign load_data_o = load_ext;
+    // Both masks are in the RVFI convention: byte lanes of the 8-byte-aligned
+    // window at `addr & ~7`, i.e. the size mask rotated to the access offset.
     assign wstrb_o     = lane_mask << byte_off_i;
+    assign rmask_o     = lane_mask << byte_off_i;
     assign wdata_o     = store_data_i << {byte_off_i, 3'b000};
 
 endmodule

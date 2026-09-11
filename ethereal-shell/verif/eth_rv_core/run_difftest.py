@@ -9,9 +9,11 @@ Pipeline per corpus ELF (C14 §5):
 2. flatten it into the ``$readmemh`` image the testbench consumes
    (``tb_eth_rv_core.sv``),
 3. build/run the Verilator ``--binary --timing`` model, which dumps one
-   ``cycle pc rd value`` line per retired instruction,
+   ``cycle pc rd value`` line per retired instruction plus the optional
+   ``mem_addr mem_wdata mem_rmask mem_wmask`` suffix (C14 §5.2),
 4. hand that dump to ``rv_difftest.py --dut dump:...`` for comparison against the
-   Spike golden stream, and propagate its verdict.
+   Spike golden stream — pc/rd/value *and* the memory stream — and propagate its
+   verdict.
 
 Exit status: ``0`` when every requested ELF MATCHes (and, for ``--fault``, when the
 injected fault is caught at the expected commit), ``1`` otherwise, ``2`` on a
@@ -62,7 +64,7 @@ RTL_SOURCES = [
 ]
 TB_SOURCE = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv_core" / "tb_eth_rv_core.sv"
 
-CORPUS_PROGRAMS = ["cor_alu", "cor_mem", "cor_muldiv", "cor_model"]
+CORPUS_PROGRAMS = ["cor_alu", "cor_mem", "cor_muldiv", "cor_model", "cor_csr", "cor_trap"]
 
 DIVERGE_RE = re.compile(r"DIVERGENCE \((\w+)\) at commit #(\d+) \(cycle (\d+)\)")
 
@@ -225,10 +227,18 @@ def run_rtl(
 
 
 def parse_fault(spec: str) -> tuple[int, str, int]:
-    """``INDEX:FIELD=VALUE`` -> ``(index, field, value)`` (same shape as --inject)."""
-    match = re.fullmatch(r"(\d+):(pc|rd|value)=(0x[0-9a-fA-F]+|\d+)", spec.strip())
+    """``INDEX:FIELD=VALUE`` -> ``(index, field, value)`` (same shape as --inject).
+
+    ``mem_addr``/``mem_wdata`` corrupt the memory stream the trace reports, which
+    is the negative control for the memory comparison (C14 §5.2).
+    """
+    match = re.fullmatch(
+        r"(\d+):(pc|rd|value|mem_addr|mem_wdata)=(0x[0-9a-fA-F]+|\d+)", spec.strip()
+    )
     if match is None:
-        raise SetupError(f"--fault wants INDEX:{{pc,rd,value}}=VALUE, got {spec!r}")
+        raise SetupError(
+            f"--fault wants INDEX:{{pc,rd,value,mem_addr,mem_wdata}}=VALUE, got {spec!r}"
+        )
     return int(match.group(1)), match.group(2), int(match.group(3), 0)
 
 
@@ -261,7 +271,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fault",
         default=None,
-        help="negative control: INDEX:{pc,rd,value}=VALUE corrupts one trace record",
+        help=(
+            "negative control: INDEX:{pc,rd,value,mem_addr,mem_wdata}=VALUE corrupts one "
+            "trace record (the mem_* fields exercise the memory comparison)"
+        ),
     )
     parser.add_argument("--rebuild", action="store_true", help="force a Verilator rebuild")
     parser.add_argument("--quiet", action="store_true", help="only print the harness verdicts")

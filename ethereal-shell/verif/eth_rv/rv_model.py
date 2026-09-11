@@ -26,6 +26,7 @@ Spike uses, so both traces end on the same instruction.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 from rv_image import Image, load_image
@@ -48,6 +49,27 @@ class ModelError(RuntimeError):
 
 class UnsupportedInstruction(ModelError):
     """The interpreter met an instruction outside its documented subset."""
+
+
+def _lane_mask(size: int, addr: int) -> int:
+    """Byte lanes of the 8-byte-aligned window at ``addr & ~7`` covered by ``size`` bytes."""
+    return ((1 << size) - 1) << (addr & 0b111)
+
+
+def _with_mem_access(commit: Commit, mem: tuple[int, int, int | None] | None) -> Commit:
+    """Attach one memory access to a commit, or return it unchanged.
+
+    ``mem`` is ``(addr, size, store data or None)`` for the instruction the model
+    just executed. The masks use the RVFI lane convention (lanes of the window at
+    ``addr & ~7``); a load marks ``rmask``, a store ``wmask``.
+    """
+    if mem is None:
+        return commit
+    addr, size, data = mem
+    mask = _lane_mask(size, addr)
+    if data is None:
+        return replace(commit, mem_addr=addr, mem_rmask=mask, mem_wmask=0)
+    return replace(commit, mem_addr=addr, mem_wdata=data, mem_rmask=0, mem_wmask=mask)
 
 
 def _sext(value: int, bits: int) -> int:
@@ -125,6 +147,8 @@ class Rv64ImcModel:
         self.cycle = 0
         self.halt_reason: str | None = None
         self._halt = False
+        self._mem: tuple[int, int, int | None] | None = None
+        """``(addr, size, store data or None)`` of the instruction being executed."""
         for addr, data in image.segments:
             self.mem.load(addr, data)
         self.mem.write(image.tohost, 8, 0)
@@ -132,7 +156,14 @@ class Rv64ImcModel:
     # -- execution ---------------------------------------------------------
 
     def step(self) -> Commit:
-        """Execute one instruction and return its commit record."""
+        """Execute one instruction and return its commit record.
+
+        The commit carries the instruction's memory access when it has one
+        (C14 §5.2), in the same convention Spike's ``--log-commits`` uses: the
+        exact address, the store data truncated to the access size (unshifted),
+        and the byte-lane masks of the 8-byte-aligned window at ``addr & ~7``.
+        """
+        self._mem = None
         pc = self.pc
         half = self.mem.read(pc, 2)
         if half & 0b11 != 0b11:
@@ -149,7 +180,8 @@ class Rv64ImcModel:
                 self.x[rd] = value
         self.pc = next_pc
         self.cycle += 1
-        return Commit(cycle=self.cycle, pc=pc, rd=rd, value=value, insn=insn)
+        commit = Commit(cycle=self.cycle, pc=pc, rd=rd, value=value, insn=insn)
+        return _with_mem_access(commit, self._mem)
 
     def run(self) -> Iterator[Commit]:
         """Yield commits until the program's ``tohost`` store (HTIF exit)."""
@@ -174,10 +206,12 @@ class Rv64ImcModel:
     # -- memory helpers ----------------------------------------------------
 
     def _load(self, addr: int, size: int, signed: bool) -> int:
+        self._mem = (addr, size, None)
         value = self.mem.read(addr, size)
         return _sext(value, size * 8) if signed else value
 
     def _store(self, addr: int, size: int, value: int) -> None:
+        self._mem = (addr, size, value & ((1 << (size * 8)) - 1))
         self.mem.write(addr, size, value & ((1 << (size * 8)) - 1))
         tohost = self.image.tohost
         if tohost is not None and addr <= tohost < addr + size and self.mem.read(tohost, 8) != 0:

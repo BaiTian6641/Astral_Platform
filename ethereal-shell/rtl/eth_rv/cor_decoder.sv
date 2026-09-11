@@ -15,10 +15,12 @@
 //
 //              Coverage is the corpus subset: RV64I (LUI/AUIPC/JAL/JALR/branch/
 //              load/store/OP-IMM/OP-IMM-32/OP/OP-32, FENCE as a no-op), RV64M
-//              (all eight mul/div plus the four W forms) and the integer RV64C
-//              forms. SYSTEM (CSR/trap/ecall/ebreak/mret) decodes to illegal —
-//              the RV-B v0 slice has no trap path and must not retire such an
-//              instruction as a no-op.
+//              (all eight mul/div plus the four W forms), the integer RV64C
+//              forms and the M-mode SYSTEM subset (CSRRW/CSRRS/CSRRC + the
+//              immediate forms on the implemented CSRs, ecall, ebreak, mret).
+//              Any other SYSTEM encoding (wfi/sret/…) and any CSR number this
+//              core does not implement decodes to illegal — never to a no-op
+//              (C14 §3).
 //
 //              Immediate bit mappings were cross-checked field by field against
 //              the reference interpreter in the DiffTest harness (rv_model.py),
@@ -374,9 +376,43 @@ module cor_decoder (
                     ctrl_o.alu_a = eth_rv_pkg::OP_A_ZERO;
                     ctrl_o.alu_b = eth_rv_pkg::OP_B_IMM;
                 end
-                // SYSTEM: no trap path in RV-B v0 -> visible error, never a no-op
+                // SYSTEM (C14 §3): the M-mode trap/CSR instructions, and nothing
+                // else — wfi/sret/… are not in RV-B and must not become no-ops.
                 OP_SYSTEM: begin
-                    ctrl_o.illegal = 1'b1;
+                    if (funct3 == 3'b000) begin
+                        unique case (insn_i[31:20])
+                            12'h000: ctrl_o.is_ecall  = 1'b1;
+                            12'h001: ctrl_o.is_ebreak = 1'b1;
+                            12'h302: ctrl_o.is_mret   = 1'b1;
+                            default: ctrl_o.illegal   = 1'b1;
+                        endcase
+                    end else if (funct3[1:0] != 2'b00) begin
+                        // csrrw/csrrs/csrrc + the immediate (uimm) forms. The op
+                        // select is exactly funct3[1:0] (see csr_op_e).
+                        if (eth_rv_pkg::csr_implemented(insn_i[31:20])) begin
+                            ctrl_o.is_csr   = 1'b1;
+                            ctrl_o.csr_op   = eth_rv_pkg::csr_op_e'(funct3[1:0]);
+                            ctrl_o.csr_imm  = funct3[2];
+                            ctrl_o.csr_addr = insn_i[31:20];
+                            ctrl_o.rf_we    = 1'b1;   // rd may still be x0
+                            ctrl_o.alu_a    = eth_rv_pkg::OP_A_RS1;
+                            ctrl_o.alu_b    = eth_rv_pkg::OP_B_IMM;
+                            ctrl_o.wb_sel   = eth_rv_pkg::WB_CSR;
+                            rd_addr_o       = rd;
+                            if (funct3[2]) begin
+                                // immediate form: the uimm rides the immediate bus,
+                                // so no register read (and no false hazard) happens
+                                imm_o = {59'd0, rs1};
+                            end else begin
+                                rs1_addr_o = rs1;
+                            end
+                        end else begin
+                            // Unimplemented CSR number: illegal, never silent.
+                            ctrl_o.illegal = 1'b1;
+                        end
+                    end else begin
+                        ctrl_o.illegal = 1'b1;   // funct3 = 100 (reserved)
+                    end
                 end
                 default: begin
                     ctrl_o.illegal = 1'b1;
@@ -589,7 +625,9 @@ module cor_decoder (
                             if (insn_i[12] == 1'b1) begin
                                 if (c_rs2 == 5'd0) begin
                                     if (c_rd == 5'd0) begin
-                                        ctrl_o.illegal = 1'b1;   // C.EBREAK: no trap path
+                                        // C.EBREAK: the same breakpoint exception as the
+                                        // 32-bit encoding (a trap, never a no-op)
+                                        ctrl_o.is_ebreak = 1'b1;
                                     end else begin
                                         // C.JALR (link into x1)
                                         ctrl_o.rf_we       = 1'b1;

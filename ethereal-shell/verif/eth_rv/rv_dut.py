@@ -6,9 +6,12 @@ that can hand the harness an ordered stream of :class:`~rv_trace.Commit` records
 three adapters ship today, and selecting one is a CLI argument:
 
 ``--dut dump:PATH``
-    A trace file: either the canonical 4-field format, or a bare
+    A trace file: the canonical format (which may carry the optional
+    ``mem_addr``/``mem_wdata``[/``mem_rmask``/``mem_wmask``] suffix), or a bare
     ``pc rd value`` dump (cycle = line ordinal) as a Verilator testbench would
-    ``$fwrite`` it.
+    ``$fwrite`` it. A dump without the memory suffix is compared on pc/rd/value
+    alone, and the harness says so instead of pretending the memory stream
+    matched.
 ``--dut model:PATH``
     The worked-example Python DUT (:mod:`rv_model`) running an ELF or hex image.
 ``--dut callback:MODULE:FUNC``
@@ -16,17 +19,19 @@ three adapters ship today, and selecting one is a CLI argument:
     the in-process hook: a Verilator/cocotb testbench can import this module,
     build commits as it retires instructions, and let the harness diff them.
 
-The RTL testbench is expected to write one line per retired instruction with the
-*architectural* effects only (pc, rd, value) — the same contract Spike's
-``--log-commits`` satisfies — so no other change to the harness is needed when
-``eth_rv`` lands.
+The RTL testbench writes one line per retired instruction with the
+*architectural* effects: pc, rd, value and — since the memory-stream increment
+(C14 §5.2) — the D-port's access as the optional ``mem_addr mem_wdata rmask
+wmask`` suffix, in the same convention Spike's ``--log-commits`` uses. Emitting
+only the core fields stays legal; the harness then reports the memory stream as
+not provided.
 """
 from __future__ import annotations
 
 import importlib
 import sys
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -161,7 +166,20 @@ def load_dut(spec: str, *, path_dirs: Iterable[Path] = (), max_commits: int = 1_
 # Fault injection — harness self-test and demo aid
 # ---------------------------------------------------------------------------
 
-INJECTION_FIELDS = ("pc", "rd", "value", "cycle")
+INJECTION_FIELDS = (
+    "pc",
+    "rd",
+    "value",
+    "cycle",
+    "mem_addr",
+    "mem_wdata",
+    "mem_rmask",
+    "mem_wmask",
+)
+"""Fields :meth:`Injection.parse` accepts (every field a :class:`Commit` carries)."""
+
+MEM_MASK_FIELDS = ("mem_rmask", "mem_wmask")
+"""Injection fields that set one byte-lane mask (and clear the other)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +192,11 @@ class Injection:
 
     @staticmethod
     def parse(spec: str) -> Injection:
-        """Parse ``INDEX:FIELD=VALUE``; ``FIELD`` is pc/rd/value/cycle."""
+        """Parse ``INDEX:FIELD=VALUE``; ``FIELD`` is any field of a commit.
+
+        ``pc``/``value``/``cycle``/``mem_addr``/``mem_wdata`` take a number,
+        ``rd`` a register name, ``mem_rmask``/``mem_wmask`` an 8-bit mask.
+        """
         index_text, sep, rest = spec.partition(":")
         field, eq, value_text = rest.partition("=")
         if not sep or not eq:
@@ -208,9 +230,12 @@ def _parse_field_value(spec: str, field: str, text: str) -> int:
             )
         return rd
     try:
-        return int(token, 16) if token.startswith("0x") else int(token, 10)
+        value = int(token, 16) if token.startswith("0x") else int(token, 10)
     except ValueError:
         raise DutSpecError(f"--inject {spec!r}: {text!r} is not a number") from None
+    if field in MEM_MASK_FIELDS and not 0 <= value < 256:
+        raise DutSpecError(f"--inject {spec!r}: {text!r} is not an 8-bit byte-lane mask")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +267,11 @@ def apply_injection(commit: Commit, injection: Injection) -> Commit:
     """Return a copy of ``commit`` with one field replaced.
 
     Injecting ``rd`` onto a commit that wrote no register gives it a register
-    write (which is exactly the kind of DUT bug the harness must catch).
+    write (which is exactly the kind of DUT bug the harness must catch). Memory
+    fields behave the same way: injecting ``mem_addr`` onto a commit that
+    performs no memory access gives it a (phantom) access, and injecting a data
+    or mask field onto such a commit first invents an access at ``pc`` so the
+    corruption is always visible instead of silently doing nothing.
     """
     if injection.field == "pc":
         return commit.with_pc(injection.value)
@@ -251,7 +280,15 @@ def apply_injection(commit: Commit, injection: Injection) -> Commit:
     if injection.field == "rd":
         return commit.with_rd(injection.value)
     if injection.field == "cycle":
-        return Commit(
-            cycle=injection.value, pc=commit.pc, rd=commit.rd, value=commit.value, insn=commit.insn
-        )
+        return commit.with_cycle(injection.value)
+    if injection.field == "mem_addr":
+        return replace(commit, mem_addr=injection.value)
+    if commit.mem_addr is None:
+        commit = replace(commit, mem_addr=commit.pc)
+    if injection.field == "mem_wdata":
+        return replace(commit, mem_wdata=injection.value)
+    if injection.field == "mem_rmask":   # a read XOR a write (see Commit.with_mem_rmask)
+        return replace(commit, mem_rmask=injection.value, mem_wmask=None)
+    if injection.field == "mem_wmask":
+        return replace(commit, mem_wmask=injection.value, mem_rmask=None)
     raise DutSpecError(f"cannot inject field {injection.field!r}")  # pragma: no cover - parse guards

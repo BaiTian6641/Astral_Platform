@@ -6,8 +6,10 @@
 //              instantiates the core, serves its two v0 ports out of a
 //              zero-filled 256 KiB word array loaded from a $readmemh image, and
 //              writes one trace line per retired instruction in the harness's
-//              canonical `cycle pc rd value` format
-//              (ethereal-shell/verif/eth_rv/rv_trace.py). `cycle` is
+//              canonical format (ethereal-shell/verif/eth_rv/rv_trace.py):
+//              `cycle pc rd value` followed by the optional memory suffix
+//              `mem_addr mem_wdata mem_rmask mem_wmask` (C14 §5.2), with `-` for
+//              "no access" / "load" / "not this direction". `cycle` is
 //              `rvfi_order_o`, i.e. the retirement ordinal 1..N — exactly what
 //              the Spike golden stream numbers — so the comparator's default
 //              cycle check passes without `--no-cycle-check`.
@@ -24,15 +26,19 @@
 //              Termination mirrors the golden generator: the run ends at the
 //              commit whose store covers the HTIF `tohost` mailbox (crt0.S'
 //              final `sd`), so both streams stop at the same instruction. The
-//              run also ends — with a clearly labelled failure — on the core's
-//              error strobe (unimplemented encoding) or on a cycle budget.
+//              run also ends on a cycle budget, or when the core takes more
+//              traps than `+maxtraps` (a trap is a normal, handled event now —
+//              the corpus exercises them on purpose — but a trap loop must not
+//              run forever).
 //
-//              `+fault_index=N +fault_field=<pc|rd|value> +fault_value=<hex>`
-//              deliberately corrupts one emitted trace record, where N is a
-//              0-based commit index (the same convention as the harness's own
-//              `--inject INDEX:FIELD=VALUE`). That is the negative control for
-//              the DiffTest vehicle: it must show up as a divergence at exactly
-//              that commit.
+//              `+fault_index=N +fault_field=<pc|rd|value|mem_addr|mem_wdata>`
+//              `+fault_value=<hex>` deliberately corrupts one emitted trace
+//              record, where N is a 0-based commit index (the same convention as
+//              the harness's own `--inject INDEX:FIELD=VALUE`). That is the
+//              negative control for the DiffTest vehicle: it must show up as a
+//              divergence at exactly that commit — including for the memory
+//              stream, which is how the memory comparison itself is proven to be
+//              live rather than decorative.
 //
 //              The PASS line also reports what the trace carried — committed
 //              instructions, how many were compressed, and the load/store
@@ -67,6 +73,7 @@ module tb_eth_rv_core;
     logic [63:0] tohost_addr;
     int unsigned mem_lat;
     int unsigned max_cycles;
+    int unsigned max_traps;
     int unsigned fault_index;
     logic [63:0] fault_value;
 
@@ -244,6 +251,8 @@ module tb_eth_rv_core;
     int unsigned n_compressed;
     int unsigned n_loads;
     int unsigned n_stores;
+    int unsigned traps;
+    logic [3:0]  last_trap_cause;
     logic [63:0] last_mem_addr;
     logic [63:0] last_store_data;
     logic [31:0] last_insn;
@@ -259,12 +268,22 @@ module tb_eth_rv_core;
     logic [63:0] f_pc;
     logic [4:0]  f_rd;
     logic [63:0] f_value;
+    logic [63:0] f_mem_addr;
+    logic [63:0] f_mem_wdata;
+    logic        f_mem_valid;
+    logic [7:0]  f_mem_rmask;
+    logic [7:0]  f_mem_wmask;
 
     always_comb begin
-        f_we    = rvfi_rd_we;
-        f_pc    = rvfi_pc;
-        f_rd    = rvfi_rd_addr;
-        f_value = rvfi_rd_wdata;
+        f_we        = rvfi_rd_we;
+        f_pc        = rvfi_pc;
+        f_rd        = rvfi_rd_addr;
+        f_value     = rvfi_rd_wdata;
+        f_mem_valid = rvfi_mem_valid;
+        f_mem_addr  = rvfi_mem_addr;
+        f_mem_wdata = rvfi_mem_wdata;
+        f_mem_rmask = rvfi_mem_rmask;
+        f_mem_wmask = rvfi_mem_wmask;
         if (commits == fault_index) begin
             if (fault_field == "pc") begin
                 f_pc = fault_value;
@@ -277,6 +296,23 @@ module tb_eth_rv_core;
                 f_rd    = fault_value[4:0];
                 f_value = rvfi_rd_we ? rvfi_rd_wdata : 64'd0;
             end
+            // The memory-stream negative control: corrupt the address or the store
+            // data this commit reports. A fault on a commit without an access
+            // invents one, exactly like `rd` invents a register write, so the
+            // corruption is always visible.
+            if (fault_field == "mem_addr") begin
+                f_mem_valid = 1'b1;
+                f_mem_addr  = fault_value;
+                f_mem_rmask = rvfi_mem_valid ? rvfi_mem_rmask : 8'd0;
+                f_mem_wmask = rvfi_mem_valid ? rvfi_mem_wmask : 8'd0;
+            end
+            if (fault_field == "mem_wdata") begin
+                f_mem_valid = 1'b1;
+                f_mem_wdata = fault_value;
+                // keep a legal mask: report it as a write when the commit has none
+                f_mem_wmask = (rvfi_mem_wmask != 8'd0) ? rvfi_mem_wmask
+                            : (rvfi_mem_rmask != 8'd0) ? 8'd0 : 8'd1;
+            end
         end
     end
 
@@ -286,6 +322,8 @@ module tb_eth_rv_core;
             n_compressed    <= 0;
             n_loads         <= 0;
             n_stores        <= 0;
+            traps           <= 0;
+            last_trap_cause <= 4'd0;
             last_mem_addr   <= 64'd0;
             last_store_data <= 64'd0;
             last_insn       <= 32'd0;
@@ -312,12 +350,27 @@ module tb_eth_rv_core;
                     end
                 end
 
+                // Always the 8-field form: this dump is the memory-aware side of
+                // the DiffTest, so every commit states whether it touched memory
+                // (`-` address) and which bytes it read/wrote (masks `-` is
+                // reserved for "not reported", which this testbench never needs).
                 if (f_we) begin
-                    $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x\n", rvfi_order,
+                    $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x ", rvfi_order,
                             f_pc, f_rd, f_value);
                 end else begin
-                    $fwrite(trace_fd, "%0d 0x%016x - -\n", rvfi_order,
+                    $fwrite(trace_fd, "%0d 0x%016x - - ", rvfi_order,
                             f_pc);
+                end
+                if (f_mem_valid) begin
+                    if (f_mem_wmask != 8'd0) begin
+                        $fwrite(trace_fd, "0x%016x 0x%016x - 0x%02x\n",
+                                f_mem_addr, f_mem_wdata, f_mem_wmask);
+                    end else begin
+                        $fwrite(trace_fd, "0x%016x - 0x%02x -\n",
+                                f_mem_addr, f_mem_rmask);
+                    end
+                end else begin
+                    $fwrite(trace_fd, "- - - -\n");
                 end
 
                 // HTIF exit: the store that covers `tohost` is the last commit
@@ -328,10 +381,14 @@ module tb_eth_rv_core;
             end
 
             if (core_err && !stop_now) begin
-                failed   <= 1'b1;
-                stop_now <= 1'b1;
-                $display("ETH_RV_TB: FAIL core error (0=ok 1=illegal 2=misaligned) pc=0x%016x insn=0x%08x code=%0d",
-                         core_err_pc, core_err_insn, core_err_code);
+                traps    <= traps + 1;
+                last_trap_cause <= core_err_code;
+                if (traps >= max_traps) begin
+                    failed   <= 1'b1;
+                    stop_now <= 1'b1;
+                    $display("ETH_RV_TB: FAIL trap budget exceeded (%0d traps, last mcause=%0d pc=0x%016x insn=0x%08x)",
+                             traps + 1, core_err_code, core_err_pc, core_err_insn);
+                end
             end else if ((cycle_cnt > max_cycles) && !stop_now) begin
                 failed   <= 1'b1;
                 stop_now <= 1'b1;
@@ -347,6 +404,7 @@ module tb_eth_rv_core;
         tohost_addr  = 64'h0000_0000_8000_0000;
         mem_lat      = 0;
         max_cycles   = 200_000;
+        max_traps    = 64;
         fault_index  = 0;
         fault_value  = 64'd0;
         fault_field  = "none";
@@ -360,6 +418,7 @@ module tb_eth_rv_core;
         void'($value$plusargs("tohost=%h", tohost_addr));
         void'($value$plusargs("memlat=%d", mem_lat));
         void'($value$plusargs("max_cycles=%d", max_cycles));
+        void'($value$plusargs("max_traps=%d", max_traps));
         void'($value$plusargs("fault_index=%d", fault_index));
         void'($value$plusargs("fault_value=%h", fault_value));
         void'($value$plusargs("fault_field=%s", fault_field));
@@ -383,7 +442,7 @@ module tb_eth_rv_core;
         end
         $fwrite(trace_fd, "# rv_difftest trace v1\n");
         $fwrite(trace_fd, "# generator: eth_rv_core rtl (eth_rv_core.sv RV-B v0)\n");
-        $fwrite(trace_fd, "# fields: cycle pc rd value\n");
+        $fwrite(trace_fd, "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]\n");
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
@@ -397,9 +456,9 @@ module tb_eth_rv_core;
                      commits, cycle_cnt);
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, last mem 0x%016x <- 0x%016x, last insn 0x%08x",
-                 commits, n_compressed, cycle_cnt, n_loads, n_stores, last_mem_addr,
-                 last_store_data, last_insn);
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (last mcause=%0d), last mem 0x%016x <- 0x%016x, last insn 0x%08x",
+                 commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
+                 last_trap_cause, last_mem_addr, last_store_data, last_insn);
         $finish;
     end
 

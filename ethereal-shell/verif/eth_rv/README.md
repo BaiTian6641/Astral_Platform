@@ -14,7 +14,7 @@ vehicle.
 ```
 Spike ──(--log-commits)──► rv_spike ──normalize──┐
                                                  ├─► rv_difftest ──► MATCH / first DIVERGENCE
-DUT ──(dump file | callback | model)──► rv_dut ──┘                    (pc / rd / cycle, exit code)
+DUT ──(dump file | callback | model)──► rv_dut ──┘   (pc / rd / value / memory, exit code)
 ```
 
 ## Quick start
@@ -82,10 +82,12 @@ One retired instruction per line, in the order the core retires them:
 ```
 # rv_difftest trace v1
 # generator: spike[rv64imc] cor_model.elf (Spike RISC-V ISA Simulator 1.1.1-dev)
-# fields: cycle pc rd value
+# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]
 1 0x0000000080000000 x2 0x000000008000a000
 2 0x0000000080000004 x2 0x000000008000a000
 3 0x0000000080000008 -  -
+64 0x00000000800000ee - - 0x0000000080009fe0 0x0000000080000010
+70 0x00000000800000fa x1 0x0000000080000010 0x0000000080009fe0 -
 ```
 
 * `cycle` — commit ordinal. Spike is not cycle-accurate, so the golden stream
@@ -98,6 +100,23 @@ One retired instruction per line, in the order the core retires them:
   `jal x0`, …). Writes to `x0` are dropped: RISC-V hard-wires it, and Spike does
   not log them either.
 * `value` — 64-bit value written to `rd`, `-` when `rd` is `-`.
+* the optional **memory suffix** (C14 §5.2): 6 fields add `mem_addr mem_wdata`
+  and 8 fields add the two byte-lane masks. `mem_addr` is the exact byte address
+  of the retired instruction's load/store, `mem_wdata` the store data in the
+  golden model's convention (the low `size` bytes of the stored register,
+  *unshifted* — exactly what Spike prints), and the masks are the byte lanes the
+  access reads/writes **relative to the 8-byte-aligned window at
+  `mem_addr & ~7`** (the RVFI convention). `-` in `mem_addr` means "this commit
+  performs no memory access"; `-` in `mem_wdata` means "load"; `-` in a mask
+  means "not reported".
+
+The memory suffix is optional and variable-width, and so is the comparison: a
+stream with no memory information at all (a 4-field dump) is still compared on
+`pc`/`rd`/`value`, and the run then reports the memory stream as **not provided**
+rather than silently passing it. Spike has no mask field, so a golden stream
+never carries masks; a DUT that reports them gets them cross-checked against the
+golden's load/store direction and for internal consistency (a mask must be a
+contiguous run of lanes starting at `addr[2:0]`).
 
 A DUT may also emit the lenient 3-field form `pc rd value` (cycle = line
 ordinal) — that is what a Verilator testbench `$fwrite` naturally produces.
@@ -105,9 +124,11 @@ Lines are `#`-commented; blank lines are ignored. Anything else fails loudly wit
 `<source>:<line>: <message>` and exit code 2 — a malformed DUT dump never turns
 into a silent "short trace".
 
-The comparator checks, per commit: `cycle` (optional), `pc`, `rd`, `value`, in
-that order, and reports the **first** divergence. `insn` is carried along when
-the producer knows it (Spike does) purely for debugging.
+The comparator checks, per commit: `cycle` (optional), `pc`, `rd`, `value` and
+then the memory stream (`mem_addr`, `mem_wdata`, mask direction/consistency), and
+reports the **first** divergence with kind, commit index, cycle, pc and register.
+`insn` is carried along when the producer knows it (Spike does) purely for
+debugging.
 
 ## Golden side: Spike
 
@@ -115,6 +136,10 @@ the producer knows it (Spike does) purely for debugging.
 `spike --isa=rv64imc -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
 Two details matter and are handled for you:
 
+* **A trapping instruction is not committed.** Spike logs the exception
+  (`core 0: exception trap_…, epc …`) instead of a commit line, so a trapping
+  instruction appears in neither stream — the DUT must take the trap without
+  emitting a trace record, which is what `eth_rv_core` does.
 * **Spike's boot ROM is not the DUT.** Spike executes a debug ROM at `0x1000`
   (`auipc`/`csrr mhartid`/`ld`/`jr`) before jumping to the ELF entry; the golden
   stream starts at the first commit whose pc equals the ELF entry point.
@@ -136,12 +161,15 @@ Three adapters, one contract: an ordered iterator of commits.
    per retirement; the harness diffs it. Nothing else is required:
 
    ```systemverilog
-   // in the eth_rv testbench: pc, rd, value of the committed instruction
+   // in the eth_rv testbench: pc, rd, value and the D-port access
    always @(posedge clk) if (commit_valid_r)
-     $fwrite(trace_fd, "%0d 0x%016x %s 0x%016x\n", cycle_r, pc_r, rd_r, wdata_r);
+     $fwrite(trace_fd, "%0d 0x%016x %s 0x%016x 0x%016x 0x%016x - 0x%02x\n",
+             cycle_r, pc_r, rd_r, wdata_r, mem_addr_r, mem_wdata_r, mem_wmask_r);
    ```
 
-   Canonical 4-field lines are preferred; `pc rd value` (3 fields) is accepted.
+   Canonical 4-field lines are preferred; `pc rd value` (3 fields) is accepted,
+   and so is the memory suffix (`ethereal-shell/verif/eth_rv_core/tb_eth_rv_core.sv`
+   is the reference producer: it always emits the 8-field form).
 2. **In-process callback — `--dut callback:MODULE:FUNC`.** `FUNC()` returns an
    iterable of `rv_trace.Commit` objects or trace-line strings; `MODULE` is
    imported with `--dut-path DIR` prepended to `sys.path`. This is the zero-I/O
@@ -154,9 +182,10 @@ Three adapters, one contract: an ordered iterator of commits.
    and the first-divergence path are exercised by real runs *today*; treat it as
    the template for the RTL adapter, not as a permanent second core.
 
-`--inject INDEX:FIELD=VALUE` corrupts one field of one DUT commit
-(`pc`/`rd`/`value`/`cycle`) — a demo/self-test switch that proves the harness
-detects the class of bug the RTL will eventually produce.
+`--inject INDEX:FIELD=VALUE` corrupts one field of one DUT commit (`pc`/`rd`/
+`value`/`cycle`/`mem_addr`/`mem_wdata`/`mem_rmask`/`mem_wmask`) — a demo/self-test
+switch that proves the harness detects the class of bug the RTL will eventually
+produce, memory stream included.
 
 ## Corpus
 
@@ -169,6 +198,8 @@ Four self-checking bare-metal programs (`-march=rv64imc -mabi=lp64 -nostdlib
 | `cor_alu.S` | RV64I ALU/shift/compare/branch, identity cross-checks, C-extension ALU forms |
 | `cor_mem.S` | all load/store widths, sign/zero extension, little-endian order, loops, stack |
 | `cor_muldiv.S` | RV64M incl. high halves, div-by-zero, `INT64_MIN / -1`, W-forms |
+| `cor_csr.S` | M-mode CSR read/write semantics: `mhartid`, `mscratch` (all three op forms + immediate), `misa` (read-only), `mie` (mask), `mip` (access legality), `mtvec` (MODE kept), `mepc` (bit 0 RO), `mcause`/`mtval`, `mstatus` (write mask) |
+| `cor_trap.S` | the exception path: `ecall`, compressed/32-bit `ebreak`, illegal (32-bit + compressed), misaligned load/store (all widths + a compressed store), unimplemented CSR numbers, `mstatus` bookkeeping, trap-aborts-the-access, a MODE=1 `mtvec` |
 | `cor_model.S` | the C forms the example DUT implements — source of the checked-in fixtures |
 
 `main` returns 0 on success or the index of the first failed check; `crt0.S`
@@ -176,6 +207,11 @@ turns that into the HTIF exit store, so a corpus bug shows up as a non-zero
 Spike exit status *and* as a divergent trace. `-mcmodel=medany` is required:
 absolute `lui` addressing cannot materialize `0x8000_xxxx` on RV64, where `lui`
 sign-extends from bit 31.
+
+The corpus is built with `-march=rv64imc_zicsr` (binutils no longer implies
+`Zicsr` from `I`, and `cor_csr`/`cor_trap` need the CSR instructions). Spike
+enables `zicsr` for `--isa=rv64imc` by default, so nothing on the golden side
+changes — and the RV64I/M/C programs assemble to the same bytes either way.
 
 Toolchain note: `riscv64-unknown-elf-gcc 13.2.0` is a full RV64 toolchain
 (`--print-multi-lib` offers `rv64i`/`rv64im`/`rv64imac`/`rv64imafdc`/…), but there
@@ -235,13 +271,16 @@ error.
 
 ## Limitations / next steps
 
-* **Memory accesses are not compared.** Spike's log carries `mem <addr> [<value>]`
-  fields; the canonical record is `cycle pc rd value`, so a DUT that stores to
-  the wrong address but keeps pc/rd/value identical is not caught yet. Extending
-  `Commit` with a `mem_write` field is the natural next increment (the Spike
-  parser already sees the data).
-* **CSRs/traps are not modelled** by the example DUT, and the comparator has no
-  CSR stream. `eth_rv` phase RV-C (Sv39, interrupts) will need one.
+* **Memory masks are DUT-side only.** Spike's log has no byte-lane masks, so the
+  golden stream cannot state them; the harness compares `mem_addr`/`mem_wdata`
+  against it and cross-checks a DUT's masks against the golden's load/store
+  direction plus their own lane consistency. A golden with masks (a second DUT,
+  or a patched Spike) would be compared value-by-value — the comparator already
+  does that when both sides provide them.
+* **CSRs/traps are not modelled** by the example Python DUT (it raises
+  `UnsupportedInstruction` by design); `cor_csr`/`cor_trap` are the RTL's corpus
+  and run through the RTL runner. An interrupt *stream* (CLINT/PLIC, Sv39) is
+  still ahead, in RV-C.
 * **Single hart, no MMU, no atomics/floating point** in the model; clock-domain
   and reset behaviour are out of scope for a commit diff.
 * **Not a lockstep co-sim yet.** This is a post-hoc commit diff (the standard

@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
 """Canonical commit-trace format for the ``eth_rv`` DiffTest harness (S15 §2.2).
 
-Everything in this directory speaks ONE trace dialect — a 4-field text line per
-retired instruction::
-
     # rv_difftest trace v1
     # generator: spike 1e05ddac (rv64imc)
-    # fields: cycle pc rd value
+    # fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]
     1 0x0000000080000000 x02 0x0000000080001000
     2 0x0000000080000004 - -
-    3 0x0000000080000008 x10 0x0000000000000013
+    3 0x0000000080000008 x10 0x0000000000000013 0x0000000080001ff8 0x000000000000002a 0x00 0x08
 
 Field semantics
   * ``cycle`` — commit ordinal of this instruction. Spike is not cycle-accurate,
@@ -23,6 +20,28 @@ Field semantics
     hard-wired zero in RISC-V, so logging them is meaningless, and Spike does
     not log them either.
   * ``value`` — 64-bit value written to ``rd``; ``-`` when ``rd`` is ``-``.
+  * ``mem_addr`` / ``mem_wdata`` — the memory access of the retired
+    instruction, in the golden model's own convention (Spike's
+    ``--log-commits`` ``mem <addr> [<data>]`` field, C14 §5.2): the exact byte
+    address, and for a store the *low* ``size`` bytes of the stored register
+    (unshifted, size-truncated). ``-``/``-`` means "no memory access"; a load
+    carries an address but ``mem_wdata`` is ``-``.
+  * ``mem_rmask`` / ``mem_wmask`` — byte lanes of the 8-byte-aligned window at
+    ``mem_addr & ~7`` that the access reads/writes (the RVFI convention), or
+    ``-`` when the producer does not report masks. Spike has no mask field, so
+    the golden stream leaves them ``-``; a DUT that reports them gets them
+    cross-checked against the golden's load/store direction and for internal
+    consistency (``rv_difftest``).
+
+The memory suffix is **optional and variable width**: a 4-field line carries no
+memory information at all, a 6-field line adds ``mem_addr mem_wdata`` and an
+8-field line adds the two masks. A stream that never carries memory information
+is still compared on ``pc``/``rd``/``value``, and the comparison reports the
+memory stream as "not provided" instead of silently passing it. Note that
+``mem_addr`` present with ``-`` for every other memory field means "this commit
+has no memory access", which is different from a 4-field line only at the
+stream level (a *producer* that knows about memory vs one that does not) — see
+:func:`stream_has_mem_info`.
 
 A *lenient* 3-field line (``pc rd value``) is also accepted on the DUT side, with
 ``cycle`` taken from the line ordinal. That is the shape a hand-written Verilator
@@ -32,7 +51,7 @@ testbench ``$fwrite`` naturally produces (see ``--dut dump:``). Lines are
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 TRACE_HEADER_PREFIX = "# rv_difftest trace v1"
@@ -107,6 +126,14 @@ class Commit:
     ``insn`` is the raw instruction word when the producer knows it (Spike does);
     it is informational only — the comparator never looks at it, so DUTs that do
     not expose instruction bits (e.g. a ``pc rd value`` dump) stay compatible.
+
+    ``mem_addr``/``mem_wdata``/``mem_rmask``/``mem_wmask`` are the optional memory
+    access of the commit (C14 §5.2). An all-``None`` commit is a commit without
+    memory information *and* a commit that performs no memory access — the two
+    are distinguished at the stream level by :func:`stream_has_mem_info`.
+    ``mem_addr`` is the exact byte address; ``mem_wdata`` the store data in the
+    golden convention (low ``size`` bytes, unshifted); the masks are byte lanes of
+    the window at ``mem_addr & ~7``.
     """
 
     cycle: int
@@ -114,6 +141,10 @@ class Commit:
     rd: int | None = None
     value: int | None = None
     insn: int | None = None
+    mem_addr: int | None = None
+    mem_wdata: int | None = None
+    mem_rmask: int | None = None
+    mem_wmask: int | None = None
 
     def __post_init__(self) -> None:
         if self.cycle < 1:
@@ -136,6 +167,38 @@ class Commit:
                 raise ValueError("commit that writes a register must carry a value")
             else:
                 _check_word(self.value, "value")
+        if self.mem_addr is None:
+            for name in ("mem_wdata", "mem_rmask", "mem_wmask"):
+                if getattr(self, name) is not None:
+                    raise ValueError(f"commit with no mem_addr must not carry {name}")
+            return
+        _check_word(self.mem_addr, "mem_addr")
+        if self.mem_wdata is not None:
+            _check_word(self.mem_wdata, "mem_wdata")
+        for name in ("mem_rmask", "mem_wmask"):
+            mask = getattr(self, name)
+            if mask is not None and not 0 <= mask < (1 << 8):
+                raise ValueError(f"{name} does not fit in 8 bits: {mask!r}")
+        if self.mem_rmask is not None and self.mem_wmask is not None:
+            # One instruction is either a load or a store, so only one of the two
+            # directions may mark bytes; 0 is the "not this direction" value.
+            if self.mem_rmask and self.mem_wmask:
+                raise ValueError(
+                    "a memory access cannot be both a load and a store "
+                    f"(rmask {self.mem_rmask:#04x}, wmask {self.mem_wmask:#04x})"
+                )
+            if not (self.mem_rmask | self.mem_wmask):
+                raise ValueError("a memory access must mark at least one byte")
+
+    @property
+    def has_mem_access(self) -> bool:
+        """True when this commit retires a load or a store."""
+        return self.mem_addr is not None
+
+    @property
+    def has_mem_masks(self) -> bool:
+        """True when this commit carries the byte-lane masks (DUT-side detail)."""
+        return self.mem_rmask is not None or self.mem_wmask is not None
 
     @property
     def writes_register(self) -> bool:
@@ -153,18 +216,37 @@ class Commit:
         return NO_WRITE if self.value is None else f"0x{self.value:016x}"
 
     def format_line(self) -> str:
-        """This commit as one canonical trace line (no trailing newline)."""
-        return f"{self.cycle} 0x{self.pc:016x} {self.reg_name} {self.value_text}"
+        """This commit as one canonical trace line (no trailing newline).
+
+        The memory suffix is omitted entirely for a commit without memory
+        information, so a producer that knows nothing about memory keeps
+        emitting the 4-field line.
+        """
+        core = f"{self.cycle} 0x{self.pc:016x} {self.reg_name} {self.value_text}"
+        mem = self._mem_text()
+        return core if mem is None else f"{core} {mem}"
+
+    def _mem_text(self) -> str | None:
+        """The memory suffix of a trace line, or ``None`` when there is none."""
+        if not self.has_mem_access and not self.has_mem_masks:
+            return None
+        addr = NO_WRITE if self.mem_addr is None else f"0x{self.mem_addr:016x}"
+        wdata = NO_WRITE if self.mem_wdata is None else f"0x{self.mem_wdata:016x}"
+        if not self.has_mem_masks:
+            return f"{addr} {wdata}"
+        rmask = NO_WRITE if self.mem_rmask is None else f"0x{self.mem_rmask:02x}"
+        wmask = NO_WRITE if self.mem_wmask is None else f"0x{self.mem_wmask:02x}"
+        return f"{addr} {wdata} {rmask} {wmask}"
 
     def with_value(self, value: int) -> Commit:
         """A copy of this commit whose register value is ``value``."""
         if self.rd is None:
             return self
-        return Commit(cycle=self.cycle, pc=self.pc, rd=self.rd, value=value, insn=self.insn)
+        return replace(self, value=value)
 
     def with_pc(self, pc: int) -> Commit:
         """A copy of this commit at ``pc`` (value/flags unchanged)."""
-        return Commit(cycle=self.cycle, pc=pc, rd=self.rd, value=self.value, insn=self.insn)
+        return replace(self, pc=pc)
 
     def with_rd(self, rd: int) -> Commit:
         """A copy of this commit writing register ``rd`` (x0 -> no write).
@@ -174,9 +256,41 @@ class Commit:
         register-number divergence, which is what a fault injection is after.
         """
         if rd == 0:
-            return Commit(cycle=self.cycle, pc=self.pc, insn=self.insn)
+            return replace(self, rd=None, value=None)
         value = 0 if self.value is None else self.value
-        return Commit(cycle=self.cycle, pc=self.pc, rd=rd, value=value, insn=self.insn)
+        return replace(self, rd=rd, value=value)
+
+    def with_cycle(self, cycle: int) -> Commit:
+        """A copy of this commit at cycle ``cycle``."""
+        return replace(self, cycle=cycle)
+
+    def with_mem_addr(self, addr: int) -> Commit:
+        """A copy of this commit at memory address ``addr``."""
+        return replace(self, mem_addr=addr)
+
+    def with_mem_wdata(self, wdata: int) -> Commit:
+        """A copy of this commit storing ``wdata``."""
+        if self.mem_addr is None:
+            return self
+        return replace(self, mem_wdata=wdata)
+
+    def with_mem_rmask(self, mask: int) -> Commit:
+        """A copy of this commit whose memory access reads ``mask`` lanes.
+
+        The write mask is cleared: an access is a load or a store, never both.
+        """
+        if self.mem_addr is None:
+            return self
+        return replace(self, mem_rmask=mask, mem_wmask=None)
+
+    def with_mem_wmask(self, mask: int) -> Commit:
+        """A copy of this commit whose memory access writes ``mask`` lanes.
+
+        The read mask is cleared: an access is a load or a store, never both.
+        """
+        if self.mem_addr is None:
+            return self
+        return replace(self, mem_wmask=mask, mem_rmask=None)
 
 
 def _check_word(value: int, what: str, *, bits: int = XLEN) -> None:
@@ -241,6 +355,13 @@ def parse_trace(
     ``pc rd value`` lines (3 fields) are accepted when ``implicit_cycle`` is set;
     their cycle is the 1-based line ordinal of the commit. Explicit cycles must be
     non-decreasing. ``insn`` is never parsed from text — only from Spike logs.
+
+    A line may carry the optional memory suffix: 6 fields add ``mem_addr
+    mem_wdata`` and 8 fields add the two byte-lane masks (see the module
+    docstring). ``-`` means "absent": a ``-`` address is a commit without a memory
+    access, a ``-`` data field is a load, and ``-`` masks mean the producer does
+    not report them. The memory suffix always requires an explicit cycle — a
+    lenient (cycle-implicit) line is exactly 3 fields.
     """
     commits: list[Commit] = []
     last_cycle = 0
@@ -249,14 +370,15 @@ def parse_trace(
         if not line:
             continue
         fields = line.split()
-        if len(fields) not in (3, 4):
+        if len(fields) not in (3, 4, 6, 8):
             raise TraceFormatError(
-                f"expected 3 (<pc> <rd> <value>) or 4 (<cycle> <pc> <rd> <value>) "
-                f"fields, got {len(fields)}: {line!r}",
+                "expected 3 (<pc> <rd> <value>), 4 (<cycle> <pc> <rd> <value>), "
+                "6 (+ <mem_addr> <mem_wdata>) or 8 (+ <mem_rmask> <mem_wmask>) fields, "
+                f"got {len(fields)}: {line!r}",
                 source=source,
                 line=lineno,
             )
-        if len(fields) == 4:
+        if len(fields) >= 4:
             cycle = _word(fields[0], source=source, line=lineno, what="cycle")
             if cycle < 1:
                 raise TraceFormatError(
@@ -283,14 +405,16 @@ def parse_trace(
             pc_token, rd_token, value_token = fields[0], fields[1], fields[2]
         if not is_reg_token(rd_token):
             raise TraceFormatError(
-                f"field {3 if len(fields) == 4 else 2} is not a register: {rd_token!r}",
+                f"field {3 if len(fields) >= 4 else 2} is not a register: {rd_token!r}",
                 source=source,
                 line=lineno,
             )
+        mem_tokens = fields[4:] if len(fields) >= 6 else []
         try:
             pc = parse_word(pc_token, bits=XLEN)
             rd = parse_reg(rd_token)
             value = None if value_token.strip() == NO_WRITE else parse_word(value_token)
+            mem_addr, mem_wdata, mem_rmask, mem_wmask = _mem_fields(mem_tokens)
         except ValueError as exc:
             raise TraceFormatError(str(exc), source=source, line=lineno) from None
         if rd is None and value is not None:
@@ -300,7 +424,18 @@ def parse_trace(
                 line=lineno,
             )
         try:
-            commits.append(Commit(cycle=cycle, pc=pc, rd=rd, value=value))
+            commits.append(
+                Commit(
+                    cycle=cycle,
+                    pc=pc,
+                    rd=rd,
+                    value=value,
+                    mem_addr=mem_addr,
+                    mem_wdata=mem_wdata,
+                    mem_rmask=mem_rmask,
+                    mem_wmask=mem_wmask,
+                )
+            )
         except ValueError as exc:  # pragma: no cover - defensive; fields are checked above
             raise TraceFormatError(str(exc), source=source, line=lineno) from None
     return commits
@@ -329,17 +464,68 @@ def format_trace(
     generator: str | None = None,
     note: str | None = None,
 ) -> str:
-    """Serialize commits as a canonical trace file (header + one line each)."""
+    """Serialize commits as a canonical trace file (header + one line each).
+
+    Commits that carry no memory information stay 4-field lines; a memory access
+    adds ``mem_addr mem_wdata`` and, when the masks are known, ``mem_rmask
+    mem_wmask``.
+    """
     header = [TRACE_HEADER_PREFIX]
     if generator is not None:
         header.append(f"# generator: {generator}")
-    header.append("# fields: cycle pc rd value")
+    header.append("# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]")
     header.append(f'# {NO_WRITE} in rd = retired without an architectural register write')
+    header.append(
+        f"# {NO_WRITE} in mem_addr = no memory access; {NO_WRITE} in mem_wdata = a load; "
+        f"{NO_WRITE} masks = the producer does not report byte lanes"
+    )
     if note is not None:
         for line in note.splitlines():
             header.append(f"# {line}")
     body = [commit.format_line() for commit in commits]
     return "\n".join([*header, *body]) + "\n"
+
+
+def _mem_fields(
+    tokens: list[str],
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Parse a trace line's optional memory suffix into ``(addr, wdata, rmask, wmask)``.
+
+    ``[]`` -> no memory information at all; 2 tokens -> ``addr wdata``; 4 tokens ->
+    the byte-lane masks as well. ``-`` means "absent". Raises :class:`ValueError`
+    for garbage or for data/masks without an address; the caller adds the
+    source/line context.
+    """
+    if not tokens:
+        return None, None, None, None
+    if len(tokens) not in (2, 4):  # pragma: no cover - the line parser guards the width
+        raise ValueError(f"expected 2 or 4 memory fields, got {len(tokens)}")
+    parsed: list[int | None] = []
+    for index, token in enumerate(tokens):
+        if token.strip() == NO_WRITE:
+            parsed.append(None)
+        else:
+            parsed.append(parse_word(token, bits=8 if index >= 2 else XLEN))
+    if parsed[0] is None and any(item is not None for item in parsed[1:]):
+        raise ValueError(f"memory data {tokens[1:]!r} given without a mem_addr")
+    if len(parsed) == 2:
+        return parsed[0], parsed[1], None, None
+    return parsed[0], parsed[1], parsed[2], parsed[3]
+
+
+def stream_has_mem_info(commits: Iterable[Commit]) -> bool:
+    """True when a commit stream reports its memory accesses (C14 §5.2).
+
+    The trace format cannot mark a single commit as "memory-aware but idle" — an
+    idle commit is all-``-`` and therefore indistinguishable from a 4-field
+    (memory-less) line. Awareness is a *stream* property: a producer that knows
+    about memory reports the accesses it performs, and every corpus program
+    performs at least the HTIF exit store, so "any commit with a memory access"
+    is a reliable and honest test. A producer that does not report memory at all
+    yields ``False`` and the comparator reports the memory stream as not provided
+    instead of silently passing it.
+    """
+    return any(commit.has_mem_access for commit in commits)
 
 
 def is_canonical_trace(text: str) -> bool:

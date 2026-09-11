@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from rv_difftest import first_divergence
 from rv_image import Image, ImageError, load_hex_image, load_image
 from rv_model import (
     ModelError,
@@ -85,26 +86,55 @@ def test_c_addi4spn_immediate() -> None:
 def test_model_reproduces_spike_commit_for_commit(
     fixture_image: Image, golden_commits: list[Commit]
 ) -> None:
+    """The fixture log is Spike's, so the model must match it through the comparator.
+
+    The golden side carries no byte-lane masks (Spike does not log them) while the
+    model reports them, so the comparison is the production one: pc/rd/value plus
+    the memory addr/store data, with the model's masks cross-checked against the
+    golden's load/store direction.
+    """
     model_commits = Rv64ImcModel(fixture_image).trace()
     assert len(model_commits) == len(golden_commits) == 116
-    assert model_commits == golden_commits
+    assert first_divergence(golden_commits, model_commits) is None
+    assert [(c.cycle, c.pc, c.rd, c.value) for c in model_commits] == [
+        (c.cycle, c.pc, c.rd, c.value) for c in golden_commits
+    ]
     # the model reports its own instruction words too, for debugging a divergence
     assert model_commits[0].insn == 0x0000_A117
+
+
+def test_model_reports_its_memory_accesses(fixture_image: Image) -> None:
+    """Every load/store the model retires carries addr + store data + lane masks."""
+    commits = Rv64ImcModel(fixture_image).trace()
+    accesses = [commit for commit in commits if commit.has_mem_access]
+    assert len(accesses) == 13
+    assert all(commit.has_mem_masks for commit in accesses)
+    for commit in accesses:
+        mask = commit.mem_rmask or commit.mem_wmask
+        assert mask is not None and mask != 0
+        assert bool(commit.mem_rmask) != bool(commit.mem_wmask)   # load XOR store
+        if commit.mem_wdata is None:                              # a load
+            assert commit.mem_wmask == 0
+        else:                                                     # a store
+            assert commit.mem_rmask == 0
 
 
 def test_fixture_trace_file_matches_the_log(
     fixtures_dir: Path, golden_commits: list[Commit]
 ) -> None:
-    """The canonical trace file carries the same pc/rd/value stream as the raw log.
+    """The canonical trace file carries the same stream as the raw log.
 
-    (Instruction words are Spike-log-only metadata: ``insn`` is never written to a
-    trace, so compare the four canonical fields.)
+    Instruction words are Spike-log-only metadata (``insn`` is never written to a
+    trace), but the memory stream is part of the canonical record (C14 §5.2), so
+    the comparison covers ``mem_addr``/``mem_wdata`` as well.
     """
     trace = parse_trace((fixtures_dir / "cor_model.trace").read_text(encoding="utf-8"))
     assert len(trace) == len(golden_commits) == 116
-    assert [(c.cycle, c.pc, c.rd, c.value) for c in trace] == [
-        (c.cycle, c.pc, c.rd, c.value) for c in golden_commits
+    fields = ("cycle", "pc", "rd", "value", "mem_addr", "mem_wdata")
+    assert [tuple(getattr(c, f) for f in fields) for c in trace] == [
+        tuple(getattr(c, f) for f in fields) for c in golden_commits
     ]
+    assert sum(1 for c in trace if c.has_mem_access) == 13
 
 
 def test_run_image_and_text_helpers(fixtures_dir: Path) -> None:

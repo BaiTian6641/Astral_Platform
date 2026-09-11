@@ -39,7 +39,28 @@
   内存访问尚未与 Spike 的 `mem` 流比对（RTL 已吐 `rvfi_mem_*`，harness 的 `Commit` 需加字段）。
 - ⚠️ 与 C14 的偏差已记录：I 口为简化取指（非 AXI 突发读）——下一片切换 `eth_axi` 主口。
 
-## 4. 下一阶段需要做的内容
+## 4. 增量 2（同日完成）：内存流 DiffTest + M 模式 CSR/trap
+
+- **内存流比对（C14 §5.2）**：轨迹格式扩展为 `cycle pc rd value [mem_addr mem_wdata [masks]]`（4 字段 = 无内存信息，
+  6 = +地址/写数据，8 = +掩码；`-` 表示无访问/load/未报告）；比较覆盖地址、写数据（Spike 约定：低 `size` 字节、
+  不移位）、DUT 掩码的**方向与 lane 连续性**（地址 `[2:0]`）；**无内存字段的流明确打印"memory: not provided"**，
+  绝不静默通过。golden 侧从 Spike `--log-commits` 的 mem 行提取。
+- **CSR/trap**：10 个 M 模式 CSR（`mstatus/misa/mie/mip/mtvec/mepc/mcause/mtval/mscratch/mhartid`）+
+  `ecall`(11/0)、`ebreak`(3/pc)、非法指令(2/insn)、加载/存储非对齐(4/6/addr)、取指非对齐(0/target)；
+  陷阱效果（`mepc/mcause/mtval` + `mstatus.MPIE<=MIE, MIE<=0, MPP<=M` + 重定向 `mtvec&~1`）与 `mret` 全部位精确；
+  未实现 CSR 号 → 非法指令（不静默）。指令侧故障在 EX、数据侧在 MEM，**MEM 优先（旧指令先报）**；`err_o` 变为携带 `mcause` 的逐陷阱脉冲（不再锁存/停机）。
+- **语料**：+`cor_csr`（140 提交，22 项 CSR 检查）、+`cor_trap`（474 提交，15 陷阱 / 33 检查）；构建改
+  `-march=rv64imc_zicsr`（binutils 不再隐含 Zicsr），既有 4 程序**机器码逐字节不变**。
+- **验证（本人独立复跑）**：`make verif-rv` **147 passed**（was 121）；RTL runner `--all` →
+  **`OK: 6 corpus program(s), MATCH vs Spike`**，逐程序 `0 divergence` 且 `memory: active — 3/30/1/13/1/28 accesses compared`；
+  `--memlat 2` 仍全绿；**负控**：`--fault 131:mem_wdata=0xdeadbeef` → 精确 commit 分歧（golden vs dut 值并排）、
+  `--fault 149:mem_addr`、harness 侧 `mem_rmask/mem_wmask` 注入（方向/连续性）均被捕获；旧 `value` 注入仍生效。
+  lint / ruff / mypy --strict 干净（无新增豁免）。
+- **C14 待补（agent 如实列出）**：`mip` 读 0 而 Spike 读 0x80（其 CLINT 报 MTIP；`cor_csr` 只查合法访问不比值）；
+  Spike 的 mem 日志无 lane 掩码（掩码比对为方向/一致性交叉检查）；无中断/特权级切换；`mtvec MODE=1` 仅存储不向量化
+  （Spike 只对中断向量化）；instruction-address-misaligned 在 IALIGN=16+JALR 清 bit0 下架构不可达（作为结构守卫保留）。
+
+## 5. 下一阶段需要做的内容
 
 - **E2-RV1 续** — CSR/trap 最小集（`mcause/mepc/mtval` + 非法指令/ecall）→ `mem` 流比对 → `eth_axi` AXI4 主口替换 → 轨迹口形式化。
 - **E2-RV0 增量** — 内存访问比对（harness `Commit.mem_*` 字段）+ CSR/trap 流 + 实时锁步 stepper。

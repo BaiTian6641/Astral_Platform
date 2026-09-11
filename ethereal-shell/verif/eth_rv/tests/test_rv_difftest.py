@@ -18,6 +18,9 @@ from rv_difftest import (
     EXIT_MATCH,
     KIND_CYCLE,
     KIND_EXTRA,
+    KIND_MEM_ADDR,
+    KIND_MEM_MASK,
+    KIND_MEM_WDATA,
     KIND_PC,
     KIND_RD,
     KIND_TRUNCATED,
@@ -28,6 +31,9 @@ from rv_difftest import (
 from rv_trace import Commit, TraceFormatError, format_trace
 
 GOLDEN_COMMITS = 116
+
+MODEL_DUT_PROGRAMS = ("cor_alu", "cor_mem", "cor_muldiv", "cor_model")
+"""Corpus programs the worked-example model DUT can run (it has no CSR/trap path)."""
 
 
 def _commits() -> list[Commit]:
@@ -126,6 +132,87 @@ def test_divergence_report_names_pc_register_and_cycle() -> None:
     assert "dut    [model]: 3 0x0000000080000008 x10 0x0000000000000007" in report
 
 
+# --- the memory stream (C14 §5.2) --------------------------------------------------
+
+
+def _memory_commits() -> list[Commit]:
+    """Two commits that agree except in the details each check looks at."""
+    return [
+        Commit(cycle=1, pc=0x8000_0000),
+        Commit(cycle=2, pc=0x8000_0004, mem_addr=0x8000_1003, mem_wdata=0x2A, mem_wmask=0x08),
+        Commit(cycle=3, pc=0x8000_0008, rd=9, value=7, mem_addr=0x8000_2004, mem_rmask=0xF0),
+    ]
+
+
+def test_memory_stream_matches_through_the_comparator() -> None:
+    assert first_divergence(_memory_commits(), _memory_commits()) is None
+
+
+@pytest.mark.parametrize(
+    ("index", "mutate", "kind"),
+    [
+        (1, "addr", KIND_MEM_ADDR),
+        (1, "wdata", KIND_MEM_WDATA),
+        (2, "addr", KIND_MEM_ADDR),
+        (2, "wdata", KIND_MEM_WDATA),
+        (1, "drop", KIND_MEM_ADDR),
+        (2, "invent", KIND_MEM_ADDR),
+        (1, "rmask_flip", KIND_MEM_MASK),
+        (1, "bad_mask", KIND_MEM_MASK),
+    ],
+)
+def test_first_memory_divergence_reports_exact_position(
+    index: int, mutate: str, kind: str
+) -> None:
+    golden = _memory_commits()
+    dut = list(golden)
+    commit = golden[index]
+    if mutate == "addr":
+        dut[index] = commit.with_mem_addr(0xDEAD_0000)
+    elif mutate == "wdata":
+        dut[index] = commit.with_mem_wdata((commit.mem_wdata or 0) ^ 0xFF)
+    elif mutate == "drop":
+        dut[index] = Commit(cycle=commit.cycle, pc=commit.pc, rd=commit.rd, value=commit.value)
+    elif mutate == "invent":
+        dut[index] = Commit(
+            cycle=commit.cycle, pc=commit.pc, rd=commit.rd, value=commit.value, mem_addr=0x1234
+        )
+    elif mutate == "rmask_flip":  # the golden says "store", the DUT says "load"
+        dut[index] = Commit(
+            cycle=commit.cycle, pc=commit.pc, mem_addr=commit.mem_addr, mem_wdata=commit.mem_wdata,
+            mem_rmask=0x08,
+        )
+    else:  # a mask that does not start at the access offset
+        dut[index] = Commit(
+            cycle=commit.cycle, pc=commit.pc, mem_addr=0x8000_1003, mem_wdata=commit.mem_wdata,
+            mem_wmask=0x01,
+        )
+    divergence = first_divergence(golden, dut)
+    assert divergence is not None
+    assert (divergence.index, divergence.kind, divergence.cycle) == (index, kind, commit.cycle)
+    assert divergence.golden == commit
+
+
+def test_memory_check_can_be_disabled() -> None:
+    """A DUT that reports no memory at all must still compare on pc/rd/value."""
+    golden = _memory_commits()
+    dut = [Commit(cycle=c.cycle, pc=c.pc, rd=c.rd, value=c.value) for c in golden]
+    assert first_divergence(golden, dut) is not None
+    assert first_divergence(golden, dut, check_mem=False) is None
+
+
+def test_memory_report_shows_both_sides() -> None:
+    golden = _memory_commits()
+    dut = [*golden[:1], golden[1].with_mem_addr(0x8000_DEAD), golden[2]]
+    divergence = first_divergence(golden, dut)
+    assert divergence is not None
+    report = "\n".join(divergence.lines(golden_label="spike", dut_label="rtl"))
+    assert "DIVERGENCE (mem_addr_mismatch) at commit #1 (cycle 2)" in report
+    assert "golden [spike]: 2 0x0000000080000004 - - 0x0000000080001003" in report
+    assert "dut    [rtl]: 2 0x0000000080000004 - - 0x000000008000dead" in report
+    assert "memory address mismatch" in report
+
+
 # --- golden loading ----------------------------------------------------------------
 
 
@@ -163,13 +250,18 @@ def test_cli_dump_dut_round_trip(cli_path: Path, fixtures_dir: Path, tmp_path: P
     """The DUT side may be a plain trace file — the RTL testbench's output shape."""
     dump = tmp_path / "with_cycles.dump"
     dump.write_text((fixtures_dir / "cor_model.trace").read_text(encoding="utf-8"), encoding="utf-8")
-    assert _run_cli(cli_path, "--golden", str(fixtures_dir / "cor_model.trace"), "--dut", f"dump:{dump}").returncode == EXIT_MATCH
+    result = _run_cli(cli_path, "--golden", str(fixtures_dir / "cor_model.trace"), "--dut", f"dump:{dump}")
+    assert result.returncode == EXIT_MATCH
+    assert "memory: active" in result.stdout
 
+    # a bare `pc rd value` dump has no memory information: the comparison must say
+    # so instead of silently claiming the memory stream matched (C14 §5.2)
     bare = tmp_path / "bare.dump"
     body = [line for line in (fixtures_dir / "cor_model.trace").read_text().splitlines() if not line.startswith("#")]
-    bare.write_text("\n".join(" ".join(line.split()[1:]) for line in body) + "\n", encoding="utf-8")
+    bare.write_text("\n".join(" ".join(line.split()[1:4]) for line in body) + "\n", encoding="utf-8")
     result = _run_cli(cli_path, "--golden", str(fixtures_dir / "cor_model.trace"), "--dut", f"dump:{bare}")
     assert result.returncode == EXIT_MATCH
+    assert "memory: not provided" in result.stdout
 
 
 def test_cli_injected_divergence_exits_one_with_exact_position(
@@ -214,6 +306,95 @@ def test_cli_malformed_dump_exits_two(cli_path: Path, fixtures_dir: Path, tmp_pa
     assert "bad.dump:1" in result.stderr
 
 
+def _first_store(lines: list[str]) -> tuple[int, int]:
+    """``(line index, 0-based commit index)`` of the fixture trace's first store."""
+    commit_index = -1
+    for line_index, line in enumerate(lines):
+        if line.startswith("#") or not line.strip():
+            continue
+        commit_index += 1
+        fields = line.split()
+        if len(fields) == 6 and fields[5] != "-":
+            return line_index, commit_index
+    raise AssertionError("the fixture trace has no store")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("wdata", "mem_wdata_mismatch"),
+        ("wmask_flip", "mem_mask_mismatch"),
+    ],
+)
+def test_cli_catches_a_corrupted_memory_stream(
+    cli_path: Path, fixtures_dir: Path, tmp_path: Path, mutation: str, expected: str
+) -> None:
+    """The memory-stream negative control, hermetically (no RTL, no Spike).
+
+    The golden trace is Spike's; the DUT dump is the same stream with one store
+    corrupted — the first divergence must land on exactly that commit, with both
+    sides printed. The second case keeps the store data and flips the byte-lane
+    direction instead, which only the mask cross-check can catch.
+    """
+    lines = (fixtures_dir / "cor_model.trace").read_text(encoding="utf-8").splitlines()
+    line_index, commit_index = _first_store(lines)
+    fields = lines[line_index].split()
+    if mutation == "wdata":
+        fields[5] = "0x00000000deadbeef"
+    else:  # keep the data, report the access as a read of the same byte
+        fields += ["0x01", "-"]
+    lines[line_index] = " ".join(fields)
+    corrupt = tmp_path / "corrupted.dump"
+    corrupt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    result = _run_cli(
+        cli_path, "--golden", str(fixtures_dir / "cor_model.trace"), "--dut", f"dump:{corrupt}"
+    )
+    assert result.returncode == EXIT_DIVERGED
+    assert f"DIVERGENCE ({expected}) at commit #{commit_index}" in result.stdout
+    assert "golden" in result.stdout and "dut" in result.stdout
+
+
+def test_cli_memory_not_provided_is_reported_not_claimed(
+    cli_path: Path, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    """A 4-field golden (no memory information) must not silently "pass" memory."""
+    lines = [
+        " ".join(line.split()[:4])
+        for line in (fixtures_dir / "cor_model.trace").read_text(encoding="utf-8").splitlines()
+        if not line.startswith("#") and line.strip()
+    ]
+    stripped = tmp_path / "no_mem.trace"
+    stripped.write_text(
+        "\n".join(["# rv_difftest trace v1", *lines]) + "\n", encoding="utf-8"
+    )
+    result = _run_cli(
+        cli_path, "--golden", str(stripped), "--dut", f"dump:{fixtures_dir / 'cor_model.trace'}"
+    )
+    assert result.returncode == EXIT_MATCH
+    assert "memory: not provided" in result.stdout
+    assert "golden" in result.stdout.split("memory: not provided", 1)[1]
+
+
+def test_cli_memory_injection_is_caught(
+    cli_path: Path, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    """``--inject INDEX:mem_addr=…`` moves a store and the comparator reports it."""
+    lines = (fixtures_dir / "cor_model.trace").read_text(encoding="utf-8").splitlines()
+    _, commit_index = _first_store(lines)
+    result = _run_cli(
+        cli_path,
+        "--golden",
+        str(fixtures_dir / "cor_model.trace"),
+        "--dut",
+        f"dump:{fixtures_dir / 'cor_model.trace'}",
+        "--inject",
+        f"{commit_index}:mem_addr=0x8000dead",
+    )
+    assert result.returncode == EXIT_DIVERGED
+    assert f"DIVERGENCE (mem_addr_mismatch) at commit #{commit_index}" in result.stdout
+    assert "0x000000008000dead" in result.stdout
+
+
 def test_cli_raw_log_golden_needs_the_elf(cli_path: Path, fixtures_dir: Path) -> None:
     result = _run_cli(
         cli_path,
@@ -250,11 +431,18 @@ def test_cli_requires_a_golden_and_a_dut(cli_path: Path) -> None:
 def test_cli_spike_end_to_end(
     cli_path: Path, corpus_elfs: dict[str, Path], spike_binary: Path
 ) -> None:
-    """The real flow: ELF golden from Spike vs the ELF running in the model DUT."""
-    for name, elf in sorted(corpus_elfs.items()):
+    """The real flow: ELF golden from Spike vs the ELF running in the model DUT.
+
+    Only the programs inside the model DUT's documented subset: it is an
+    RV64IMC interpreter without a CSR/trap path (``cor_csr``/``cor_trap`` raise
+    ``UnsupportedInstruction`` by design — they are the RTL's corpus).
+    """
+    for name in MODEL_DUT_PROGRAMS:
+        elf = corpus_elfs[name]
         result = _run_cli(cli_path, "--elf", str(elf), "--dut", f"model:{elf}", "--spike", str(spike_binary))
         assert result.returncode == EXIT_MATCH, result.stdout + result.stderr
         assert "MATCH:" in result.stdout
+        assert "memory: active" in result.stdout
 
 
 def test_cli_spike_end_to_end_catches_a_wrong_dut(

@@ -6,13 +6,24 @@ Runs an ELF under the pinned Spike build (``generated/rv_difftest/spike``, see
 into the canonical 4-field trace of :mod:`rv_trace`::
 
     core   0: 3 0x0000000080000000 (0x00000297) x 5  0x0000000080001000
+    core   0: 3 0x00000000800000f8 (0x6082) x1  0x0000000000000000 mem 0x0000000080009fe0
+    core   0: 3 0x00000000800000fc (0x00a2b023) mem 0x0000000080001000 0x0000000000000001
     -> 1 0x0000000080000000 x5 0x0000000080001000
+    -> 2 0x00000000800000f8 x1 0x0000000000000000 0x0000000080009fe0 -
+    -> 3 0x00000000800000fc - - 0x0000000080001000 0x0000000000000001
 
 Upstream Spike prints one line per retired instruction containing the privilege,
 pc, instruction word, every register (``x``/``f``/``c`` prefixes) or vector
-update, and ``mem`` read/write addresses. Only the integer register write is
-part of the canonical record; ``insn`` is carried along for diagnostics.
-Spike is not cycle-accurate, so ``cycle`` is the retirement ordinal.
+update, and ``mem`` read/write addresses. The integer register write and the
+memory access are part of the canonical record (the latter as the optional
+``mem_addr``/``mem_wdata`` suffix of :mod:`rv_trace` — see C14 §5.2); ``insn`` is
+carried along for diagnostics. Spike is not cycle-accurate, so ``cycle`` is the
+retirement ordinal.
+
+An instruction that **traps** is not committed: Spike logs the exception instead
+of a commit line, so a trapping instruction appears in neither the golden stream
+nor (correctly implemented) a DUT's trace. The exception lines and the ``-l``
+disassembly lines do not match :data:`_COMMIT_RE` and are ignored.
 """
 from __future__ import annotations
 
@@ -66,8 +77,14 @@ _COMMIT_RE = re.compile(
 _XREG_RE = re.compile(r"\bx(?P<rd>\d+)\s+(?P<value>0x[0-9a-fA-F]+)\b")
 """Integer register update inside a commit line (``f``/``v``/``c`` updates are ignored)."""
 
-_MEM_RE = re.compile(r"\bmem\s+0x([0-9a-fA-F]+)\s+0x[0-9a-fA-F]+")
-"""Memory *store* inside a commit line (loads print the address only, so they never match)."""
+_MEM_RE = re.compile(r"\bmem\s+0x(?P<addr>[0-9a-fA-F]+)(?:\s+0x(?P<data>[0-9a-fA-F]+))?\b")
+"""One memory access inside a commit line: ``mem <addr> [<data>]``.
+
+Spike logs a store with its data and a load with the address only, and logs the
+data already truncated to the access size (``sb`` of ``0x1234`` prints
+``mem 0x… 0x34``) — that is the convention the trace's ``mem_wdata`` uses
+(C14 §5.2), so it compares byte for byte against a DUT.
+"""
 
 
 class SpikeError(RuntimeError):
@@ -321,7 +338,27 @@ def iter_spike_commits(
                 )
             rd = reg
             value = int(reg_match.group("value"), 16)
-        yield lineno, Commit(cycle=index + 1, pc=pc, rd=rd, value=value, insn=insn)
+        mem_addr: int | None = None
+        mem_wdata: int | None = None
+        for mem_match in _MEM_RE.finditer(match.group("rest")):
+            if mem_addr is not None:
+                raise TraceFormatError(
+                    "spike commit line reports more than one memory access",
+                    source=source,
+                    line=lineno + 1,
+                )
+            mem_addr = int(mem_match.group("addr"), 16)
+            data = mem_match.group("data")
+            mem_wdata = None if data is None else int(data, 16)
+        yield lineno, Commit(
+            cycle=index + 1,
+            pc=pc,
+            rd=rd,
+            value=value,
+            insn=insn,
+            mem_addr=mem_addr,
+            mem_wdata=mem_wdata,
+        )
         index += 1
         if tohost is not None and _writes_htif_mailbox(match.group("rest"), tohost):
             return
@@ -336,9 +373,14 @@ def last_golden_line(text: str, *, source: str = "<spike log>", tohost: int | No
 
 
 def _writes_htif_mailbox(rest: str, tohost: int) -> bool:
-    """True when a commit line's ``mem`` field stores to the HTIF mailbox."""
+    """True when a commit line's ``mem`` field stores to the HTIF mailbox.
+
+    The mailbox store is a store, so Spike logs data with it — the ``data`` group
+    is what distinguishes a store from the address-only entry of a load.
+    """
     return any(
-        int(mem.group(1), 16) == tohost for mem in _MEM_RE.finditer(rest)
+        int(mem.group("addr"), 16) == tohost and mem.group("data") is not None
+        for mem in _MEM_RE.finditer(rest)
     )
 
 

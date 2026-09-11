@@ -46,6 +46,7 @@ from rv_trace import (
     format_reg,
     is_canonical_trace,
     parse_trace,
+    stream_has_mem_info,
 )
 
 EXIT_MATCH = 0
@@ -56,6 +57,9 @@ KIND_PC = "pc_mismatch"
 KIND_RD = "rd_mismatch"
 KIND_VALUE = "value_mismatch"
 KIND_CYCLE = "cycle_mismatch"
+KIND_MEM_ADDR = "mem_addr_mismatch"
+KIND_MEM_WDATA = "mem_wdata_mismatch"
+KIND_MEM_MASK = "mem_mask_mismatch"
 KIND_TRUNCATED = "dut_trace_truncated"
 KIND_EXTRA = "dut_trace_extra_commits"
 
@@ -91,18 +95,148 @@ def _render(commit: Commit | None) -> str:
     return "<stream ended>" if commit is None else commit.format_line()
 
 
+def _mem_text(commit: Commit) -> str:
+    """The memory access of a commit as compact text for a divergence report."""
+    if not commit.has_mem_access:
+        return "no memory access"
+    addr = f"addr=0x{commit.mem_addr:016x}"
+    data = "load" if commit.mem_wdata is None else f"store data=0x{commit.mem_wdata:016x}"
+    return f"{addr} {data}"
+
+
+def _lane_mask_is_consistent(mask: int, addr: int) -> bool:
+    """True when ``mask`` is a contiguous run of lanes starting at ``addr[2:0]``.
+
+    The masks address byte lanes of the 8-byte-aligned window at ``addr & ~7``
+    (the RVFI convention), and every access this core can retire is contained in
+    one such window — so a mask that does not start at the access offset, or that
+    has holes, is an inconsistent record and is reported.
+    """
+    offset = addr & 0b111
+    if mask & ((1 << offset) - 1):
+        return False
+    shifted = mask >> offset
+    return shifted != 0 and (shifted & (shifted + 1)) == 0
+
+
+def _mem_divergence(index: int, golden: Commit, dut: Commit) -> Divergence | None:
+    """The first memory-stream divergence between two commits, or ``None``.
+
+    ``mem_addr``/``mem_wdata`` are compared when both sides report memory (the
+    golden convention is Spike's ``mem`` log). ``mem_rmask``/``mem_wmask`` are
+    DUT-only information — Spike has no mask field — so they are checked against
+    the golden's load/store direction and for internal consistency instead of
+    being compared value by value.
+    """
+    if golden.mem_addr != dut.mem_addr:
+        if dut.mem_addr is None:
+            detail = f"golden retires a memory access here, dut reports none ({_mem_text(golden)})"
+        elif golden.mem_addr is None:
+            detail = f"dut retires a memory access here, golden reports none ({_mem_text(dut)})"
+        else:
+            detail = (
+                f"memory address mismatch: golden 0x{golden.mem_addr:016x} != "
+                f"dut 0x{dut.mem_addr:016x}"
+            )
+        return Divergence(
+            index=index,
+            kind=KIND_MEM_ADDR,
+            cycle=dut.cycle,
+            pc=dut.pc,
+            rd=dut.rd,
+            golden=golden,
+            dut=dut,
+            detail=detail,
+        )
+    if dut.mem_addr is None:
+        return None
+    if golden.mem_wdata != dut.mem_wdata:
+        detail = (
+            f"memory write data mismatch: golden "
+            f"{'load' if golden.mem_wdata is None else f'0x{golden.mem_wdata:016x}'} != dut "
+            f"{'load' if dut.mem_wdata is None else f'0x{dut.mem_wdata:016x}'}"
+        )
+        return Divergence(
+            index=index,
+            kind=KIND_MEM_WDATA,
+            cycle=dut.cycle,
+            pc=dut.pc,
+            rd=dut.rd,
+            golden=golden,
+            dut=dut,
+            detail=detail,
+        )
+    return _mask_divergence(index, golden, dut)
+
+
+def _mask_divergence(index: int, golden: Commit, dut: Commit) -> Divergence | None:
+    """Check the DUT's byte-lane masks against the golden direction and themselves."""
+
+    def fail(detail: str) -> Divergence:
+        return Divergence(
+            index=index,
+            kind=KIND_MEM_MASK,
+            cycle=dut.cycle,
+            pc=dut.pc,
+            rd=dut.rd,
+            golden=golden,
+            dut=dut,
+            detail=detail,
+        )
+
+    assert dut.mem_addr is not None and golden.mem_addr is not None
+    if not dut.has_mem_masks:
+        return None
+    for name, mask in (("rmask", dut.mem_rmask), ("wmask", dut.mem_wmask)):
+        # 0 is the "this is not a load/store" value for the unused direction
+        if mask and not _lane_mask_is_consistent(mask, dut.mem_addr):
+            return fail(
+                f"dut {name}=0x{mask:02x} is not a contiguous run of lanes starting at "
+                f"addr[2:0]={dut.mem_addr & 7}"
+            )
+    if golden.mem_wdata is None:  # the golden says this commit is a load
+        if not dut.mem_rmask:
+            return fail(
+                f"golden retires a load here, dut reports rmask=0x{(dut.mem_rmask or 0):02x} "
+                f"(wmask=0x{(dut.mem_wmask or 0):02x})"
+            )
+    elif not dut.mem_wmask:
+        return fail(
+            f"golden retires a store here, dut reports wmask=0x{(dut.mem_wmask or 0):02x} "
+            f"(rmask=0x{(dut.mem_rmask or 0):02x})"
+        )
+    if (
+        golden.has_mem_masks
+        and dut.has_mem_masks
+        and (golden.mem_rmask != dut.mem_rmask or golden.mem_wmask != dut.mem_wmask)
+    ):
+        return fail(
+            f"mask mismatch: golden rmask={golden.mem_rmask} wmask={golden.mem_wmask} != "
+            f"dut rmask={dut.mem_rmask} wmask={dut.mem_wmask}"
+        )
+    return None
+
+
 def first_divergence(
     golden: Iterable[Commit],
     dut: Iterable[Commit],
     *,
     check_cycle: bool = True,
+    check_mem: bool = True,
     max_commits: int | None = None,
 ) -> Divergence | None:
     """The first differing commit, or ``None`` when the streams are identical.
 
     Order of checks per commit: cycle (optional), pc, register number, register
-    value. ``max_commits`` stops the comparison after N commits (a prefix check
-    for long programs); the streams must still have the same length otherwise.
+    value, then the optional memory stream (C14 §5.2) — address, store data and
+    the DUT's byte-lane masks. ``max_commits`` stops the comparison after N
+    commits (a prefix check for long programs); the streams must still have the
+    same length otherwise.
+
+    ``check_mem`` must only be set when *both* streams report their memory
+    accesses (``rv_trace.stream_has_mem_info``); the CLI decides that once for
+    the whole run so a 4-field DUT dump is compared on pc/rd/value alone and the
+    memory stream is reported as not provided rather than silently passing.
     """
     golden_iter = iter(golden)
     dut_iter = iter(dut)
@@ -197,6 +331,10 @@ def first_divergence(
                     f"dut {dut_commit.value_text}"
                 ),
             )
+        if check_mem:
+            mem_divergence = _mem_divergence(index, golden_commit, dut_commit)
+            if mem_divergence is not None:
+                return mem_divergence
         index += 1
     return None
 
@@ -303,10 +441,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"[rv_difftest] error: {exc}\n")
         return EXIT_ERROR
 
+    golden_aware = stream_has_mem_info(golden_commits)
+    dut_aware = stream_has_mem_info(dut_commits)
+    check_mem = golden_aware and dut_aware
     divergence = first_divergence(
         golden_commits,
         dut_commits,
         check_cycle=not args.no_cycle_check,
+        check_mem=check_mem,
         max_commits=args.max_commits,
     )
     print(f"[rv_difftest] golden = {golden_label} ({len(golden_commits)} commits)")
@@ -317,6 +459,24 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"MATCH: {compared} commits compared{scope}, 0 divergence — pc, rd and value agree"
         )
+        if check_mem:
+            accesses = sum(
+                1 for commit in golden_commits[:compared] if commit.has_mem_access
+            )
+            print(
+                f"[rv_difftest] memory: active — {accesses} memory access(es) compared "
+                "(addr + store data; DUT lane masks checked for direction/consistency)"
+            )
+        else:
+            missing = ", ".join(
+                name
+                for name, aware in (("golden", golden_aware), ("dut", dut_aware))
+                if not aware
+            )
+            print(
+                f"[rv_difftest] memory: not provided — no mem fields in the {missing} stream "
+                "(compared pc, rd and value only)"
+            )
         return EXIT_MATCH
     for line in divergence.lines(golden_label=golden_label, dut_label=dut.describe()):
         print(line)

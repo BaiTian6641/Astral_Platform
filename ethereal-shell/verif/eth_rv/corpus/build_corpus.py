@@ -39,7 +39,14 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_OUT_DIR = REPO_ROOT / "generated" / "rv_difftest" / "corpus"
 
 TOOLCHAIN_PREFIX = "riscv64-unknown-elf-"
-MARCH = "rv64imc"
+MARCH = "rv64imc_zicsr"
+"""ISA the corpus is built for: RV64IMC + the CSR instructions.
+
+`Zicsr` is not implied by `I` in binutils any more, so the CSR/trap programs
+(cor_csr/cor_trap) need it spelled out. It changes nothing for the RV64I/M/C
+programs — they contain no CSR instruction and assemble to the same bytes — and
+Spike enables `zicsr` by default for `--isa=rv64imc`, so the golden side needs
+no change."""
 MABI = "lp64"
 
 CFLAGS: tuple[str, ...] = (

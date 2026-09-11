@@ -20,6 +20,7 @@ from rv_trace import (
     parse_reg,
     parse_trace,
     parse_trace_file,
+    stream_has_mem_info,
 )
 
 
@@ -89,12 +90,12 @@ def test_decimal_and_upper_case_hex_are_accepted() -> None:
 @pytest.mark.parametrize(
     ("text", "line", "expected"),
     [
-        ("1 0x80000000 x2 0x1 0x2\n", 1, "expected 3 .* or 4 .* fields, got 5"),
+        ("1 0x80000000 x2 0x1 0x2\n", 1, "expected 3 .*fields, got 5"),
         ("1 0xzzzz x2 0x1\n", 1, "not a number"),
         ("1 0x80000000 q7 0x1\n", 1, "is not a register"),
         ("1 0x80000000 - 0x1\n", 1, "without a register write"),
         ("0 0x80000000 x2 0x1\n", 1, "cycle must be >= 1"),
-        ("0x80000000 x2\n", 1, "expected 3 .* or 4 .* fields, got 2"),
+        ("0x80000000 x2\n", 1, "expected 3 .*fields, got 2"),
         ("1 0x80000000 x32 0x1\n", 1, "is not a register"),
         ("1 0x80000000 x2 0x1\n\n3 0xzzzz x2 0x1\n", 3, "not a number"),
         ("1 0x80000000 x2 0x1\n3 0x80000004 x2 0x1\n2 0x80000008 x2 0x1\n", 3, "goes backwards"),
@@ -153,3 +154,91 @@ def test_commit_helpers_rebuild_the_record() -> None:
 def test_non_canonical_text_is_detected() -> None:
     assert not is_canonical_trace("1 0x80000000 - -\n")
     assert not is_canonical_trace("")
+
+
+# --- the optional memory suffix (C14 §5.2) ----------------------------------------
+
+
+def test_memory_suffix_round_trips() -> None:
+    """6 fields carry addr + store data; 8 add the byte-lane masks."""
+    commits = [
+        Commit(cycle=1, pc=0x8000_0000, rd=2, value=0x8000_A000),
+        Commit(cycle=2, pc=0x8000_0004, mem_addr=0x8000_1000, mem_wdata=1),
+        Commit(cycle=3, pc=0x8000_0008, rd=10, value=7, mem_addr=0x8000_1FF8),
+        Commit(cycle=4, pc=0x8000_000C, mem_addr=0x8000_2000, mem_wmask=0x08),
+    ]
+    text = format_trace(commits)
+    body = [line for line in text.splitlines() if not line.startswith("#")]
+    assert body == [
+        "1 0x0000000080000000 x2 0x000000008000a000",
+        "2 0x0000000080000004 - - 0x0000000080001000 0x0000000000000001",
+        "3 0x0000000080000008 x10 0x0000000000000007 0x0000000080001ff8 -",
+        "4 0x000000008000000c - - 0x0000000080002000 - - 0x08",
+    ]
+    assert parse_trace(text) == commits
+
+
+def test_memory_suffix_accepts_dashes_and_both_masks() -> None:
+    commits = parse_trace("7 0x80000000 - - - - - -\n8 0x80000004 - - 0x20 0x2a 0xf0 -\n")
+    assert not commits[0].has_mem_access
+    assert not commits[0].has_mem_masks
+    assert commits[1].mem_addr == 0x20
+    assert commits[1].mem_wdata == 0x2A
+    assert commits[1].mem_rmask == 0xF0
+    assert commits[1].mem_wmask is None
+    assert commits[1].has_mem_masks
+
+
+def test_memory_masks_are_eight_bit() -> None:
+    with pytest.raises(ValueError, match="mem_wmask does not fit in 8 bits"):
+        Commit(cycle=1, pc=0, mem_addr=0, mem_wmask=0x100)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("1 0x80000000 - - - 0x1\n", "without a mem_addr"),
+        ("1 0x80000000 - - 0x1 0x2 0x3\n", "expected 3 .*fields, got 7"),
+        ("1 0x80000000 - - 0x80000000 0x1 0xzz -\n", "not a number"),
+        ("1 0x80000000 - - 0x80000000 0x1 0x100 -\n", "does not fit in 8 bits"),
+    ],
+)
+def test_malformed_memory_fields_report_the_line(text: str, expected: str) -> None:
+    with pytest.raises(TraceFormatError, match=expected) as excinfo:
+        parse_trace(text, source="rtl.dump")
+    assert str(excinfo.value).startswith("rtl.dump:1: ")
+
+
+def test_commit_rejects_inconsistent_masks() -> None:
+    with pytest.raises(ValueError, match="cannot be both a load and a store"):
+        Commit(cycle=1, pc=0, mem_addr=0, mem_rmask=0x01, mem_wmask=0x02)
+    with pytest.raises(ValueError, match="must mark at least one byte"):
+        Commit(cycle=1, pc=0, mem_addr=0, mem_rmask=0, mem_wmask=0)
+    with pytest.raises(ValueError, match="must not carry mem_wdata"):
+        Commit(cycle=1, pc=0, mem_wdata=1)
+
+
+def test_stream_has_mem_info() -> None:
+    """A stream is memory-aware when at least one commit reports an access."""
+    memory_less = [Commit(cycle=1, pc=0x1000), Commit(cycle=2, pc=0x1004, rd=1, value=1)]
+    memory_aware = [*memory_less, Commit(cycle=3, pc=0x1008, mem_addr=0x2000)]
+    assert not stream_has_mem_info(memory_less)
+    assert stream_has_mem_info(memory_aware)
+    assert not stream_has_mem_info([])
+
+
+def test_mem_helpers_preserve_the_rest_of_the_record() -> None:
+    commit = Commit(cycle=3, pc=0x1000, rd=5, value=1, insn=0x13, mem_addr=0x2000, mem_wmask=0x01)
+    assert commit.with_value(9).mem_addr == 0x2000
+    assert commit.with_pc(0x2004).mem_wmask == 0x01
+    assert commit.with_rd(6).mem_addr == 0x2000
+    assert commit.with_rd(0).mem_addr == 0x2000
+    assert commit.with_cycle(9).mem_addr == 0x2000
+    assert commit.with_mem_addr(0x3000).pc == 0x1000
+    assert commit.with_mem_wdata(0x2A).mem_addr == 0x2000
+    assert commit.with_mem_rmask(0x01).mem_wmask is None   # a load XOR a store
+    assert commit.with_mem_wmask(0x02).mem_rmask is None
+    # a commit without a memory access ignores memory-field tweaks
+    plain = Commit(cycle=1, pc=0x1000)
+    assert plain.with_mem_wdata(1) == plain
+    assert plain.with_mem_wmask(1) == plain

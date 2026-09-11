@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      eth_rv_pkg
 // Description: Frozen parameter pack + decode/writeback control types for eth_rv (RV64IMC, RV-B).
-// Details:     Single blessed configuration (C14 §2): XLEN = 64, one hart, no MMU / FPU /
-//              CSR / trap path. Every pipeline-control field travels as one packed
-//              struct (`ctrl_t`) so the IF->ID->EX->MEM->WB registers stay flat
-//              vectors and the core lints clean under `-Wall`.
+// Details:     Single blessed configuration (C14 §2): XLEN = 64, one hart, no MMU / FPU;
+//              the M-mode CSR + trap path is the minimal set of C14 §3. Every
+//              pipeline-control field travels as one packed struct (`ctrl_t`) so the
+//              IF->ID->EX->MEM->WB registers stay flat vectors and the core lints
+//              clean under `-Wall`.
 //
 //              The enum values are chosen so that a zeroed struct is a legal
 //              "no write / no memory / add" control word: the decoder starts from
@@ -17,9 +18,11 @@
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §2 (frozen parameter pack),
 //              §3 (micro-architecture), §4 (RVFI trace port)
 //              ethereal-plan/subsystems/S15-应用处理器子系统.md §2.2
-// Notes:       RV-B v0 scope: RV64I + M + C integer subset. Unimplemented encodings
-//              (SYSTEM/CSR/FPU/atomics) set `ctrl_t.illegal` and raise the core error
-//              strobe — they NEVER retire silently (C14 §3).
+// Notes:       RV-B v0 scope: RV64I + M + C integer subset, plus the M-mode CSR/trap
+//              path (`mstatus/misa/mie/mip/mtvec/mepc/mcause/mtval/mscratch/mhartid`,
+//              ecall/ebreak/illegal/misaligned). An unimplemented encoding or CSR
+//              number sets `ctrl_t.illegal` and raises the error strobe — it NEVER
+//              retires silently (C14 §3).
 package eth_rv_pkg;
 
     // ---------------------------------------------------------------- config
@@ -58,8 +61,76 @@ package eth_rv_pkg;
     typedef enum logic [1:0] {
         WB_ALU  = 2'd0,
         WB_MEM  = 2'd1,
-        WB_LINK = 2'd2   // pc + 2 (compressed) or pc + 4
+        WB_LINK = 2'd2,  // pc + 2 (compressed) or pc + 4
+        WB_CSR  = 2'd3   // the old value of a CSR (SYSTEM CSRRS/CSRRW/…)
     } wb_sel_e;
+
+    // ------------------------------------------------------------ CSR access
+    // CSR op select, encoded exactly like funct3[1:0] of the SYSTEM encodings:
+    // 1 = read/write, 2 = read/set, 3 = read/clear (funct3 0 is not a CSR op).
+    typedef enum logic [1:0] {
+        CSR_RW = 2'd1,
+        CSR_RS = 2'd2,
+        CSR_RC = 2'd3
+    } csr_op_e;
+
+    // M-mode CSR addresses of the RV-B minimal set (C14 §3).
+    localparam logic [11:0] CSR_MSTATUS  = 12'h300;
+    localparam logic [11:0] CSR_MISA     = 12'h301;
+    localparam logic [11:0] CSR_MIE      = 12'h304;
+    localparam logic [11:0] CSR_MTVEC    = 12'h305;
+    localparam logic [11:0] CSR_MSCRATCH = 12'h340;
+    localparam logic [11:0] CSR_MEPC     = 12'h341;
+    localparam logic [11:0] CSR_MCAUSE   = 12'h342;
+    localparam logic [11:0] CSR_MTVAL    = 12'h343;
+    localparam logic [11:0] CSR_MIP      = 12'h344;
+    localparam logic [11:0] CSR_MHARTID  = 12'hf14;
+
+    // Read-only CSR values. `misa` advertises exactly what RV-B implements
+    // (MXL=64, I, M, C) and the mstatus XL fields are the RV64 values, so a
+    // program that reads them sees the same bit pattern as the Spike golden
+    // model (see verif/eth_rv/README.md). `mip` has no interrupt source yet —
+    // the CLINT/PLIC are a later increment — so it reads as zero.
+    localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_1104;
+    localparam logic [63:0] MSTATUS_XL    = 64'h0000_000a_0000_0000;  // SXL = UXL = 2
+    localparam logic [63:0] MIP_VALUE     = 64'd0;
+    localparam logic [63:0] MHARTID_VALUE = 64'd0;
+
+    // Write masks / field selectors of the writable CSRs.
+    localparam logic [63:0] MIE_WMASK     = 64'h0000_0000_0000_0aaa;  // SSIE MSIE STIE MTIE SEIE MEIE
+    localparam logic [63:0] MSTATUS_WMASK = 64'h0000_0000_0000_1888;  // MIE, MPIE, MPP
+    localparam logic [63:0] MSTATUS_MIE   = 64'h0000_0000_0000_0008;
+    localparam logic [63:0] MSTATUS_MPIE  = 64'h0000_0000_0000_0080;
+    localparam logic [63:0] MSTATUS_MPP_M = 64'h0000_0000_0000_1800;  // MPP = M
+    // mtvec is fully writable: the golden model keeps the MODE bits verbatim and
+    // masks bit 0 only when it computes the trap target. mepc[0] is read-only zero
+    // (IALIGN = 16).
+    localparam logic [63:0] MEPC_MASK     = 64'hffff_ffff_ffff_fffe;
+
+    // ------------------------------------------------------ exception causes
+    // The architectural `mcause` values of the exceptions RV-B can raise
+    // (interrupts are not implemented yet, so bit 63 is always clear). The
+    // codes double as the core's error-strobe codes: `err_o` is the valid
+    // strobe, so CAUSE_INSN_MISALIGN = 0 is distinguishable from "no trap".
+    typedef enum logic [3:0] {
+        CAUSE_INSN_MISALIGN  = 4'd0,   // instruction address misaligned
+        CAUSE_ILLEGAL        = 4'd2,   // illegal / unimplemented instruction
+        CAUSE_BREAKPOINT     = 4'd3,   // ebreak
+        CAUSE_LOAD_MISALIGN  = 4'd4,   // load address misaligned
+        CAUSE_STORE_MISALIGN = 4'd6,   // store address misaligned
+        CAUSE_ECALL_M        = 4'd11   // ecall from M-mode
+    } trap_cause_e;
+
+    // True when `addr` names a CSR this core implements. Anything else is an
+    // illegal instruction (C14 §3: unimplemented CSR access NEVER succeeds
+    // silently) — matching Spike, which rejects e.g. `mstatush` on RV64.
+    function automatic logic csr_implemented(input logic [11:0] addr);
+        unique case (addr)
+            CSR_MSTATUS, CSR_MISA, CSR_MIE, CSR_MTVEC, CSR_MSCRATCH, CSR_MEPC,
+            CSR_MCAUSE, CSR_MTVAL, CSR_MIP, CSR_MHARTID: csr_implemented = 1'b1;
+            default:                                      csr_implemented = 1'b0;
+        endcase
+    endfunction
 
     // ------------------------------------------------ M-extension operation
     typedef enum logic [3:0] {
@@ -107,14 +178,32 @@ package eth_rv_pkg;
         logic       mem_signed;  // sign-extend the loaded value
         logic       is_muldiv;
         md_op_e     md_op;
+        // ---- SYSTEM (C14 §3): CSR access, ecall/ebreak, mret ----
+        logic       is_csr;      // csrrw/csrrs/csrrc + the immediate forms
+        logic       csr_imm;     // source is the 5-bit uimm (insn[19:15]), not rs1
+        csr_op_e    csr_op;
+        logic [11:0] csr_addr;
+        logic       is_ecall;
+        logic       is_ebreak;
+        logic       is_mret;
     } ctrl_t;
 
-    // ------------------------------------------------------ error condition
-    typedef enum logic [3:0] {
-        ERR_NONE     = 4'd0,
-        ERR_ILLEGAL  = 4'd1,  // unimplemented / reserved encoding
-        ERR_MISALIGN = 4'd2   // data access a single aligned beat cannot serve
-    } err_code_e;
+    // The error strobe's code type is `trap_cause_e`: the core no longer halts on
+    // an exception, it takes the trap, so the strobe reports the architectural
+    // `mcause` value (see the type's own comment).
+
+    // The stored value in the trace/RVFI convention: the low `size` bytes of the
+    // store data, unshifted — exactly what Spike prints for a store's `mem` field
+    // (`sb` of 0x1234 logs 0x34), so the harness can compare it byte for byte.
+    function automatic logic [63:0] store_wdata(input logic [63:0] data,
+                                                input mem_size_e size);
+        unique case (size)
+            SZ_BYTE: store_wdata = {56'd0, data[7:0]};
+            SZ_HALF: store_wdata = {48'd0, data[15:0]};
+            SZ_WORD: store_wdata = {32'd0, data[31:0]};
+            default: store_wdata = data;
+        endcase
+    endfunction
 
     // ---------------------------------------------- commit-stage control
     // The WB stage needs four control bits, not the whole decode bundle: keeping
