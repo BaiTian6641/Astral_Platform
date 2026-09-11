@@ -5,13 +5,15 @@
 // Details:     Drives the per-column configuration frame bus. v0 commands:
 //                 NOP(0) / WRITE(1) / READBACK(2) / BLANK(3)
 //               * WRITE    : streams DATA words to the frame bus, 1 word/cycle,
-//                            computing a streaming CRC32; on completion stores the
-//                            final CRC into write_crc_r.
+//                            computing a streaming CRC32 (exposed on crc_result_o
+//                            after completion).
 //               * BLANK    : self-driven zero-word writes (no wdata stream), same
 //                            CRC accumulation as WRITE.
 //               * READBACK : reads the frame back via fbus_re (combinational-read
 //                            target in v0), recomputes CRC32, then CMP compares
-//                            against write_crc_r.
+//                            against expect_crc_i latched at command accept
+//                            (v0.5 spec §3.1.1: the caller captures crc_result_o
+//                            after the WRITE and supplies it as the expectation).
 //               WRITE/BLANK are gated by region_locked_i (reject -> LOCKED);
 //               READBACK is NOT lock-checked in v0 (read is non-destructive).
 //               crc_error_o is sticky: set on a READBACK CRC mismatch, cleared on
@@ -26,6 +28,8 @@
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB4)
 // Modified:    2026-07-24 - blank-before-write enforcement + NEEDS_BLANK (task E0-FAB5)
+// Modified:    2026-09-11 - v0.5 expected-CRC gate: expect_crc_i latched at
+//                           accept, crc_result_o exposed (spec §3.1.1)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C03-OCC组件.md §2
 // Notes:       v0 scope per C03 §2.2 (simplified): no mailbox/DMA, no col_ack
@@ -73,7 +77,12 @@ module occ_top #(
     // status + lock
     output logic [2:0]            status_o,        // 0=IDLE 1=BUSY 2=DONE 3=ERROR 4=LOCKED
     output logic                  crc_error_o,     // sticky; set on readback CRC mismatch
-    input  logic                  region_locked_i  // 1 = current region locked (blocks WRITE/BLANK)
+    input  logic                  region_locked_i, // 1 = current region locked (blocks WRITE/BLANK)
+    // v0.5 spec §3.1.1 expected-CRC gate: READBACK compares its stream CRC
+    // against expect_crc_i latched at command accept; crc_result_o exposes the
+    // running/streaming CRC (= the final WRITE/BLANK stream CRC after completion).
+    input  logic [DATA_W-1:0]     expect_crc_i,
+    output logic [DATA_W-1:0]     crc_result_o
 );
 
     // --------------------------------------------------------------------
@@ -140,7 +149,7 @@ module occ_top #(
     logic [15:0]       word_count_r;   // latched word count
     logic [15:0]       idx_r;          // intra-frame word index
     logic [31:0]       crc_r;          // running streaming CRC (write + readback)
-    logic [31:0]       write_crc_r;    // CRC captured at WRITE/BLANK completion
+    logic [31:0]       expect_crc_latched_r; // v0.5 §3.1.1: expected READBACK CRC (latched at accept)
     logic              crc_error_r;    // sticky readback-mismatch flag
 
     // --------------------------------------------------------------------
@@ -159,10 +168,9 @@ module occ_top #(
     // datapath control hints
     logic              c_accept;        // IDLE: a command is accepted this cycle
     logic              c_write_word;    // WRITE: a data word is being written
-    logic              c_write_last;    // WRITE: this word is the final one
     logic              c_blank_word;    // BLANK: a zero word is being written
     logic              c_read_word;     // READBACK: a word is being read
-    logic              c_cmp_mismatch;  // CMP: crc_r != write_crc_r
+    logic              c_cmp_mismatch;  // CMP: crc_r != expect_crc_latched_r
 
     // blank-before-write (E0-FAB5, C03 sec3): per-region dirty tracking
     logic [3:0]  region_id_w;       // current cmd region = frame_addr top 4 bits
@@ -183,7 +191,6 @@ module occ_top #(
         fbus_wdata     = '0;
         c_accept       = 1'b0;
         c_write_word   = 1'b0;
-        c_write_last   = 1'b0;
         c_blank_word   = 1'b0;
         c_read_word    = 1'b0;
         c_cmp_mismatch = 1'b0;
@@ -241,7 +248,6 @@ module occ_top #(
                         fbus_addr    = frame_addr_r + idx_r;
                         fbus_wdata   = wdata_i;
                         c_write_word = 1'b1;
-                        if (idx_r == (word_count_r - 16'd1)) c_write_last = 1'b1;
                     end
                     state_nxt = ST_WRITE;
                 end
@@ -275,8 +281,9 @@ module occ_top #(
             end
 
             ST_CMP: begin
-                // crc_r and write_crc_r both hold their final values
-                if (crc_r == write_crc_r) begin
+                // crc_r holds the readback stream CRC; the expected value was
+                // latched from expect_crc_i at command accept (v0.5 §3.1.1)
+                if (crc_r == expect_crc_latched_r) begin
                     status_c = S_DONE;
                 end else begin
                     status_c       = S_ERROR;
@@ -309,7 +316,7 @@ module occ_top #(
             word_count_r <= '0;
             idx_r        <= '0;
             crc_r        <= 32'hFFFF_FFFF;
-            write_crc_r  <= 32'hFFFF_FFFF;
+            expect_crc_latched_r <= 32'hFFFF_FFFF;
             crc_error_r  <= 1'b0;
             region_id_r  <= '0;
             dirty_r      <= '0;            // E0-FAB5: regions start CLEAN
@@ -320,18 +327,15 @@ module occ_top #(
                 word_count_r <= word_count_i;
                 idx_r        <= '0;
                 crc_r        <= 32'hFFFF_FFFF;
+                expect_crc_latched_r <= expect_crc_i;   // v0.5 §3.1.1
                 crc_error_r  <= 1'b0;
                 region_id_r  <= region_id_w;   // E0-FAB5: latch region of in-flight op
             end else if (c_write_word) begin
                 idx_r   <= idx_r + 16'd1;
                 crc_r   <= crc32_next(crc_r, wdata_i);
-                if (c_write_last) write_crc_r <= crc32_next(crc_r, wdata_i);
             end else if (c_blank_word) begin
                 idx_r   <= idx_r + 16'd1;
                 crc_r   <= crc32_next(crc_r, 32'h0);
-                if (idx_r == (word_count_r - 16'd1)) begin
-                    write_crc_r <= crc32_next(crc_r, 32'h0);
-                end
             end else if (c_read_word) begin
                 idx_r <= idx_r + 16'd1;
                 crc_r <= crc32_next(crc_r, fbus_rdata_i);
@@ -356,6 +360,7 @@ module occ_top #(
     assign fbus_re_o    = fbus_re;
     assign status_o     = status_c;
     assign crc_error_o  = crc_error_r;
+    assign crc_result_o = crc_r;
     assign region_id_w  = frame_addr_i[ADDR_W-1 -: 4];   // E0-FAB5: top-4-bit region id
 
 endmodule

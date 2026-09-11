@@ -28,6 +28,8 @@ R_OCC_STATUS = 0x0A
 R_OCC_FRAME_ADDR = 0x0B
 R_OCC_WORD_COUNT = 0x0C
 R_OCC_DECODE = 0x0D
+R_OCC_EXPECT_CRC = 0x0E  # v0.5 (spec sec 3.1.1): expected READBACK CRC (RW)
+R_OCC_CRC_RESULT = 0x0F  # v0.5 (spec sec 3.1.1): OCC running/streaming CRC (R)
 R_SESSION_CMD = 0x10
 R_SESSION_STATUS = 0x11
 R_RX_BUF_CTRL = 0x12
@@ -57,8 +59,9 @@ EFP_CMD_STOP = 2
 EFP_CMD_RESTART = 3
 EFP_CMD_ABORT = 4
 EFP_CMD_RUN_PACKED = 5  # v0.3: bit-packed production-frame deploy (spec sec 3.3)
+EFP_CMD_FWUPDATE = 6  # v0.4 (spec sec 3.6): SIM-DEMO dual-partition fw update
+EFP_CMD_REBOOT = 7  # v0.4 (spec sec 3.6): SIM-DEMO re-enter boot stub
 EFP_REGION_AUTO = 0xFF
-
 # EFP daemon lifecycle states (EFP_STATUS.state)
 EFP_S_IDLE = 0
 EFP_S_VERIFY = 1
@@ -80,6 +83,19 @@ EFP_ERR_OCC_REJECT = 5
 EFP_ERR_BAD_CMD = 6
 EFP_ERR_IMG_LEN_MISMATCH = 7
 EFP_ERR_CRC_TRANSPORT = 8  # v0.3 (spec sec 7.1): EFP-SPI OCC_PUSH CRC16 mismatch
+EFP_ERR_WATCHDOG_TIMEOUT = 9  # v0.4 (spec sec 3.5): OCC op watchdog fired
+EFP_ERR_FWUPDATE = 10  # v0.4 (spec sec 3.6): sim-demo fw-update CRC mismatch
+
+# ---- Event-log ring (spec sec 3.4, v0.4) ----
+# 16-entry ring in the regfile: write 0x39 pushes, read 0x39 pops-oldest,
+# write 0x38 with bit16 set clears. Entry = {code[7:0], region[15:8], stamp[31:16]}.
+R_EVT_LOG_CTRL = 0x38
+R_EVT_LOG_DATA = 0x39
+EVT_LOG_DEPTH = 16
+EVT_LOG_CLEAR = 0x0001_0000  # write-1-to-bit16-clears
+EVT_CODE_WATCHDOG_TIMEOUT = 1
+EVT_CODE_HB_MISMATCH = 2
+EVT_CODE_SLOT_CHANGE = 3
 
 # ---- CAPABILITIES bits ----
 CAPB_HAS_BMC = 0

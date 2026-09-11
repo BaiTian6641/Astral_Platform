@@ -84,6 +84,8 @@ module shell_tb_mgmt_packed;
   logic [R*C*48-1:0]     dsp_vp_obs;
 
   // ---- DUTs ----
+  logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+  logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
   emri_regfile #(
     .HAS_BMC(1'b0), .NUM_REGIONS(2), .PLATFORM_ID(32'h0000_0000),
     .REGION0_INFO(32'h0202_0010), .REGION1_INFO(32'h0202_0010)
@@ -96,7 +98,9 @@ module shell_tb_mgmt_packed;
     .occ_frame_addr_o(occ_frame_addr), .occ_word_count_o(occ_word_count),
     .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid), .occ_wdata_ready_i(occ_wdata_ready),
     .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-    .occ_region_locked_o(occ_region_locked)
+    .occ_region_locked_o(occ_region_locked),
+    .occ_expect_crc_o(occ_expect_crc_w),
+    .occ_crc_result_i(occ_crc_result_w)
   );
 
   occ_top #(.ADDR_W(16), .DATA_W(32)) u_occ (
@@ -108,7 +112,9 @@ module shell_tb_mgmt_packed;
     .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata), .fbus_we_o(fbus_we),
     .fbus_re_o(), .fbus_rdata_i(32'h0),   // no cfg readback on fabric_top (assert functional)
     .status_o(occ_status), .crc_error_o(occ_crc_error),
-    .region_locked_i(occ_region_locked)
+    .region_locked_i(occ_region_locked),
+    .expect_crc_i(occ_expect_crc_w),
+    .crc_result_o(occ_crc_result_w)
   );
 
   frame_decoder #(

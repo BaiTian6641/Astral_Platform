@@ -95,9 +95,62 @@ $(BUILD)/bmc_dmem.bin: $(BUILD)/bmc_fw.elf
 $(BUILD)/bmc_dmem_lane0.hex: $(BUILD)/bmc_dmem.bin bin2hex.py
 	python3 bin2hex.py --lanes 4 4096 $< $(BUILD)/bmc_dmem_lane
 
+# ----------------------------------------------------------------------
+# E1-BMC2 sim-demo firmware: dual-partition fw-update variant (fwupdate/,
+# emri-v0.md sec 3.6 v0.4). SIM-SCOPED: no Ed25519/daemon/SPI — just the
+# boot stub + update server + UART/EMRI drivers.
+# ----------------------------------------------------------------------
+FWUPD_OBJS := $(BUILD)/crt0.o $(BUILD)/main_fwupdate.o $(BUILD)/uart.o \
+              $(BUILD)/fwupdate.o
+
+$(BUILD)/main_fwupdate.o: fwupdate/main_fwupdate.c drivers/uart.h \
+                          fwupdate/fwupdate.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/fwupdate.o: fwupdate/fwupdate.c fwupdate/fwupdate.h drivers/emri.h \
+                     drivers/uart.h daemon/daemon.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/fwupdate.elf: $(FWUPD_OBJS) link.ld
+	$(CC) $(LDFLAGS) $(FWUPD_OBJS) -o $@
+
+$(BUILD)/fwupdate_boot.bin: $(BUILD)/fwupdate.elf
+	$(OBJCOPY) -O binary --only-section=.boot $< $@
+
+$(BUILD)/fwupdate_boot.hex: $(BUILD)/fwupdate_boot.bin bin2hex.py
+	python3 bin2hex.py $< $@ 256
+
+$(BUILD)/fwupdate_dmem.bin: $(BUILD)/fwupdate.elf
+	$(OBJCOPY) -O binary --only-section=.text --only-section=.data $< $@
+
+$(BUILD)/fwupdate_dmem_lane0.hex: $(BUILD)/fwupdate_dmem.bin bin2hex.py
+	python3 bin2hex.py --lanes 4 4096 $< $(BUILD)/fwupdate_dmem_lane
+
+.PHONY: fwupdate slots
+fwupdate: $(BUILD)/fwupdate_boot.hex $(BUILD)/fwupdate_dmem_lane0.hex
+
+# Slot payloads (XIP from the TB flash window 0x4001_0000): slot A payload
+# entry = word 5 = byte 0x14; slot B entry = word 64+5 = byte 0x114
+# (fwupdate.h slot layout). Padded to exactly FW_PAYLOAD_WORDS = 16 words.
+SLOT_A_ENTRY := 0x40010014
+SLOT_B_ENTRY := 0x40010114
+
+$(BUILD)/slot_v1.elf: fwupdate/slot_payload.S | $(BUILD)
+	$(CC) $(ASFLAGS) -nostartfiles -Wl,-Ttext=$(SLOT_A_ENTRY) -D SLOT_VER=1 -o $@ $<
+
+$(BUILD)/slot_v2.elf: fwupdate/slot_payload.S | $(BUILD)
+	$(CC) $(ASFLAGS) -nostartfiles -Wl,-Ttext=$(SLOT_B_ENTRY) -D SLOT_VER=2 -o $@ $<
+
+$(BUILD)/slot_v1.hex: $(BUILD)/slot_v1.elf bin2hex.py
+	$(OBJCOPY) -O binary $< $(BUILD)/slot_v1.bin
+	python3 bin2hex.py $(BUILD)/slot_v1.bin $@ 16
+
+$(BUILD)/slot_v2.hex: $(BUILD)/slot_v2.elf bin2hex.py
+	$(OBJCOPY) -O binary $< $(BUILD)/slot_v2.bin
+	python3 bin2hex.py $(BUILD)/slot_v2.bin $@ 16
+
+slots: $(BUILD)/slot_v1.hex $(BUILD)/slot_v2.hex
+
 # Regenerate the trusted-key keyring (deterministic; also used for TB vectors).
 vectors: daemon/gen_daemon_vectors.py
 	python3 daemon/gen_daemon_vectors.py --keyring daemon/keyring.h
-
-clean:
-	rm -rf $(BUILD)

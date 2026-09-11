@@ -65,6 +65,8 @@ module tb_emri_occ_loop;
   logic [DATA_W-1:0] fbus_rdata;
 
   // ---- DUTs ----
+  logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+  logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
   emri_regfile #(
     .HAS_BMC(1'b0), .NUM_REGIONS(2),
     .PLATFORM_ID(32'h0000_0000),
@@ -80,7 +82,9 @@ module tb_emri_occ_loop;
     .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
     .occ_wdata_ready_i(occ_wdata_ready),
     .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-    .occ_region_locked_o(occ_region_locked)
+    .occ_region_locked_o(occ_region_locked),
+    .occ_expect_crc_o(occ_expect_crc_w),
+    .occ_crc_result_i(occ_crc_result_w)
   );
 
   occ_top #(.ADDR_W(ADDR_W), .DATA_W(DATA_W)) u_occ (
@@ -91,7 +95,9 @@ module tb_emri_occ_loop;
     .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata), .fbus_we_o(fbus_we),
     .fbus_re_o(fbus_re), .fbus_rdata_i(fbus_rdata),
     .status_o(occ_status), .crc_error_o(occ_crc_error),
-    .region_locked_i(occ_region_locked)
+    .region_locked_i(occ_region_locked),
+    .expect_crc_i(occ_expect_crc_w),
+    .crc_result_o(occ_crc_result_w)
   );
 
   column_cfg_ram #(.ADDR_W(ADDR_W), .DATA_W(DATA_W), .DEPTH(8192)) u_ram (
@@ -218,6 +224,8 @@ module tb_emri_occ_loop;
     // ---- 4. READBACK + CRC verify (deploy-verify cycle) ----
     emri_write(R_OCC_FRAME_ADDR, 32'h0000_0000);
     emri_write(R_OCC_WORD_COUNT, NWORDS);
+    emri_read(R_OCC_CRC_RESULT, rd);   // v0.5 §3.1.1: gate = WRITE stream CRC
+    emri_write(R_OCC_EXPECT_CRC, rd);
     emri_cmd(OCC_READBACK, 4'd0);
     wait_occ_done(dc);
     chk(dc == 2'd0, "READBACK done_code=DONE");
@@ -234,6 +242,8 @@ module tb_emri_occ_loop;
     u_ram.mem[3] = 32'hDEAD_BEEF;   // backdoor flip
     emri_write(R_OCC_FRAME_ADDR, 32'h0000_0000);
     emri_write(R_OCC_WORD_COUNT, NWORDS);
+    emri_read(R_OCC_CRC_RESULT, rd);   // v0.5 §3.1.1: gate = clean frame CRC
+    emri_write(R_OCC_EXPECT_CRC, rd);
     emri_cmd(OCC_READBACK, 4'd0);
     wait_occ_done(dc);
     chk(dc == 2'd1, "tamper: READBACK done_code=ERROR");

@@ -199,6 +199,8 @@ module tb_bmc_axi_fabric;
     logic [R*C*32-1:0]  mem_vd_obs;
     logic [R*C*48-1:0]  dsp_vp_obs;
 
+    logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+    logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
     emri_regfile #(
         .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0)
     ) u_emri (
@@ -214,7 +216,9 @@ module tb_bmc_axi_fabric;
         .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
         .occ_region_locked_o(occ_region_locked),
         // v0.1 R_OCC_DECODE -> frame_decoder start trigger (busy backpressured)
-        .dec_start_o(dec_start), .dec_col_o(dec_col), .dec_busy_i(dec_busy)
+        .dec_start_o(dec_start), .dec_col_o(dec_col), .dec_busy_i(dec_busy),
+        .occ_expect_crc_o(occ_expect_crc_w),
+        .occ_crc_result_i(occ_crc_result_w)
     );
 
     occ_top #(.ADDR_W(16), .DATA_W(32)) u_occ (
@@ -226,7 +230,9 @@ module tb_bmc_axi_fabric;
         .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata),
         .fbus_we_o(fbus_we), .fbus_re_o(), .fbus_rdata_i(32'h0),
         .status_o(occ_status), .crc_error_o(occ_crc_error),
-        .region_locked_i(occ_region_locked)
+        .region_locked_i(occ_region_locked),
+        .expect_crc_i(occ_expect_crc_w),
+        .crc_result_o(occ_crc_result_w)
     );
 
     frame_decoder #(

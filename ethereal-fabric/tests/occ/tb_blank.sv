@@ -85,7 +85,9 @@ module tb_blank;
         .fbus_rdata_i   (fbus_rdata),
         .status_o       (status),
         .crc_error_o    (crc_error),
-        .region_locked_i(region_locked)
+        .region_locked_i(region_locked),
+        .expect_crc_i   (32'h0),   // v0.5 §3.1.1: this TB issues no READBACK
+        .crc_result_o   ()
     );
 
     // ---- frame-bus target: column config RAM model ----

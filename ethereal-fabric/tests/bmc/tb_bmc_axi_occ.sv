@@ -181,6 +181,8 @@ module tb_bmc_axi_occ;
     logic [31:0] fbus_wdata, fbus_rdata;
     logic        fbus_we, fbus_re;
 
+    logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+    logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
     emri_regfile #(
         .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0)
     ) u_emri (
@@ -195,7 +197,9 @@ module tb_bmc_axi_occ;
         .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
         .occ_wdata_ready_i(occ_wdata_ready),
         .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-        .occ_region_locked_o(occ_region_locked)
+        .occ_region_locked_o(occ_region_locked),
+        .occ_expect_crc_o(occ_expect_crc_w),
+        .occ_crc_result_i(occ_crc_result_w)
     );
 
     occ_top u_occ (
@@ -207,7 +211,9 @@ module tb_bmc_axi_occ;
         .fbus_addr_o(fbus_addr), .fbus_wdata_o(fbus_wdata),
         .fbus_we_o(fbus_we), .fbus_re_o(fbus_re), .fbus_rdata_i(fbus_rdata),
         .status_o(occ_status), .crc_error_o(occ_crc_error),
-        .region_locked_i(occ_region_locked)
+        .region_locked_i(occ_region_locked),
+        .expect_crc_i(occ_expect_crc_w),
+        .crc_result_o(occ_crc_result_w)
     );
 
     column_cfg_ram #(.ADDR_W(16), .DATA_W(32), .DEPTH(8192)) u_ram (

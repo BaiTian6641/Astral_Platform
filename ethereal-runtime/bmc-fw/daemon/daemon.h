@@ -28,9 +28,11 @@
 #define EFP_CMD_RESTART 3u
 #define EFP_CMD_ABORT   4u
 #define EFP_CMD_RUN_PACKED 5u /* v0.3: bit-packed production-frame deploy (sec 3.3) */
+#define EFP_CMD_FWUPDATE   6u /* v0.4 sec 3.6: SIM-DEMO (E1-BMC2). The production
+                               * daemon answers this (and REBOOT) bad_cmd. */
+#define EFP_CMD_REBOOT     7u /* v0.4 sec 3.6: SIM-DEMO re-enter boot stub */
 #define EFP_REGION_AUTO 0xFFu /* auto-allocate first free (run only) */
 
-/* EFP daemon lifecycle states (EFP_STATUS.state[3:0]). */
 #define EFP_S_IDLE     0u
 #define EFP_S_VERIFY   1u
 #define EFP_S_ALLOC    2u
@@ -55,6 +57,28 @@
 #define EFP_ERR_BAD_CMD          6u
 #define EFP_ERR_IMG_LEN_MISMATCH 7u
 #define EFP_ERR_CRC_TRANSPORT    8u /* v0.3 sec 7.1: EFP-SPI OCC_PUSH CRC16 mismatch */
+#define EFP_ERR_WATCHDOG_TIMEOUT 9u /* v0.4 sec 3.5: OCC op watchdog fired */
+#define EFP_ERR_FWUPDATE        10u /* v0.4 sec 3.6 (sim-demo): fw-update CRC mismatch */
+
+/* Event-log entry codes (emri-v0.md sec 3.4; entry = {code, region, stamp}). */
+#define EVT_CODE_WATCHDOG_TIMEOUT 1u /* sec 3.5: op watchdog fired on region */
+#define EVT_CODE_HB_MISMATCH      2u /* sec 3.5: heartbeat READBACK CRC mismatch */
+#define EVT_CODE_SLOT_CHANGE      3u /* sec 3.6 (sim-demo): slot selected/updated */
+
+/* OCC op watchdog budget (sec 3.5): occ_wait_done poll iterations before the
+ * daemon declares the op starved. One iteration = efp_spi_service() + one
+ * EMRI OCC_STATUS read ~= 100 fabric cycles, so 2^20 iterations ~= 1.05e8
+ * cycles ~= 1.05 s @ 100 MHz. Worst LEGIT case is LOAD pacing: 4096 words
+ * (16 KiB rx_buf bound) over a 1 MHz EFP-SPI link ~= 0.23 s — >4.5x margin;
+ * AXI hosts are ~10^3x faster. BLANK/READBACK are self-driven (us). */
+#define OCC_WDT_POLL_BUDGET (1u << 20)
+
+/* Region heartbeat interval (sec 3.5): daemon IDLE poll-loop iterations
+ * between READBACK liveness probes of RUNNING regions. ~= 2e7 cycles
+ * ~= 0.2 s @ 100 MHz; live-session command gaps are us-ms, so the probe
+ * only runs in genuinely idle stretches. v0 simplification: READBACK CRC
+ * stands in for a HW heartbeat tap (E2 scope). */
+#define DAEMON_HB_INTERVAL 200000u
 
 /* Region count: v0 fixed at 2 (ADR-004 build-time; NUM_REGIONS reg = 2). */
 #define DAEMON_NUM_REGIONS 2u

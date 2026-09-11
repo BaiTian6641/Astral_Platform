@@ -384,7 +384,7 @@ tasks:
     est_days: 2
     deliverable: bmc-fw/watchdog/
     acceptance: 死锁镜像超时自动 blank，相邻 region 无损
-    status: todo
+    status: done   # 2026-09-11 (sim 范围): OCC op watchdog（2^20 预算 → drain-complete + BLANK + EFP_ERR=9 + 事件 code 1）+ region 心跳 + 事件环（§3.4）；tb_bmc_watchdog 29/29 全过（含邻区无损）。过程中修出并经 ADR-019/spec v0.5 解决两个真问题：① frame_decoder.frame_base_i 全 TB 硬接 0 → region>0 部署错解；② occ_top 单一 write_crc_r「最后写赢」→ 心跳误隔离健康 region 且 cols>1 部署必然失败 → 引入软件供给的 OCC_EXPECT_CRC/OCC_CRC_RESULT（§3.1.1）。回归：tb_bmc_daemon 39 / packed 25 / spi 31 / replay 18 / fwupdate 30 全过，模型 2683+2xfail，lint/ruff clean；report-E1-RUN4-watchdog-20260911、ADR-019
 
   - id: E1-DMO1
     title: 三个演示镜像（PWM/UART 回显/AES-128）

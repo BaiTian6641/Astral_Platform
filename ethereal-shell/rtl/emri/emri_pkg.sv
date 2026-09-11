@@ -37,12 +37,24 @@ package emri_pkg;
   // (-> frame_decoder.start_i) so a packed deploy is self-contained over the
   // register ABI (no host/TB sideband strobe). v0.1 (emri-v0.md §3.1).
   localparam logic [15:0] R_OCC_DECODE     = 16'h0D;
+  // v0.5 §3.1.1: READBACK compares its stream CRC against OCC_EXPECT_CRC
+  // (latched by occ_top at command accept); OCC_CRC_RESULT exposes the
+  // running/streaming CRC (after WRITE/BLANK = that stream's final CRC).
+  localparam logic [15:0] R_OCC_EXPECT_CRC = 16'h0E;
+  localparam logic [15:0] R_OCC_CRC_RESULT = 16'h0F;
   localparam logic [15:0] R_SESSION_CMD    = 16'h10;
   localparam logic [15:0] R_SESSION_STATUS = 16'h11;
   localparam logic [15:0] R_RX_BUF_CTRL    = 16'h12;
   localparam logic [15:0] R_HEALTH_STATUS  = 16'h20;
   localparam logic [15:0] R_MON_TEMP       = 16'h30;
   localparam logic [15:0] R_MON_VCCINT     = 16'h31;
+  // Event-log ring (v0.4, spec §3.4): 16-entry ring in the regfile; daemon
+  // writes entries via R_EVT_LOG_DATA (push), host reads them back (pop-
+  // oldest) and clears via R_EVT_LOG_CTRL write-1-to-bit16.
+  localparam logic [15:0] R_EVT_LOG_CTRL   = 16'h38;
+  localparam logic [15:0] R_EVT_LOG_DATA   = 16'h39;
+  localparam int          EVT_LOG_DEPTH    = 16;      // ring capacity (entries)
+  localparam logic [31:0] EVT_LOG_CLEAR    = 32'h0001_0000;  // W1C bit16
 
   // ------------------------------------------------------------------
   // EFP command block (spec §3.2, v0.2) — host<->BMC-daemon mailbox.
@@ -129,6 +141,8 @@ package emri_pkg;
   localparam logic [7:0] EFP_CMD_RESTART = 8'd3;
   localparam logic [7:0] EFP_CMD_ABORT   = 8'd4;
   localparam logic [7:0] EFP_CMD_RUN_PACKED = 8'd5;  // v0.3 bit-packed deploy (§3.3)
+  localparam logic [7:0] EFP_CMD_FWUPDATE = 8'd6;   // v0.4 §3.6 SIM-DEMO (E1-BMC2)
+  localparam logic [7:0] EFP_CMD_REBOOT   = 8'd7;   // v0.4 §3.6 SIM-DEMO (E1-BMC2)
   localparam logic [7:0] EFP_REGION_AUTO = 8'hFF;  // auto first-free (run only)
 
   // EFP daemon lifecycle states (spec §3.2; EFP_STATUS.state[3:0])
@@ -152,6 +166,17 @@ package emri_pkg;
   localparam logic [7:0] EFP_ERR_BAD_CMD          = 8'd6;
   localparam logic [7:0] EFP_ERR_IMG_LEN_MISMATCH = 8'd7;
   localparam logic [7:0] EFP_ERR_CRC_TRANSPORT    = 8'd8;  // §7.1 SPI CRC16 gate
+  localparam logic [7:0] EFP_ERR_WATCHDOG_TIMEOUT = 8'd9;   // v0.4 §3.5 OCC op watchdog
+  localparam logic [7:0] EFP_ERR_FWUPDATE         = 8'd10;  // v0.4 §3.6 sim-demo CRC mismatch
+
+  // ------------------------------------------------------------------
+  // Event-log ring entry codes (v0.4, spec §3.4; entry {code[7:0],
+  // region[15:8], stamp[31:16]}). Producers: daemon (codes 1-2),
+  // fwupdate demo firmware (code 3).
+  // ------------------------------------------------------------------
+  localparam logic [7:0] EVT_CODE_WATCHDOG_TIMEOUT = 8'd1;
+  localparam logic [7:0] EVT_CODE_HB_MISMATCH      = 8'd2;
+  localparam logic [7:0] EVT_CODE_SLOT_CHANGE      = 8'd3;
   /* verilator lint_on UNUSEDPARAM */
 
 endpackage : emri_pkg

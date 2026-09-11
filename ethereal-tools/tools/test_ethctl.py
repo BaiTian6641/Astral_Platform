@@ -140,6 +140,21 @@ def test_emri_constants_match_pkg_sv():
         ("SPI_STAT_CRC_ERR", "SPI_STAT_CRC_ERR"),
         ("SPI_STAT_NOT_READY", "SPI_STAT_NOT_READY"),
         ("R_SPI_CRC", "R_SPI_CRC"),
+        # Event-log ring + watchdog/fwupdate (emri-v0.md sec 3.4-3.6, v0.4)
+        ("R_EVT_LOG_CTRL", "R_EVT_LOG_CTRL"),
+        ("R_EVT_LOG_DATA", "R_EVT_LOG_DATA"),
+        # OCC expected-CRC gate (emri-v0.md sec 3.1.1, v0.5)
+        ("R_OCC_EXPECT_CRC", "R_OCC_EXPECT_CRC"),
+        ("R_OCC_CRC_RESULT", "R_OCC_CRC_RESULT"),
+        ("EVT_LOG_DEPTH", "EVT_LOG_DEPTH"),
+        ("EVT_LOG_CLEAR", "EVT_LOG_CLEAR"),
+        ("EVT_CODE_WATCHDOG_TIMEOUT", "EVT_CODE_WATCHDOG_TIMEOUT"),
+        ("EVT_CODE_HB_MISMATCH", "EVT_CODE_HB_MISMATCH"),
+        ("EVT_CODE_SLOT_CHANGE", "EVT_CODE_SLOT_CHANGE"),
+        ("EFP_ERR_WATCHDOG_TIMEOUT", "EFP_ERR_WATCHDOG_TIMEOUT"),
+        ("EFP_ERR_FWUPDATE", "EFP_ERR_FWUPDATE"),
+        ("EFP_CMD_FWUPDATE", "EFP_CMD_FWUPDATE"),
+        ("EFP_CMD_REBOOT", "EFP_CMD_REBOOT"),
     ]
     assert pkg, "failed to parse any localparams from emri_pkg.sv"
     for py_name, sv_name in pairs:

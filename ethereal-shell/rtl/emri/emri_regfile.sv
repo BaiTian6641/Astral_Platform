@@ -70,6 +70,8 @@ module emri_regfile #(
   input  logic [2:0]  occ_status_i,
   input  logic        occ_crc_error_i,
   output logic        occ_region_locked_o,  // v0: hardwired 0 (see Details)
+  output logic [31:0] occ_expect_crc_o,     // v0.5 §3.1.1: expected READBACK CRC (regfile storage)
+  input  logic [31:0] occ_crc_result_i,     // v0.5 §3.1.1: occ_top running/streaming CRC
 
   // -- frame_decoder start trigger (v0.1, emri-v0.md §3.1)
   output logic        dec_start_o,          // 1-cycle pulse on R_OCC_DECODE write
@@ -96,9 +98,15 @@ module emri_regfile #(
   localparam logic [15:0] R_OCC_FRAME_ADDR = emri_pkg::R_OCC_FRAME_ADDR;
   localparam logic [15:0] R_OCC_WORD_COUNT = emri_pkg::R_OCC_WORD_COUNT;
   localparam logic [15:0] R_OCC_DECODE     = emri_pkg::R_OCC_DECODE;
+  localparam logic [15:0] R_OCC_EXPECT_CRC = emri_pkg::R_OCC_EXPECT_CRC;
+  localparam logic [15:0] R_OCC_CRC_RESULT = emri_pkg::R_OCC_CRC_RESULT;
   localparam logic [15:0] R_SESSION_CMD    = emri_pkg::R_SESSION_CMD;
   localparam logic [15:0] R_SESSION_STATUS = emri_pkg::R_SESSION_STATUS;
   localparam logic [15:0] R_RX_BUF_CTRL    = emri_pkg::R_RX_BUF_CTRL;
+  localparam logic [15:0] R_EVT_LOG_CTRL   = emri_pkg::R_EVT_LOG_CTRL;
+  localparam logic [15:0] R_EVT_LOG_DATA   = emri_pkg::R_EVT_LOG_DATA;
+  localparam int          EVT_LOG_DEPTH    = emri_pkg::EVT_LOG_DEPTH;
+  localparam logic [31:0] EVT_LOG_CLEAR    = emri_pkg::EVT_LOG_CLEAR;
   localparam logic [15:0] R_HEALTH_STATUS  = emri_pkg::R_HEALTH_STATUS;
   localparam logic [15:0] R_MON_TEMP       = emri_pkg::R_MON_TEMP;
   localparam logic [15:0] R_MON_VCCINT     = emri_pkg::R_MON_VCCINT;
@@ -140,6 +148,7 @@ module emri_regfile #(
   // ------------------------------------------------------------------
   logic [15:0] occ_frame_addr_r;
   logic [15:0] occ_word_count_r;
+  logic [31:0] occ_expect_crc_r;   // v0.5 §3.1.1 (plain RW storage)
   logic [7:0]  region_sel_r;
   // OCC command latch (held until occ_cmd_ready pulse)
   logic [1:0]  occ_cmd_r;
@@ -206,6 +215,7 @@ module emri_regfile #(
   assign occ_cmd_valid_o  = occ_start_r;
   assign occ_frame_addr_o = occ_frame_addr_r;
   assign occ_word_count_o = occ_word_count_r;
+  assign occ_expect_crc_o = occ_expect_crc_r;
   assign occ_region_locked_o = 1'b0;  // v0 (see Details)
 
   // ------------------------------------------------------------------
@@ -240,6 +250,7 @@ module emri_regfile #(
     if (!rst_ni) begin
       occ_frame_addr_r <= 16'h0;
       occ_word_count_r <= 16'h0;
+      occ_expect_crc_r <= 32'h0;
       region_sel_r     <= 8'h0;
       session_cmd_r    <= 8'h0;
       session_status_r <= 8'h0;
@@ -253,6 +264,7 @@ module emri_regfile #(
       case (host_addr_i)
         R_OCC_FRAME_ADDR: occ_frame_addr_r <= host_wdata_i[15:0];
         R_OCC_WORD_COUNT: occ_word_count_r <= host_wdata_i[15:0];
+        R_OCC_EXPECT_CRC: occ_expect_crc_r <= host_wdata_i;
         R_REGION_SEL:     region_sel_r     <= host_wdata_i[7:0];
         R_SESSION_CMD:    session_cmd_r    <= host_wdata_i[7:0];
         R_EFP_CMD:        efp_cmd_r        <= host_wdata_i[7:0];
@@ -294,6 +306,60 @@ module emri_regfile #(
       end
     end
   endgenerate
+
+  // ------------------------------------------------------------------
+  // Event-log ring (v0.4, spec sec 3.4): plain storage + two monotonic
+  // 16-bit pointers, no port-role distinction (roles are software: the
+  // daemon WRITES R_EVT_LOG_DATA to push, the host READS it to pop and
+  // writes R_EVT_LOG_CTRL bit16 to clear).
+  //   * push (write R_EVT_LOG_DATA): the written word IS the entry
+  //     {code[7:0], region[15:8], stamp[31:16]}; pushing into a FULL ring
+  //     overwrites the oldest entry (read pointer auto-advances).
+  //   * pop (accepted read of R_EVT_LOG_DATA): returns the OLDEST
+  //     un-popped entry and advances the read pointer. An EMPTY ring
+  //     reads 0 and does NOT advance (host polling is idempotent).
+  //   * clear (write R_EVT_LOG_CTRL with wdata[16]=1): wr=rd=0.
+  // count = wr - rd as an unsigned 16-bit difference: the pointers stay
+  // within EVT_LOG_DEPTH of each other, so the modular difference is exact
+  // even across the 2^16 wrap. Storage index = ptr mod EVT_LOG_DEPTH
+  // (ASSUMPTION: EVT_LOG_DEPTH is a power of two — 16 in v0.4).
+  // The array carries no reset: entries are only readable while
+  // count != 0, i.e. after they were written.
+  // ------------------------------------------------------------------
+  localparam int EVT_LOG_IDXW = (EVT_LOG_DEPTH > 1) ? $clog2(EVT_LOG_DEPTH) : 1;
+
+  logic [31:0] evt_q [EVT_LOG_DEPTH];
+  logic [15:0] evt_wr_ptr_r;
+  logic [15:0] evt_rd_ptr_r;
+  logic [15:0] evt_count_w;
+  assign evt_count_w = evt_wr_ptr_r - evt_rd_ptr_r;
+
+  logic evt_push, evt_pop, evt_clr;
+  assign evt_push = host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                    (host_addr_i == R_EVT_LOG_DATA);
+  assign evt_pop  = host_req_i && !host_we_i &&
+                    (host_addr_i == R_EVT_LOG_DATA) && (evt_count_w != 16'd0);
+  assign evt_clr  = host_req_i && host_we_i && (host_op_i == SPI_OP_WR) &&
+                    (host_addr_i == R_EVT_LOG_CTRL) &&
+                    ((host_wdata_i & EVT_LOG_CLEAR) != 32'h0);
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      evt_wr_ptr_r <= 16'h0;
+      evt_rd_ptr_r <= 16'h0;
+    end else if (evt_clr) begin
+      evt_wr_ptr_r <= 16'h0;
+      evt_rd_ptr_r <= 16'h0;
+    end else if (evt_push) begin
+      evt_q[evt_wr_ptr_r[EVT_LOG_IDXW-1:0]] <= host_wdata_i;
+      evt_wr_ptr_r <= evt_wr_ptr_r + 16'd1;
+      if (evt_count_w == 16'(EVT_LOG_DEPTH)) begin
+        evt_rd_ptr_r <= evt_rd_ptr_r + 16'd1;  // full: drop the oldest
+      end
+    end else if (evt_pop) begin
+      evt_rd_ptr_r <= evt_rd_ptr_r + 16'd1;
+    end
+  end
 
   // ------------------------------------------------------------------
   // OCC_DECODE start trigger (v0.1, spec §3.1): a write to R_OCC_DECODE
@@ -407,6 +473,8 @@ module emri_regfile #(
       R_OCC_STATUS:     host_rdata_o = occ_status_w;
       R_OCC_FRAME_ADDR: host_rdata_o = {16'h0, occ_frame_addr_r};
       R_OCC_WORD_COUNT: host_rdata_o = {16'h0, occ_word_count_r};
+      R_OCC_EXPECT_CRC: host_rdata_o = occ_expect_crc_r;
+      R_OCC_CRC_RESULT: host_rdata_o = occ_crc_result_i;
       R_SESSION_CMD:    host_rdata_o = {24'h0, session_cmd_r};
       R_SESSION_STATUS: host_rdata_o = {24'h0, session_status_r};
       R_RX_BUF_CTRL:    host_rdata_o = {16'h0, rx_buf_depth_w};
@@ -416,6 +484,10 @@ module emri_regfile #(
       R_EFP_STATUS:     host_rdata_o = {24'h0, efp_status_r};
       R_EFP_ERR:        host_rdata_o = {24'h0, efp_err_r};
       R_EFP_IMG_COLS:   host_rdata_o = {24'h0, efp_img_cols_r};
+      R_EVT_LOG_CTRL:   host_rdata_o = {evt_wr_ptr_r, evt_count_w};
+      R_EVT_LOG_DATA:   host_rdata_o = (evt_count_w != 16'd0)
+                                      ? evt_q[evt_rd_ptr_r[EVT_LOG_IDXW-1:0]]
+                                      : 32'h0;
       R_HEALTH_STATUS:  host_rdata_o = health_status_w;
       R_MON_TEMP:       host_rdata_o = {16'h0, MON_TEMP_SIM};
       R_MON_VCCINT:     host_rdata_o = {16'h0, MON_VCCINT_SIM};

@@ -42,6 +42,8 @@ module tb_occ;
     logic [DATA_W-1:0]     fbus_rdata;
     logic [2:0]            status;
     logic                  crc_error;
+    logic [31:0]           crc_result;    // v0.5 §3.1.1: OCC running CRC
+    logic [31:0]           expect_crc;    // v0.5 §3.1.1: READBACK gate value
     logic                  region_locked;
 
     integer errors = 0;
@@ -81,7 +83,9 @@ module tb_occ;
         .fbus_rdata_i  (fbus_rdata),
         .status_o      (status),
         .crc_error_o   (crc_error),
-        .region_locked_i(region_locked)
+        .region_locked_i(region_locked),
+        .expect_crc_i  (expect_crc),      // v0.5 §3.1.1
+        .crc_result_o  (crc_result)
     );
 
     // ---- frame-bus target: column config RAM model ----
@@ -134,6 +138,9 @@ module tb_occ;
 
     task run_readback(input logic [ADDR_W-1:0] a, input logic [15:0] n);
         begin
+            // v0.5 §3.1.1: gate the readback against the last WRITE/BLANK
+            // stream's CRC (the OCC's current crc_result).
+            expect_crc = crc_result;
             occ_cmd(CMD_READBACK, a, n);
         end
     endtask
@@ -173,6 +180,7 @@ module tb_occ;
         wdata         = '0;
         wdata_valid   = 1'b0;
         region_locked = 1'b0;
+        expect_crc    = 32'h0;
 
         // counter-config pattern
         cfg[0] = 32'h0000_0001;

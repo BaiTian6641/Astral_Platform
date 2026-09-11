@@ -56,6 +56,8 @@ module tb_emri_regfile;
   logic        occ_region_locked;
 
   // ---- DUT ----
+  logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+  logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
   emri_regfile #(
     .HAS_BMC(HAS_BMC), .NUM_REGIONS(NUM_REGIONS),
     .PLATFORM_ID(PLATFORM_ID),
@@ -71,7 +73,9 @@ module tb_emri_regfile;
     .occ_wdata_o(occ_wdata), .occ_wdata_valid_o(occ_wdata_valid),
     .occ_wdata_ready_i(occ_wdata_ready),
     .occ_status_i(occ_status), .occ_crc_error_i(occ_crc_error),
-    .occ_region_locked_o(occ_region_locked)
+    .occ_region_locked_o(occ_region_locked),
+    .occ_expect_crc_o(),
+    .occ_crc_result_i(32'h0)
   );
 
   // ============================================================
@@ -318,10 +322,49 @@ module tb_emri_regfile;
     //      storage; the rest of the old reserved ranges still read-as-0.
     host_read(16'h22, rd); chk(rd == 32'h0, "reserved 0x22 read-as-0");
     host_read(16'h37, rd); chk(rd == 32'h0, "reserved 0x37 read-as-0");
-    host_read(16'h39, rd); chk(rd == 32'h0, "reserved 0x39 read-as-0");
+    host_read(16'h3A, rd); chk(rd == 32'h0, "reserved 0x3A read-as-0 (0x38/0x39 now event ring)");
     host_read(16'h60, rd); chk(rd == 32'h0, "reserved 0x60 read-as-0");
     host_read(16'h1F, rd); chk(rd == 32'hD160_0007, "0x1F = IMG_DIGEST[7] (not reserved)");
     host_read(16'h5F, rd); chk(rd == 32'h5160_000F, "0x5F = IMG_SIG[15] (not reserved)");
+
+    // ---- 11. Event-log ring (v0.4, spec sec 3.4): push/pop/clear ----
+    // reset state: empty
+    host_read(R_EVT_LOG_CTRL, rd);
+    chk(rd == 32'h0, "EVT ring empty at reset (count=0, wr_ptr=0)");
+    host_read(R_EVT_LOG_DATA, rd);
+    chk(rd == 32'h0, "EVT empty pop reads 0");
+    host_read(R_EVT_LOG_CTRL, rd);
+    chk(rd[15:0] == 16'd0, "EVT empty pop does not advance rd_ptr");
+
+    // push 3 entries ({code, region, stamp}); pop-oldest order preserved
+    host_write(R_EVT_LOG_DATA, 32'h0003_0101);  // code=1 r=1 stamp=3
+    host_write(R_EVT_LOG_DATA, 32'h0001_0202);  // code=2 r=2 stamp=1
+    host_write(R_EVT_LOG_DATA, 32'h0007_0003);  // code=3 r=0 stamp=7
+    host_read(R_EVT_LOG_CTRL, rd);
+    chk(rd[15:0] == 16'd3 && rd[31:16] == 16'd3, "EVT count=3 wr_ptr=3 after 3 pushes");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'h0003_0101, "EVT pop #1 = oldest (code1 r1)");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'h0001_0202, "EVT pop #2 = code2 r2");
+    host_read(R_EVT_LOG_CTRL, rd); chk(rd[15:0] == 16'd1, "EVT count=1 mid-drain");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'h0007_0003, "EVT pop #3 = code3 r0");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'h0, "EVT pop #4 empty -> 0");
+    host_read(R_EVT_LOG_CTRL, rd); chk(rd[15:0] == 16'd0, "EVT drained (count=0, wr_ptr=3)");
+
+    // W1C clear via bit16 (write-1-to-bit16-clears; wr_ptr/count reset)
+    host_write(R_EVT_LOG_DATA, 32'h0009_0104);
+    host_read(R_EVT_LOG_CTRL, rd); chk(rd[15:0] == 16'd1, "EVT one entry before clear");
+    host_write(R_EVT_LOG_CTRL, 32'h0000_0000);
+    host_read(R_EVT_LOG_CTRL, rd); chk(rd[15:0] == 16'd1, "EVT bit16=0 write is a no-op");
+    host_write(R_EVT_LOG_CTRL, 32'h0001_0000);
+    host_read(R_EVT_LOG_CTRL, rd); chk(rd == 32'h0, "EVT bit16=1 write clears ring");
+
+    // overflow: push 20 into depth-16 -> count saturates 16, oldest 4 dropped
+    for (int i = 0; i < 20; i = i + 1)
+      host_write(R_EVT_LOG_DATA, 32'h0000_0000 + 32'(i));
+    host_read(R_EVT_LOG_CTRL, rd);
+    chk(rd[15:0] == 16'd16 && rd[31:16] == 16'd20, "EVT overflow: count=16 wr_ptr=20");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'd4, "EVT oldest dropped -> first pop = push #4");
+    host_read(R_EVT_LOG_DATA, rd); chk(rd == 32'd5, "EVT second pop = push #5");
+    host_write(R_EVT_LOG_CTRL, 32'h0001_0000);   // clean up for nothing after
 
     // ---- report ----
     if (errors == 0) $display("TEST PASSED: emri_regfile (EMRI v0 register ABI + OCC passthrough)");

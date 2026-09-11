@@ -160,6 +160,8 @@ module tb_bmc_axi_emri;
     );
 
     // OCC side tied off (identity/capability reads only in this TB).
+    logic [31:0] occ_expect_crc_w;   // v0.5 §3.1.1 (OCC expected-CRC gate)
+    logic [31:0] occ_crc_result_w;   // v0.5 §3.1.1 (OCC running CRC)
     emri_regfile #(
         .HAS_BMC(1'b1), .NUM_REGIONS(2), .PLATFORM_ID(32'h0)
     ) u_emri (
@@ -172,7 +174,9 @@ module tb_bmc_axi_emri;
         .occ_wdata_o(), .occ_wdata_valid_o(), .occ_wdata_ready_i(1'b0),
         .occ_status_i(3'd0),      // OCC_S_IDLE
         .occ_crc_error_i(1'b0),
-        .occ_region_locked_o()
+        .occ_region_locked_o(),
+        .occ_expect_crc_o(),
+        .occ_crc_result_i(32'h0)
     );
 
     // -- Clock ------------------------------------------------------------------

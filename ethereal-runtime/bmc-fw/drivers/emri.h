@@ -32,6 +32,8 @@
 #define EMRI_OCC_FRAME_ADDR_WORD  0x0Bu  /* R_OCC_FRAME_ADDR */
 #define EMRI_OCC_WORD_COUNT_WORD  0x0Cu  /* R_OCC_WORD_COUNT */
 #define EMRI_OCC_DECODE_WORD   0x0Du  /* R_OCC_DECODE   (sec 3.1, frame_decoder trigger) */
+#define EMRI_OCC_EXPECT_CRC_WORD  0x0Eu  /* R_OCC_EXPECT_CRC (v0.5, sec 3.1.1) */
+#define EMRI_OCC_CRC_RESULT_WORD  0x0Fu  /* R_OCC_CRC_RESULT (v0.5, sec 3.1.1) */
 /* EFP command block (v0.2, spec sec 3.2): host<->daemon mailbox. */
 #define EMRI_EFP_CMD_WORD      0x13u  /* R_EFP_CMD      doorbell */
 #define EMRI_EFP_REGION_WORD   0x14u  /* R_EFP_REGION   0xFF = auto */
@@ -44,7 +46,12 @@
 /* SPI_CRC @ 0x3F (v0.3, spec sec 7.1): EFP-SPI transport-CRC16 latch. NOT a
  * regfile storage word — intercepted by the efp-spi front-end (efp-spi/). */
 #define EMRI_SPI_CRC_WORD      0x3Fu
-
+/* Event-log ring (v0.4, spec sec 3.4): the daemon WRITES 0x39 to push an
+ * entry {code[7:0], region[15:8], stamp[31:16]}; the host pops via reads of
+ * 0x39 and clears via a write of bit16 to 0x38. The daemon NEVER reads 0x39
+ * (a read pops the oldest entry). */
+#define EMRI_EVT_LOG_CTRL_WORD 0x38u /* R: {count[15:0], wr_ptr[31:16]}  */
+#define EMRI_EVT_LOG_DATA_WORD 0x39u /* W: push entry / R(host): pop-oldest */
 /* OCC_CMD bitfield (spec sec 3; emri_pkg OCC_CMD_*). */
 #define EMRI_OCC_CMD_START     (1u << 8)
 #define EMRI_OCC_OP_NOP        0u
