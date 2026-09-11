@@ -27,7 +27,10 @@ hal/gowin_gw5/
 ├── glue/                      ← vendor-glue modules (C13 §4 exception zone)
 │   ├── gowin_bsram.sv         ← BSRAM host mapping for eth_inf_ram
 │   ├── gowin_dsp.sv           ← DSP host mapping for eth_inf_dsp_mac (27x18 MAC)
-│   └── gowin_clkstub.sv       ← clock/PLL glue placeholder (C12 §2 hal_pll slot)
+│   ├── gowin_clkstub.sv       ← clock/PLL glue placeholder (C12 §2 hal_pll slot)
+│   └── eth_dram_glue.sv       ← GW5 hard-DDR3 DRAM backend for the eth_dram_ctrl
+│                                socket (E2-DRAM1; `module eth_dram_glue`, same
+│                                seam contract — see eth_dram_ctrl.sv header)
 ├── probe/                     ← synthesis measurement scripts (open chain)
 │   └── synth_stat.sh          ← yosys synth_gowin per-module LUT/DFF census
 └── boards/
@@ -54,6 +57,28 @@ Every glue module has two branches selected by one define:
 - **Attribute steering** (per-target `syn_ramstyle` / `syn_dspstyle` /
   `use_dsp` / …) lives in the single attribute layer
   `ethereal-fabric/rtl/inf/eth_config.svh` (C13 §2.5), NOT in this directory.
+
+## DRAM glue (E2-DRAM1)
+
+`eth_dram_ctrl` (the SoC's only path to DRAM: `ethereal-shell/rtl/dram/eth_dram_ctrl.sv`)
+is a pure AXI4 memory-slave socket whose implementation is selected per target. For a GW5
+build, `-DETH_DRAM_VENDOR_GLUE` makes the socket instantiate `eth_dram_glue`, provided by
+`glue/eth_dram_glue.sv` — the ADR-017 slot for the GW5 hard-DDR3 PHY+controller IP
+(S15 §4 row 2 / ADR-018 §4 row 2).
+
+* **Default branch** (`no GOWIN_PRIMITIVE`): binds the behavioral `eth_dram_stub`, so the
+  whole SoC simulates on a GW5 target without the hard IP. The file list must also carry
+  `ethereal-shell/rtl/dram/eth_dram_stub.sv`.
+* **`GOWIN_PRIMITIVE` branch**: documentation-in-code only (GW5A DDR3 Memory Interface,
+  AXI4 mode) with a deliberate elaboration-time `$error`. Real PHY integration — DDR3 pin
+  assignment, DQS read training, DFI timing closure, calibration, refresh — is a
+  **hardware bring-up task on the physical Tang Mega 138K**, not part of E2-DRAM1. Until
+  then the GW5 app cluster runs the no-DDR profile (BootROM + on-chip SRAM + optional
+  SPI-flash/PSRAM rootfs), which is exactly what S15 §4 specifies.
+
+Standalone verification, the seam contract and the open G6 items are documented in the
+`eth_dram_ctrl` / `eth_dram_glue.sv` headers, in this README section, and in the E2-DRAM1
+acceptance report (`docs/reports/`).
 
 ## Stub philosophy (ADR-017)
 

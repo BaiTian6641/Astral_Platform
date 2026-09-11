@@ -117,7 +117,37 @@ Every `eth_axi` module ships with SVA properties checked by `sby` (and simulated
 4. Formal properties + a `sby` config per module + iverilog smoke TBs.
 5. The BMC XBUS→AXI4 bridge hangs off this socket (separate task, E1-BMC1 follow-up).
 
-## 9. Open items (TBD)
+## 9. Data plane — AXI4 memory-slave contract (v0.1 draft, already implemented)
+
+> Status: **implemented** by `ethereal-shell/rtl/dram/eth_dram_ctrl.sv` (+ the behavioral
+> `eth_dram_stub.sv`); this section records the contract so implementations and tests stop
+> deriving it from code alone. Freeze alongside the `eth_axi_xbar` burst extension (E2-AXI2).
+
+1. **Socket, not a bus.** The SoC reaches DRAM only through the `eth_dram_ctrl` AXI4
+   memory-slave socket (S15 §4): one frozen parameter surface
+   (`AXI_AW/AXI_DW/AXI_IDW/MEM_BASE/MEM_BYTES/RD_LATENCY/WR_LATENCY`) and the complete AXI4
+   slave channel set. Target-specific backends (Zynq PS DDR, Gowin GW5 hard-DDR3) plug into
+   the socket's seam at build time and always ship a behavioral stub (ADR-017).
+2. **Addressing (INCR only in v0.1).** `Address_1 = AxADDR`; for beat N > 1,
+   `Address_N = align_down(AxADDR, 2**AxSIZE) + (N-1) * 2**AxSIZE` (IHI0022G §A3.4.1).
+   Narrow/unaligned transfers use `WSTRB` lanes; a read returns the containing bus word.
+   `WRAP`/`FIXED` are `SLVERR` in v0.1.
+3. **Response policy — one code per burst, uniform across its beats:** `OKAY` when every
+   byte lies inside the window; `SLVERR` for protocol/transfer illegality (`AxBURST` not
+   INCR, `AxSIZE` > bus width, 4 KiB crossing, `AxLOCK`); `DECERR` for address decode
+   failure (outside `[MEM_BASE, MEM_BASE+MEM_BYTES)`).
+4. **Error completion (matches the xbar's §5.3 built-in slave):** an erroring write still
+   sinks every `W` beat and commits nothing; an erroring read returns exactly one beat
+   (`RDATA = 0`, `RLAST = 1`) and consumes the `AR`.
+5. **Timing:** `AW` captured → `WREADY` next cycle; last `W` beat → `BVALID` after
+   `WR_LATENCY`; `AR` captured → first `RVALID` after `RD_LATENCY`+1, then one beat per cycle
+   while `RREADY`. All handshake outputs come from stored state (no combinational
+   input→output path), and a stalled `R` beat's payload is stable.
+6. **v0.1 gap:** the v0 `eth_axi_xbar` slave port set has no `AxLEN/AxSIZE/AxBURST/WLAST/RLAST`
+   (§5.2 defers bursts to v0.1), so a burst-capable master reaches the DRAM socket directly
+   today; wiring it behind the xbar is `E2-AXI2`.
+
+## 10. Open items (TBD)
 1. **AXI4 full bursts vs AXI4-Lite-only in v0:** the crossbar is designed for full AXI4
    but v0 bring-up may run it AXI4-Lite-first (simpler). Decision at RTL time.
 2. **ATOP atomics timing:** v0.1, needed only for SMP Linux (not the single-core GW5
