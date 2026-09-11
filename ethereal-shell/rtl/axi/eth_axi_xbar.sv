@@ -29,8 +29,23 @@
 //              routing trivially correct while the ID-prepend/route-back and the
 //              address decode are written burst-/outstanding-agnostic, so v0.1
 //              adds bursts + multiple-outstanding WITHOUT restructuring (Notes).
+//              v0.1 MODEL (2026-09-12, E2-AXI2) — bursts, same structure: the
+//              lock-step discipline now spans a whole burst. A granted write
+//              runs AW -> W(beat 0..AxLEN) -> B, a granted read runs AR ->
+//              R(beat 0..ArLEN); still one transaction per master per direction
+//              and one per destination at a time. The burst shape (AxLEN/AxSIZE/
+//              AxBURST/WLAST) rides inside the existing per-channel skid
+//              payloads — captured, routed and forwarded exactly like the
+//              address and the ID — while per-master beat counters decide the
+//              last beat. Because a destination's busy bit is held for the WHOLE
+//              burst, the per-destination uniqueness invariant the formal proof
+//              pins (§7, formal/eth_axi_xbar.sby) is the v0 one evaluated
+//              mid-burst.
 // Maintainer:  BaiTian6641
 // Created:     2026-07-30
+// Modified:    2026-09-12 - v0.1: AXI4 INCR burst routing (AxLEN/AxSIZE/
+//              AxBURST/WLAST/RLAST, per-master beat counters) behind BURST_EN
+//              (E2-AXI2). Default BURST_EN=0 keeps the v0 single-beat contract.
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-spec/control/eth-axi-v0.md §5 (crossbar), §2 (rules),
 //              §7 (props 3-5); docs/adr/ADR-018-axi-noc-riscv-cluster.md §2
@@ -40,6 +55,31 @@
 //              and multiple-outstanding (an outstanding-ID table) — the ID
 //              routing + decode already carry the widened xid end-to-end, so only
 //              the beat counters and the ID table are added, not a redesign.
+// Notes:       v0-vs-v0.1 boundary: v0 = single-beat (AxLEN=0) + one
+//              outstanding transaction per master per direction (AW->W->B,
+//              AR->R). v0.1 = INCR bursts routed end-to-end (per-master beat
+//              counters); ATOP atomics + multiple-outstanding remain deferred.
+//              The ID routing + decode already carried the widened xid
+//              end-to-end, so only the beat counters and the burst attributes
+//              were added — not a redesign.
+//              BURST_EN (compile-time): 1 = route multi-beat bursts; 0 (the
+//              default) masks the burst attribute inputs to a legal single-beat
+//              encoding (AxLEN=0, AxSIZE=bus width, AxBURST=INCR, WLAST=0), so
+//              AXI4-Lite / single-beat users keep the v0 contract bit-identically
+//              without connecting the new ports (their instantiations —
+//              including the tb_bmc_*.sv family — are owned elsewhere and are
+//              not edited by this change).
+//              LAST policy: the slave-facing WLAST is
+//              `captured_master_WLAST | (beat_cnt == captured AxLEN)` and the
+//              master-facing RLAST is
+//              `slave_RLAST | (beat_cnt == captured ArLEN)` — the same tolerance
+//              the memory slave implements (eth_dram_stub:
+//              `wr_last = wlast | (beat == len)`), so neither a missing nor an
+//              early LAST can hang a routed burst.
+//              Burst shape is forwarded, not re-encoded: WRAP/FIXED and an
+//              illegal AxSIZE reach the slave as-is and come back as the slave's
+//              SLVERR (eth-axi-v0.md §9.3) — the xbar routes bursts, the memory
+//              socket judges them (§9.2).
 //              iverilog-compatible: NO SV interface/modport, flat ports, flat
 //              (non-packed-2D) ADDR_MAP, NO `automatic` vars (iverilog 14 rejects
 //              them in always_comb — all decode/arb is generate-time or plain
@@ -59,6 +99,15 @@ module eth_axi_xbar #(
     // widened slave-side ID width = AXI_IDW + master-index width. A parameter
     // (not a post-ports localparam) because iverilog requires it for port dims.
     parameter int AXI_XIDW = AXI_IDW + ((N_MST > 1) ? $clog2(N_MST) : 1),
+    // ---- v0.1 burst routing (compile-time switch; see Notes) ----------------
+    //   0 = v0 contract: the burst attribute inputs below are masked to a legal
+    //       single-beat encoding, so an AXI4-Lite / single-beat master (or an
+    //       existing instantiation that does not connect them at all) is
+    //       unaffected — the slave still sees a well-formed AxLEN=0 INCR burst.
+    //   1 = route full AXI4 INCR bursts: AxLEN/AxSIZE/AxBURST are captured and
+    //       forwarded, per-master beat counters bound the burst, WLAST/RLAST
+    //       terminate it.
+    parameter logic BURST_EN = 1'b0,
     // flat ADDR_MAP: base_s at [s*AW +: AW], mask_s at [(N_SLV+s)*AW +: AW]
     parameter logic [2*N_SLV*AXI_AW-1:0] ADDR_MAP = {(2*N_SLV*AXI_AW){1'b0}}
 ) (
@@ -70,10 +119,14 @@ module eth_axi_xbar #(
     output logic [N_MST-1:0]                 s_awready,
     input  logic [N_MST*AXI_AW-1:0]          s_awaddr,
     input  logic [N_MST*AXI_IDW-1:0]         s_awid,
+    input  logic [N_MST*8-1:0]               s_awlen,
+    input  logic [N_MST*3-1:0]               s_awsize,
+    input  logic [N_MST*2-1:0]               s_awburst,
     input  logic [N_MST-1:0]                 s_wvalid,
     output logic [N_MST-1:0]                 s_wready,
     input  logic [N_MST*AXI_DW-1:0]          s_wdata,
     input  logic [N_MST*(AXI_DW/8)-1:0]      s_wstrb,
+    input  logic [N_MST-1:0]                 s_wlast,
     output logic [N_MST-1:0]                 s_bvalid,
     input  logic [N_MST-1:0]                 s_bready,
     output logic [N_MST*AXI_IDW-1:0]         s_bid,
@@ -82,21 +135,29 @@ module eth_axi_xbar #(
     output logic [N_MST-1:0]                 s_arready,
     input  logic [N_MST*AXI_AW-1:0]          s_araddr,
     input  logic [N_MST*AXI_IDW-1:0]         s_arid,
+    input  logic [N_MST*8-1:0]               s_arlen,
+    input  logic [N_MST*3-1:0]               s_arsize,
+    input  logic [N_MST*2-1:0]               s_arburst,
     output logic [N_MST-1:0]                 s_rvalid,
     input  logic [N_MST-1:0]                 s_rready,
     output logic [N_MST*AXI_IDW-1:0]         s_rid,
     output logic [N_MST*AXI_DW-1:0]          s_rdata,
     output logic [N_MST*2-1:0]               s_rresp,
+    output logic [N_MST-1:0]                 s_rlast,
 
     // ===================== slave-side master ports (flattened) =============
     output logic [N_SLV-1:0]                 m_awvalid,
     input  logic [N_SLV-1:0]                 m_awready,
     output logic [N_SLV*AXI_AW-1:0]          m_awaddr,
     output logic [N_SLV*AXI_XIDW-1:0]        m_awid,
+    output logic [N_SLV*8-1:0]               m_awlen,
+    output logic [N_SLV*3-1:0]               m_awsize,
+    output logic [N_SLV*2-1:0]               m_awburst,
     output logic [N_SLV-1:0]                 m_wvalid,
     input  logic [N_SLV-1:0]                 m_wready,
     output logic [N_SLV*AXI_DW-1:0]          m_wdata,
     output logic [N_SLV*(AXI_DW/8)-1:0]      m_wstrb,
+    output logic [N_SLV-1:0]                 m_wlast,
     input  logic [N_SLV-1:0]                 m_bvalid,
     output logic [N_SLV-1:0]                 m_bready,
     input  logic [N_SLV*AXI_XIDW-1:0]        m_bid,
@@ -105,9 +166,13 @@ module eth_axi_xbar #(
     input  logic [N_SLV-1:0]                 m_arready,
     output logic [N_SLV*AXI_AW-1:0]          m_araddr,
     output logic [N_SLV*AXI_XIDW-1:0]        m_arid,
+    output logic [N_SLV*8-1:0]               m_arlen,
+    output logic [N_SLV*3-1:0]               m_arsize,
+    output logic [N_SLV*2-1:0]               m_arburst,
     input  logic [N_SLV-1:0]                 m_rvalid,
     output logic [N_SLV-1:0]                 m_rready,
     input  logic [N_SLV*AXI_XIDW-1:0]        m_rid,
+    input  logic [N_SLV-1:0]                 m_rlast,
     input  logic [N_SLV*AXI_DW-1:0]          m_rdata,
     input  logic [N_SLV*2-1:0]               m_rresp
 );
@@ -115,6 +180,9 @@ module eth_axi_xbar #(
     localparam int MIW      = (N_MST > 1) ? $clog2(N_MST) : 1;
     localparam int SIW      = (N_SLV > 1) ? $clog2(N_SLV) : 1;
     localparam int STRB_W   = AXI_DW / 8;
+    localparam int LOG_STRB   = $clog2(STRB_W);           // AxSIZE of a full-width beat
+    localparam logic [2:0] AXSIZE_FULL = LOG_STRB[2:0];   // (0 when STRB_W == 1)
+    localparam logic [1:0] BURST_INCR  = 2'b01;           // AXI4 AxBURST encoding
     localparam int N_DST    = N_SLV + 1;               // + decode-error slave
     localparam int ERR      = N_SLV;                   // error-slave index
     localparam logic [1:0] RESP_DECERR = 2'b11;
@@ -125,43 +193,80 @@ module eth_axi_xbar #(
     logic [N_MST-1:0]           aw_v,   aw_pop;
     logic [N_MST*AXI_AW-1:0]    aw_addr;
     logic [N_MST*AXI_IDW-1:0]   aw_id;
+    logic [N_MST*8-1:0]         aw_len;    // captured AxLEN   (v0.1 burst)
+    logic [N_MST*3-1:0]         aw_size;   // captured AxSIZE
+    logic [N_MST*2-1:0]         aw_burst;  // captured AxBURST
     logic [N_MST-1:0]           w_v,    w_pop;
     logic [N_MST*AXI_DW-1:0]    w_data;
     logic [N_MST*STRB_W-1:0]    w_strb;
+    logic [N_MST-1:0]           w_last;    // captured WLAST
     logic [N_MST-1:0]           ar_v,   ar_pop;
     logic [N_MST*AXI_AW-1:0]    ar_addr;
     logic [N_MST*AXI_IDW-1:0]   ar_id;
+    logic [N_MST*8-1:0]         ar_len;
+    logic [N_MST*3-1:0]         ar_size;
+    logic [N_MST*2-1:0]         ar_burst;
 
     genvar m;
     generate
     for (m = 0; m < N_MST; m++) begin : g_cap
-        localparam int AWPW = AXI_AW + AXI_IDW;
-        localparam int WPW  = AXI_DW + STRB_W;
-        localparam int ARPW = AXI_AW + AXI_IDW;
+        // Burst-shape field offsets in the widened capture payloads, and the
+        // BURST_EN=0 masks: with bursts disabled every attribute is pinned to a
+        // legal single-beat AXI4 encoding, so an unconnected input (an existing
+        // instantiation that does not know the burst ports) cannot leak X into
+        // the datapath (Notes).
+        localparam int BRST_OFF = AXI_IDW;          // {addr, len, size, burst, id}
+        localparam int SIZE_OFF = BRST_OFF + 2;     // laid out MSB-first
+        localparam int LEN_OFF  = SIZE_OFF + 3;
+        localparam int ADDR_OFF = LEN_OFF + 8;
+        localparam int AWPW = ADDR_OFF + AXI_AW;
+        localparam int ARPW = ADDR_OFF + AXI_AW;
+        localparam int WPW  = AXI_DW + STRB_W + 1;
         logic [AWPW-1:0] aw_in, aw_out;
         logic [WPW-1:0]  w_in,  w_out;
         logic [ARPW-1:0] ar_in, ar_out;
-        assign aw_in = {s_awaddr[m*AXI_AW +: AXI_AW], s_awid[m*AXI_IDW +: AXI_IDW]};
+        logic [7:0]      aw_len_c, ar_len_c;
+        logic [2:0]      aw_size_c, ar_size_c;
+        logic [1:0]      aw_burst_c, ar_burst_c;
+        logic            w_last_c;
+        assign aw_len_c   = BURST_EN ? s_awlen[m*8 +: 8]   : 8'h00;
+        assign aw_size_c  = BURST_EN ? s_awsize[m*3 +: 3]  : AXSIZE_FULL;
+        assign aw_burst_c = BURST_EN ? s_awburst[m*2 +: 2] : BURST_INCR;
+        assign ar_len_c   = BURST_EN ? s_arlen[m*8 +: 8]   : 8'h00;
+        assign ar_size_c  = BURST_EN ? s_arsize[m*3 +: 3]  : AXSIZE_FULL;
+        assign ar_burst_c = BURST_EN ? s_arburst[m*2 +: 2] : BURST_INCR;
+        assign w_last_c   = BURST_EN ? s_wlast[m]          : 1'b0;
+        assign aw_in = {s_awaddr[m*AXI_AW +: AXI_AW], aw_len_c, aw_size_c,
+                        aw_burst_c, s_awid[m*AXI_IDW +: AXI_IDW]};
         eth_axi_skidbuf #(.PW(AWPW)) u_aw (
             .clk_i(clk_i), .rst_ni(rst_ni),
             .i_valid(s_awvalid[m]), .i_ready(s_awready[m]), .i_data(aw_in),
             .o_valid(aw_v[m]), .o_ready(aw_pop[m]), .o_data(aw_out));
-        assign aw_addr[m*AXI_AW +: AXI_AW] = aw_out[AWPW-1 -: AXI_AW];
-        assign aw_id[m*AXI_IDW +: AXI_IDW] = aw_out[AXI_IDW-1:0];
-        assign w_in = {s_wdata[m*AXI_DW +: AXI_DW], s_wstrb[m*STRB_W +: STRB_W]};
+        assign aw_addr[m*AXI_AW +: AXI_AW] = aw_out[ADDR_OFF +: AXI_AW];
+        assign aw_id[m*AXI_IDW +: AXI_IDW] = aw_out[0 +: AXI_IDW];
+        assign aw_len[m*8 +: 8]            = aw_out[LEN_OFF +: 8];
+        assign aw_size[m*3 +: 3]           = aw_out[SIZE_OFF +: 3];
+        assign aw_burst[m*2 +: 2]          = aw_out[BRST_OFF +: 2];
+        assign w_in = {s_wdata[m*AXI_DW +: AXI_DW], s_wstrb[m*STRB_W +: STRB_W],
+                       w_last_c};
         eth_axi_skidbuf #(.PW(WPW)) u_w (
             .clk_i(clk_i), .rst_ni(rst_ni),
             .i_valid(s_wvalid[m]), .i_ready(s_wready[m]), .i_data(w_in),
             .o_valid(w_v[m]), .o_ready(w_pop[m]), .o_data(w_out));
-        assign w_data[m*AXI_DW +: AXI_DW] = w_out[WPW-1 -: AXI_DW];
-        assign w_strb[m*STRB_W +: STRB_W] = w_out[STRB_W-1:0];
-        assign ar_in = {s_araddr[m*AXI_AW +: AXI_AW], s_arid[m*AXI_IDW +: AXI_IDW]};
+        assign w_data[m*AXI_DW +: AXI_DW] = w_out[STRB_W+1 +: AXI_DW];
+        assign w_strb[m*STRB_W +: STRB_W] = w_out[1 +: STRB_W];
+        assign w_last[m]                  = w_out[0];
+        assign ar_in = {s_araddr[m*AXI_AW +: AXI_AW], ar_len_c, ar_size_c,
+                        ar_burst_c, s_arid[m*AXI_IDW +: AXI_IDW]};
         eth_axi_skidbuf #(.PW(ARPW)) u_ar (
             .clk_i(clk_i), .rst_ni(rst_ni),
             .i_valid(s_arvalid[m]), .i_ready(s_arready[m]), .i_data(ar_in),
             .o_valid(ar_v[m]), .o_ready(ar_pop[m]), .o_data(ar_out));
-        assign ar_addr[m*AXI_AW +: AXI_AW] = ar_out[ARPW-1 -: AXI_AW];
-        assign ar_id[m*AXI_IDW +: AXI_IDW] = ar_out[AXI_IDW-1:0];
+        assign ar_addr[m*AXI_AW +: AXI_AW] = ar_out[ADDR_OFF +: AXI_AW];
+        assign ar_id[m*AXI_IDW +: AXI_IDW] = ar_out[0 +: AXI_IDW];
+        assign ar_len[m*8 +: 8]            = ar_out[LEN_OFF +: 8];
+        assign ar_size[m*3 +: 3]           = ar_out[SIZE_OFF +: 3];
+        assign ar_burst[m*2 +: 2]          = ar_out[BRST_OFF +: 2];
     end
     endgenerate
 
@@ -201,6 +306,21 @@ module eth_axi_xbar #(
     logic [N_MST*2-1:0]        wr_state;
     logic [N_MST-1:0]          rd_state;
     logic [N_MST*(SIW+1)-1:0]  wr_dest, rd_dest;
+    // ---- v0.1 burst tracking (per master, per direction) -------------------
+    // A burst is AxLEN+1 beats. wr_len/rd_len hold the AxLEN captured with the
+    // granted AW/AR; wr_cnt/rd_cnt count the beats already forwarded (write) or
+    // pushed to the master (read) — the index of the beat at the capture skid's
+    // output — and are held at len once the burst's last beat has been taken, so
+    // `cnt == len` identifies the last beat anywhere in the burst.
+    logic [N_MST*8-1:0]        wr_len, wr_cnt, rd_len, rd_cnt;
+    logic [N_MST-1:0]          wbeat_last;   // W skid head beat ends its burst
+    genvar gb;
+    generate
+    for (gb = 0; gb < N_MST; gb++) begin : g_blast
+        assign wbeat_last[gb] = w_last[gb] |
+                                (wr_cnt[gb*8 +: 8] == wr_len[gb*8 +: 8]);
+    end
+    endgenerate
 
     // ======================================================================
     // Central per-destination arbiters (round-robin), write + read.
@@ -285,9 +405,12 @@ module eth_axi_xbar #(
     genvar d;
     generate
     for (d = 0; d < N_SLV; d++) begin : g_slv_in
-        localparam int AWPW = AXI_AW + AXI_XIDW;
-        localparam int ARPW = AXI_AW + AXI_XIDW;
-        localparam int WPW  = AXI_DW + STRB_W;
+        localparam int AWPW = AXI_AW + AXI_XIDW + 13;
+        localparam int ARPW = AXI_AW + AXI_XIDW + 13;
+        localparam int WPW  = AXI_DW + STRB_W + 1;
+        // The slave-side skid payloads carry the burst shape as well, so a full
+        // AXI4 slave sees the same AxLEN/AxSIZE/AxBURST/WLAST the master sent.
+        // The burst fields sit above the widened xid ({mst_idx, orig_id}).
         logic [AWPW-1:0] awpl_in, awpl_out;
         logic [ARPW-1:0] arpl_in, arpl_out;
         logic [WPW-1:0]  wpl_in,  wpl_out;
@@ -295,6 +418,8 @@ module eth_axi_xbar #(
         // ---- AW ----
         assign gm      = wr_gnt_m[d];
         assign awpl_in = {aw_addr[gm*AXI_AW +: AXI_AW],
+                          aw_len[gm*8 +: 8], aw_size[gm*3 +: 3],
+                          aw_burst[gm*2 +: 2],
                           gm, aw_id[gm*AXI_IDW +: AXI_IDW]};
         assign aw_issue[d] = wr_gnt_v[d] && aw_skid_iready[d];
         eth_axi_skidbuf #(.PW(AWPW)) u_aw (
@@ -302,11 +427,16 @@ module eth_axi_xbar #(
             .i_valid(wr_gnt_v[d] && (aw_dest[gm*(SIW+1) +: (SIW+1)] == d[SIW:0])),
             .i_ready(aw_skid_iready[d]), .i_data(awpl_in),
             .o_valid(m_awvalid[d]), .o_ready(m_awready[d]), .o_data(awpl_out));
-        assign m_awaddr[d*AXI_AW +: AXI_AW]   = awpl_out[AWPW-1 -: AXI_AW];
-        assign m_awid[d*AXI_XIDW +: AXI_XIDW] = awpl_out[AXI_XIDW-1:0];
+        assign m_awaddr[d*AXI_AW +: AXI_AW]   = awpl_out[AXI_XIDW+13 +: AXI_AW];
+        assign m_awid[d*AXI_XIDW +: AXI_XIDW] = awpl_out[0 +: AXI_XIDW];
+        assign m_awlen[d*8 +: 8]              = awpl_out[AXI_XIDW+5 +: 8];
+        assign m_awsize[d*3 +: 3]             = awpl_out[AXI_XIDW+2 +: 3];
+        assign m_awburst[d*2 +: 2]            = awpl_out[AXI_XIDW +: 2];
         // ---- AR ----
         assign rgm     = rd_gnt_m[d];
         assign arpl_in = {ar_addr[rgm*AXI_AW +: AXI_AW],
+                          ar_len[rgm*8 +: 8], ar_size[rgm*3 +: 3],
+                          ar_burst[rgm*2 +: 2],
                           rgm, ar_id[rgm*AXI_IDW +: AXI_IDW]};
         assign ar_issue[d] = rd_gnt_v[d] && ar_skid_iready[d];
         eth_axi_skidbuf #(.PW(ARPW)) u_ar (
@@ -314,8 +444,11 @@ module eth_axi_xbar #(
             .i_valid(rd_gnt_v[d] && (ar_dest[rgm*(SIW+1) +: (SIW+1)] == d[SIW:0])),
             .i_ready(ar_skid_iready[d]), .i_data(arpl_in),
             .o_valid(m_arvalid[d]), .o_ready(m_arready[d]), .o_data(arpl_out));
-        assign m_araddr[d*AXI_AW +: AXI_AW]   = arpl_out[ARPW-1 -: AXI_AW];
-        assign m_arid[d*AXI_XIDW +: AXI_XIDW] = arpl_out[AXI_XIDW-1:0];
+        assign m_araddr[d*AXI_AW +: AXI_AW]   = arpl_out[AXI_XIDW+13 +: AXI_AW];
+        assign m_arid[d*AXI_XIDW +: AXI_XIDW] = arpl_out[0 +: AXI_XIDW];
+        assign m_arlen[d*8 +: 8]              = arpl_out[AXI_XIDW+5 +: 8];
+        assign m_arsize[d*3 +: 3]             = arpl_out[AXI_XIDW+2 +: 3];
+        assign m_arburst[d*2 +: 2]            = arpl_out[AXI_XIDW +: 2];
         // ---- W (driven by the master in WDATA whose dest==d) ----
         logic [N_MST-1:0] wsel;
         logic [MIW-1:0]   wsel_m;
@@ -336,13 +469,15 @@ module eth_axi_xbar #(
         end
         assign wv     = (|wsel) && w_v[wsel_m];
         assign wpl_in = {w_data[wsel_m*AXI_DW +: AXI_DW],
-                         w_strb[wsel_m*STRB_W +: STRB_W]};
+                         w_strb[wsel_m*STRB_W +: STRB_W],
+                         wbeat_last[wsel_m]};
         eth_axi_skidbuf #(.PW(WPW)) u_w (
             .clk_i(clk_i), .rst_ni(rst_ni),
             .i_valid(wv), .i_ready(w_skid_iready[d]), .i_data(wpl_in),
             .o_valid(m_wvalid[d]), .o_ready(m_wready[d]), .o_data(wpl_out));
-        assign m_wdata[d*AXI_DW +: AXI_DW] = wpl_out[WPW-1 -: AXI_DW];
-        assign m_wstrb[d*STRB_W +: STRB_W] = wpl_out[STRB_W-1:0];
+        assign m_wdata[d*AXI_DW +: AXI_DW] = wpl_out[STRB_W+1 +: AXI_DW];
+        assign m_wstrb[d*STRB_W +: STRB_W] = wpl_out[1 +: STRB_W];
+        assign m_wlast[d]                  = wpl_out[0];
     end
     endgenerate
 
@@ -375,6 +510,7 @@ module eth_axi_xbar #(
     // ======================================================================
     logic [N_MST-1:0]          b_in_rdy, r_in_rdy;
     logic [N_SLV-1:0]          b_slave_push, r_slave_push;
+    logic [N_SLV-1:0]          r_push_last;      // last R beat of the burst
     logic [N_SLV*MIW-1:0]      b_slave_owner, r_slave_owner;
     logic                      err_b_push, err_r_push;
     logic [MIW-1:0]            err_b_owner, err_r_owner;
@@ -422,6 +558,9 @@ module eth_axi_xbar #(
         end
         assign m_rready[rd2]              = (|rsel) && r_in_rdy[rm];
         assign r_slave_push[rd2]          = m_rvalid[rd2] && (|rsel) && r_in_rdy[rm];
+        // Burst end at the response side: the slave's RLAST or the ArLEN bound.
+        assign r_push_last[rd2] = r_slave_push[rd2] &&
+            (m_rlast[rd2] | (rd_cnt[rm*8 +: 8] == rd_len[rm*8 +: 8]));
         assign r_slave_owner[rd2*MIW +: MIW] = rm;
     end
     endgenerate
@@ -441,7 +580,8 @@ module eth_axi_xbar #(
                 if (aw_issue[bi])      wr_busy[bi] <= 1'b1;
                 else if (b_slave_push[bi]) wr_busy[bi] <= 1'b0;
                 if (ar_issue[bi])      rd_busy[bi] <= 1'b1;
-                else if (r_slave_push[bi]) rd_busy[bi] <= 1'b0;
+                // held for the WHOLE burst: cleared by its last R beat only
+                else if (r_push_last[bi]) rd_busy[bi] <= 1'b0;
             end
             if (aw_issue[ERR])      wr_busy[ERR] <= 1'b1;
             else if (err_b_push)    wr_busy[ERR] <= 1'b0;
@@ -457,6 +597,7 @@ module eth_axi_xbar #(
         logic               bv, rv;
         logic [AXI_IDW-1:0] bid, rid;
         logic [1:0]         bresp, rresp;
+        logic               rlast;
         logic [AXI_DW-1:0]  rdata;
         integer q;
         always_comb begin
@@ -483,23 +624,28 @@ module eth_axi_xbar #(
             rid   = {AXI_IDW{1'b0}};
             rdata = {AXI_DW{1'b0}};
             rresp = 2'b00;
+            rlast = 1'b0;
             for (q = 0; q < N_SLV; q++)
                 if (r_slave_push[q] && r_slave_owner[q*MIW +: MIW] == pm[MIW-1:0]) begin
                     rv    = 1'b1;
                     rid   = m_rid[q*AXI_XIDW +: AXI_IDW];        // strip prefix
                     rdata = m_rdata[q*AXI_DW +: AXI_DW];
                     rresp = m_rresp[q*2 +: 2];
+                    rlast = m_rlast[q] |
+                            (rd_cnt[pm*8 +: 8] == rd_len[pm*8 +: 8]);
                 end
             if (err_r_push && err_r_owner == pm[MIW-1:0]) begin
                 rv = 1'b1; rid = err_r_id; rdata = {AXI_DW{1'b0}}; rresp = RESP_DECERR;
+                rlast = 1'b1;                // one error beat per transaction
             end
         end
-        eth_axi_skidbuf #(.PW(AXI_IDW+AXI_DW+2)) u_r (
+        eth_axi_skidbuf #(.PW(AXI_IDW+AXI_DW+3)) u_r (
             .clk_i(clk_i), .rst_ni(rst_ni),
-            .i_valid(rv), .i_ready(r_in_rdy[pm]), .i_data({rid, rdata, rresp}),
+            .i_valid(rv), .i_ready(r_in_rdy[pm]),
+            .i_data({rid, rdata, rresp, rlast}),
             .o_valid(s_rvalid[pm]), .o_ready(s_rready[pm]),
             .o_data({s_rid[pm*AXI_IDW +: AXI_IDW], s_rdata[pm*AXI_DW +: AXI_DW],
-                    s_rresp[pm*2 +: 2]}));
+                    s_rresp[pm*2 +: 2], s_rlast[pm]}));
     end
     endgenerate
 
@@ -533,7 +679,8 @@ module eth_axi_xbar #(
                                  aw_id[wr_gnt_m[ERR]*AXI_IDW +: AXI_IDW]};
                     ew_state <= EW_W;
                 end
-                EW_W:  if (w_pop[ew_xid[AXI_XIDW-1 -: MIW]]) ew_state <= EW_B;
+                EW_W:  if (w_pop[ew_xid[AXI_XIDW-1 -: MIW]] &&
+                           wbeat_last[ew_xid[AXI_XIDW-1 -: MIW]]) ew_state <= EW_B;
                 EW_B:  if (err_b_push) ew_state <= EW_AW;
                 default: ew_state <= EW_AW;
             endcase
@@ -575,19 +722,36 @@ module eth_axi_xbar #(
         assign r_done = (rdd == ERR[SIW:0])
             ? (err_r_push && err_r_owner == tm[MIW-1:0])
             : (r_slave_push[rdd] && r_slave_owner[rdd*MIW +: MIW] == tm[MIW-1:0]);
+        // Does the R beat being pushed complete this master's read burst? The
+        // slave's RLAST or the captured ArLEN bound; the error slave always
+        // returns exactly one last beat (§5.3).
+        logic r_last;
+        assign r_last = (rdd == ERR[SIW:0])
+            ? 1'b1
+            : (m_rlast[rdd] | (rd_cnt[tm*8 +: 8] == rd_len[tm*8 +: 8]));
         always_ff @(posedge clk_i or negedge rst_ni) begin
             if (!rst_ni) begin
                 wr_state[tm*2 +: 2] <= 2'd0;
                 rd_state[tm]        <= 1'b0;
                 wr_dest[tm*(SIW+1) +: (SIW+1)] <= {(SIW+1){1'b0}};
                 rd_dest[tm*(SIW+1) +: (SIW+1)] <= {(SIW+1){1'b0}};
+                wr_len[tm*8 +: 8] <= 8'h00;
+                wr_cnt[tm*8 +: 8] <= 8'h00;
+                rd_len[tm*8 +: 8] <= 8'h00;
+                rd_cnt[tm*8 +: 8] <= 8'h00;
             end else begin
                 case (wr_state[tm*2 +: 2])
                     2'd0: if (aw_pop[tm]) begin
                         wr_state[tm*2 +: 2] <= 2'd1;
                         wr_dest[tm*(SIW+1) +: (SIW+1)] <= awd;
+                        wr_len[tm*8 +: 8] <= aw_len[tm*8 +: 8];
+                        wr_cnt[tm*8 +: 8] <= 8'h00;
                     end
-                    2'd1: if (w_pop[tm]) wr_state[tm*2 +: 2] <= 2'd2;
+                    2'd1: if (w_pop[tm]) begin
+                        // WLAST (as forwarded) or the AxLEN bound ends the burst.
+                        if (wbeat_last[tm]) wr_state[tm*2 +: 2] <= 2'd2;
+                        else wr_cnt[tm*8 +: 8] <= wr_cnt[tm*8 +: 8] + 8'd1;
+                    end
                     2'd2: if (b_done)      wr_state[tm*2 +: 2] <= 2'd0;
                     default:               wr_state[tm*2 +: 2] <= 2'd0;
                 endcase
@@ -595,9 +759,14 @@ module eth_axi_xbar #(
                     if (ar_pop[tm]) begin
                         rd_state[tm] <= 1'b1;
                         rd_dest[tm*(SIW+1) +: (SIW+1)] <= ard;
+                        rd_len[tm*8 +: 8] <= ar_len[tm*8 +: 8];
+                        rd_cnt[tm*8 +: 8] <= 8'h00;
                     end
                 end else if (r_done) begin
-                    rd_state[tm] <= 1'b0;
+                    // the burst ends on its last R beat; earlier beats advance
+                    // the per-master read beat counter
+                    if (r_last) rd_state[tm] <= 1'b0;
+                    else        rd_cnt[tm*8 +: 8] <= rd_cnt[tm*8 +: 8] + 8'd1;
                 end
             end
         end
@@ -640,6 +809,10 @@ module eth_axi_xbar #(
     //       routed ONLY to the master whose in-flight transaction targets it
     //       — every other master has NO matching in-flight (the exact
     //       counterexample scenario of the bug, now excluded).
+    //   (B) burst BOUNDING (v0.1, E2-AXI2): the per-master beat counters never
+    //       run past the AxLEN/ArLEN captured with the granted transaction, so a
+    //       routed burst is exactly as long as its master asked for — it cannot
+    //       over-run its own length into the next transaction.
     // Plus the pre-existing §7 props (response VALID stability, error-slave
     // owner bounds).
     //
@@ -671,22 +844,26 @@ module eth_axi_xbar #(
     // ---- shadow counters: responses owed by each real slave -----------------
     // b_pending[d] = W beats accepted by slave d minus B beats returned;
     // r_pending[d] = ARs accepted by slave d minus R beats returned.
-    logic [N_SLV*2-1:0] b_pending, r_pending;
+    // Sized for a full AXI4 INCR burst (v0.1: AxLEN+1 = up to 256 W beats) — a
+    // 2-bit counter would wrap and void the m_bvalid/m_rvalid ordering
+    // assumptions below.
+    localparam int PCW = 10;
+    logic [N_SLV*PCW-1:0] b_pending, r_pending;
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
-            b_pending <= {N_SLV*2{1'b0}};
-            r_pending <= {N_SLV*2{1'b0}};
+            b_pending <= {N_SLV*PCW{1'b0}};
+            r_pending <= {N_SLV*PCW{1'b0}};
         end else begin
             for (fi = 0; fi < N_SLV; fi++) begin
                 case ({m_wvalid[fi] && m_wready[fi], m_bvalid[fi] && m_bready[fi]})
-                    2'b10:   b_pending[fi*2 +: 2] <= b_pending[fi*2 +: 2] + 2'd1;
-                    2'b01:   b_pending[fi*2 +: 2] <= b_pending[fi*2 +: 2] - 2'd1;
-                    default: b_pending[fi*2 +: 2] <= b_pending[fi*2 +: 2];
+                    2'b10:   b_pending[fi*PCW +: PCW] <= b_pending[fi*PCW +: PCW] + 10'd1;
+                    2'b01:   b_pending[fi*PCW +: PCW] <= b_pending[fi*PCW +: PCW] - 10'd1;
+                    default: b_pending[fi*PCW +: PCW] <= b_pending[fi*PCW +: PCW];
                 endcase
                 case ({m_arvalid[fi] && m_arready[fi], m_rvalid[fi] && m_rready[fi]})
-                    2'b10:   r_pending[fi*2 +: 2] <= r_pending[fi*2 +: 2] + 2'd1;
-                    2'b01:   r_pending[fi*2 +: 2] <= r_pending[fi*2 +: 2] - 2'd1;
-                    default: r_pending[fi*2 +: 2] <= r_pending[fi*2 +: 2];
+                    2'b10:   r_pending[fi*PCW +: PCW] <= r_pending[fi*PCW +: PCW] + 10'd1;
+                    2'b01:   r_pending[fi*PCW +: PCW] <= r_pending[fi*PCW +: PCW] - 10'd1;
+                    default: r_pending[fi*PCW +: PCW] <= r_pending[fi*PCW +: PCW];
                 endcase
             end
         end
@@ -696,22 +873,30 @@ module eth_axi_xbar #(
     always_ff @(posedge clk_i) begin
         if (past_valid && $past(rst_ni) && rst_ni) begin
             // masters: a presented AW/W/AR beat is held stable until accepted
-            // (AXI A3.1.2 VALID stability); *_ready may toggle freely.
+            // (AXI A3.1.2 VALID stability — including the v0.1 burst attributes
+            // AxLEN/AxSIZE/AxBURST/WLAST); *_ready may toggle freely.
             for (fa = 0; fa < N_MST; fa++) begin
                 if ($past(s_awvalid[fa]) && !$past(s_awready[fa])) begin
                     assume(s_awvalid[fa]);
                     assume(s_awaddr[fa*AXI_AW +: AXI_AW] == $past(s_awaddr[fa*AXI_AW +: AXI_AW]));
                     assume(s_awid[fa*AXI_IDW +: AXI_IDW]   == $past(s_awid[fa*AXI_IDW +: AXI_IDW]));
+                    assume(s_awlen[fa*8 +: 8] == $past(s_awlen[fa*8 +: 8]));
+                    assume(s_awsize[fa*3 +: 3] == $past(s_awsize[fa*3 +: 3]));
+                    assume(s_awburst[fa*2 +: 2] == $past(s_awburst[fa*2 +: 2]));
                 end
                 if ($past(s_wvalid[fa]) && !$past(s_wready[fa])) begin
                     assume(s_wvalid[fa]);
                     assume(s_wdata[fa*AXI_DW +: AXI_DW] == $past(s_wdata[fa*AXI_DW +: AXI_DW]));
                     assume(s_wstrb[fa*STRB_W +: STRB_W] == $past(s_wstrb[fa*STRB_W +: STRB_W]));
+                    assume(s_wlast[fa] == $past(s_wlast[fa]));
                 end
                 if ($past(s_arvalid[fa]) && !$past(s_arready[fa])) begin
                     assume(s_arvalid[fa]);
                     assume(s_araddr[fa*AXI_AW +: AXI_AW] == $past(s_araddr[fa*AXI_AW +: AXI_AW]));
                     assume(s_arid[fa*AXI_IDW +: AXI_IDW]   == $past(s_arid[fa*AXI_IDW +: AXI_IDW]));
+                    assume(s_arlen[fa*8 +: 8] == $past(s_arlen[fa*8 +: 8]));
+                    assume(s_arsize[fa*3 +: 3] == $past(s_arsize[fa*3 +: 3]));
+                    assume(s_arburst[fa*2 +: 2] == $past(s_arburst[fa*2 +: 2]));
                 end
             end
             // slaves: a presented B/R beat is held stable until accepted, and
@@ -727,9 +912,10 @@ module eth_axi_xbar #(
                     assume(m_rid[fa*AXI_XIDW +: AXI_XIDW] == $past(m_rid[fa*AXI_XIDW +: AXI_XIDW]));
                     assume(m_rdata[fa*AXI_DW +: AXI_DW]   == $past(m_rdata[fa*AXI_DW +: AXI_DW]));
                     assume(m_rresp[fa*2 +: 2]             == $past(m_rresp[fa*2 +: 2]));
+                    assume(m_rlast[fa]                    == $past(m_rlast[fa]));
                 end
-                if (m_bvalid[fa]) assume(b_pending[fa*2 +: 2] != 2'd0);
-                if (m_rvalid[fa]) assume(r_pending[fa*2 +: 2] != 2'd0);
+                if (m_bvalid[fa]) assume(b_pending[fa*PCW +: PCW] != {PCW{1'b0}});
+                if (m_rvalid[fa]) assume(r_pending[fa*PCW +: PCW] != {PCW{1'b0}});
             end
         end
     end
@@ -765,6 +951,19 @@ module eth_axi_xbar #(
     endgenerate
 
     // ---- (O): B/R beats route ONLY to the issuing master --------------------
+    // ---- (B): a routed burst never runs past its captured AxLEN / ArLEN ----
+    // (U)/(C) above already hold MID-BURST — the destination's busy bit is set
+    // for the whole burst, not just its first beat — so this family only adds
+    // the burst-length bound: `cnt == len` is the last beat and is never passed.
+    always_ff @(posedge clk_i) begin
+        if (past_valid && rst_ni) begin
+            for (int q = 0; q < N_MST; q++) begin
+                assert(wr_cnt[q*8 +: 8] <= wr_len[q*8 +: 8]);
+                assert(rd_cnt[q*8 +: 8] <= rd_len[q*8 +: 8]);
+            end
+        end
+    end
+
     genvar fs;
     generate
     for (fs = 0; fs < N_SLV; fs++) begin : g_fml_owner
@@ -863,6 +1062,14 @@ module eth_axi_xbar #(
             cover(rd_ptr[MIW-1:0] != {MIW{1'b0}});
             cover(&s_bvalid);                           // every master holds a B
             cover(&s_rvalid);                           // every master holds an R
+            // v0.1 burst witnesses (master 0's lane/byte fields; a bare [0] on a
+            // flat N_MST*8 vector would be bit 0, not master 0)
+            cover(m_wlast[0] && (wr_len[0*8 +: 8] != 8'h00)); // multi-beat write out
+            cover(s_rlast[0] && (rd_len[0*8 +: 8] != 8'h00)); // multi-beat read back
+            // ... and a burst past its FIRST beat in each direction (still the
+            // minimal witness that a routed burst spans more than one beat)
+            cover(wr_cnt[0*8 +: 8] != 8'h00);                 // 2nd+ W beat in flight
+            cover(rd_cnt[0*8 +: 8] != 8'h00);                 // 2nd+ R beat in flight
         end
     end
 `endif

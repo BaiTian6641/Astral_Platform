@@ -41,7 +41,9 @@ DOCKER     ?= $(shell command -v docker 2>/dev/null)
 # carry a KNOWN G1-cleanup backlog -> linted separately via `make lint-mailbox`
 # (advisory). Fabric loop-modules (clb_t feedback, fabric_top routing rings) are
 # linted with a documented -Wno-UNOPTFLAT waiver (intended virtual loops, C01 sec2.4).
-RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/occ/ctx_scan.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/emri/emri_axi_adapter.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-shell/rtl/emri/ctx_engine_wrap.sv ethereal-shell/rtl/dram/eth_dram_stub.sv ethereal-shell/rtl/dram/eth_dram_ctrl.sv ethereal-fabric/hal/gowin_gw5/glue/eth_dram_glue.sv ethereal-fabric/hal/zynq/glue/eth_dram_glue.sv ethereal-shell/rtl/dma/eth_dma_pkg.sv ethereal-shell/rtl/dma/eth_dma_fifo.sv ethereal-shell/rtl/dma/eth_dma_arb.sv ethereal-shell/rtl/dma/eth_dma_axi_engine.sv ethereal-shell/rtl/dma/eth_dma_channel.sv ethereal-shell/rtl/dma/eth_dma_mc.sv
+RTL_CLEAN := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/occ/ctx_scan.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-shell/rtl/emri/frame_decoder.sv ethereal-shell/rtl/bmc/bmc_core.sv ethereal-shell/rtl/axi/eth_wb2axi.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/emri/emri_axi_adapter.sv ethereal-shell/rtl/axi/eth_axi_stream.sv ethereal-shell/rtl/axi/eth_axi_lite_slave.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-shell/rtl/emri/ctx_engine_wrap.sv ethereal-shell/rtl/dram/eth_dram_stub.sv ethereal-shell/rtl/dram/eth_dram_ctrl.sv ethereal-fabric/hal/gowin_gw5/glue/eth_dram_glue.sv ethereal-fabric/hal/zynq/glue/eth_dram_glue.sv ethereal-shell/rtl/dma/eth_dma_pkg.sv ethereal-shell/rtl/dma/eth_dma_fifo.sv ethereal-shell/rtl/dma/eth_dma_arb.sv ethereal-shell/rtl/dma/eth_dma_axi_engine.sv ethereal-shell/rtl/dma/eth_dma_channel.sv ethereal-shell/rtl/dma/eth_dma_mc.sv ethereal-shell/rtl/eth_rv/cor_alu.sv ethereal-shell/rtl/eth_rv/cor_muldiv.sv ethereal-shell/rtl/eth_rv/cor_lsu.sv ethereal-shell/rtl/eth_rv/cor_regfile.sv ethereal-shell/rtl/eth_rv/cor_decoder.sv ethereal-shell/rtl/eth_rv/eth_rv_core.sv
+
+
 RTL_FABRIC_DEPS := ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/interconnect/fabric_top.sv
 # Vendored NEORV32 all-Verilog netlist (machine-generated, BSD-3). NOT G1-ours —
 # provided to bmc_core as a dep; its ~536 vendor warnings are documented-waived
@@ -93,6 +95,10 @@ else
 	    eth_dma_fifo|eth_dma_arb|eth_dma_axi_engine) deps="ethereal-shell/rtl/dma/eth_dma_pkg.sv" ;; \
 	    eth_dma_channel)     deps="ethereal-shell/rtl/dma/eth_dma_pkg.sv ethereal-shell/rtl/dma/eth_dma_fifo.sv" ;; \
 	    eth_dma_mc)          deps="ethereal-shell/rtl/dma/eth_dma_pkg.sv ethereal-shell/rtl/dma/eth_dma_fifo.sv ethereal-shell/rtl/dma/eth_dma_arb.sv ethereal-shell/rtl/dma/eth_dma_axi_engine.sv ethereal-shell/rtl/dma/eth_dma_channel.sv" ;; \
+	    cor_alu|cor_muldiv|cor_lsu|cor_regfile|cor_decoder) deps="ethereal-shell/rtl/eth_rv/eth_rv_pkg.sv"; \
+	                         waiver="-Wno-UNUSEDPARAM" ;; \
+	    eth_rv_core)         deps="ethereal-shell/rtl/eth_rv/eth_rv_pkg.sv ethereal-shell/rtl/eth_rv/cor_alu.sv ethereal-shell/rtl/eth_rv/cor_muldiv.sv ethereal-shell/rtl/eth_rv/cor_lsu.sv ethereal-shell/rtl/eth_rv/cor_regfile.sv ethereal-shell/rtl/eth_rv/cor_decoder.sv"; \
+	                         waiver="-Wno-UNUSEDPARAM" ;; \
 	    emri_axi_adapter)    deps="ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
 	                         waiver="-Wno-UNUSEDPARAM" ;; \
 	    eth_axi_stream)      deps="ethereal-shell/rtl/axi/eth_axi_skidbuf.sv"; \
@@ -187,6 +193,7 @@ else
 	@echo "[test-sv] tb_eth_dram_ctrl (GW5 seam)"; $(IVERILOG) -g2012 -DETH_DRAM_VENDOR_GLUE -o /tmp/tb_dram_gw ethereal-shell/rtl/dram/eth_dram_stub.sv ethereal-fabric/hal/gowin_gw5/glue/eth_dram_glue.sv ethereal-shell/rtl/dram/eth_dram_ctrl.sv ethereal-fabric/tests/axi/tb_eth_dram_ctrl.sv 2>/dev/null && vvp /tmp/tb_dram_gw | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_lock_matrix"; $(IVERILOG) -g2012 -o /tmp/tb_lkm ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/tests/occ/tb_lock_matrix.sv 2>/dev/null && vvp /tmp/tb_lkm | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_eth_dma_mc"; $(IVERILOG) -g2012 -o /tmp/tb_dma_mc ethereal-shell/rtl/dma/eth_dma_pkg.sv ethereal-shell/rtl/dma/eth_dma_fifo.sv ethereal-shell/rtl/dma/eth_dma_arb.sv ethereal-shell/rtl/dma/eth_dma_axi_engine.sv ethereal-shell/rtl/dma/eth_dma_channel.sv ethereal-shell/rtl/dma/eth_dma_mc.sv ethereal-shell/rtl/dram/eth_dram_stub.sv ethereal-shell/rtl/dram/eth_dram_ctrl.sv ethereal-fabric/tests/dma/tb_eth_dma_mc.sv 2>/dev/null && vvp /tmp/tb_dma_mc | grep -q "TEST PASSED" && echo "  PASS"
+	@echo "[test-sv] tb_axi_xbar_burst"; $(IVERILOG) -g2012 -o /tmp/tb_xb ethereal-shell/rtl/axi/eth_axi_skidbuf.sv ethereal-shell/rtl/axi/eth_axi_xbar.sv ethereal-shell/rtl/dram/eth_dram_stub.sv ethereal-shell/rtl/dram/eth_dram_ctrl.sv ethereal-fabric/tests/axi/tb_axi_xbar_burst.sv 2>/dev/null && vvp /tmp/tb_xb | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_emri_regfile"; $(IVERILOG) -g2012 -o /tmp/tb_emri ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/tests/emri/tb_emri_regfile.sv 2>/dev/null && vvp /tmp/tb_emri | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_emri_occ_loop"; $(IVERILOG) -g2012 -o /tmp/tb_emriloop ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/tests/occ/column_cfg_ram.sv ethereal-fabric/tests/emri/tb_emri_occ_loop.sv 2>/dev/null && vvp /tmp/tb_emriloop | grep -q "TEST PASSED" && echo "  PASS"
 	@echo "[test-sv] tb_mgmt_hotswap"; $(IVERILOG) -g2012 -o /tmp/tb_mgmthotswap -Iethereal-fabric/rtl/inf ethereal-shell/rtl/emri/emri_pkg.sv ethereal-shell/rtl/emri/emri_regfile.sv ethereal-fabric/rtl/occ/occ_top.sv ethereal-fabric/rtl/clb/elut4.sv ethereal-fabric/rtl/clb/clb_t.sv ethereal-fabric/rtl/interconnect/switch_box.sv ethereal-fabric/rtl/interconnect/connection_block.sv ethereal-fabric/rtl/inf/eth_inf_ram.sv ethereal-fabric/rtl/inf/eth_inf_dsp_mac.sv ethereal-fabric/rtl/tile/mem_t.sv ethereal-fabric/rtl/tile/dsp_t.sv ethereal-fabric/rtl/interconnect/fabric_top.sv ethereal-fabric/tests/emri/tb_mgmt_hotswap.sv 2>/dev/null && vvp /tmp/tb_mgmthotswap | grep -q "TEST PASSED" && echo "  PASS"
@@ -246,6 +253,9 @@ ifeq ($(VERILATOR),)
 else
 	@$(MAKE) -C $(SMOKE_DIR) sim SIM=verilator
 endif
+
+verif-rv-rtl: ## Run the eth_rv core RTL against the DiffTest corpus (E2-RV1 slice; Verilator)
+	@python3 ethereal-shell/verif/eth_rv_core/run_difftest.py
 
 verif-rv: ## Build the eth_rv DiffTest corpus and run the RV harness tests (E2-RV0)
 	@python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_difftest/corpus

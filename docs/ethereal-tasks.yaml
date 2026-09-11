@@ -617,7 +617,7 @@ tasks:
     est_days: 180
     deliverable: ethereal-shell/rtl/eth_rv/ + AXI4 socket wrapper + core.yaml 描述符
     acceptance: spike 锁步比对零分歧跑 bare-metal hello；iverilog/verilator 可仿真
-    status: todo   # 2026-09-12: 两个前置均已就绪 —— **E2-RV0**（Spike 锁步载体，done）与 **`ethereal-plan/components/C14-eth_rv-RV64核心.md`**（本次新写的 HDL 级组件规范：冻结参数包/5 级微架构/I·D 端口/AXI 与 CLINT·PLIC/RVFI 轨迹口契约/DiffTest 集成规则/RV-B 六项验收检查点）。RV-B 实现（RV64IMC 无 MMU，DiffTest 零分歧 + UART hello）可分片开工；工具链：riscv64-unknown-elf 13.2.0 为 RV64 但**无 rv64imc multilib**（`-nostdlib` 下不影响，语料已验证；需要 libc 时用 rv64imac 库）
+    status: in_progress   # 2026-09-12 **首个垂直切片达成**：`ethereal-shell/rtl/eth_rv/`（pkg + ALU/乘除/LSU/寄存器堆/译码 + 顶层 5 级顺序核，EX/MEM/WB→EX 前递 + load-use 气泡）→ 运行器对 Spike **4/4 语料 MATCH、0 分歧**（221/169/105/116 提交，exit 0；`--memlat 2` 仍全绿）；RVFI 轨迹口为一等接口；负控（value/pc/rd 注入）均在精确提交处 FAIL；差分环抓出并修掉 2 个真实 RTL 缺陷（写优先旁路、D 口 lane 约定）；错误不静默（ecall/非对齐 → 错误脉冲）。Makefile 增 `verif-rv-rtl` 目标 + RTL_CLEAN/deps（包参数按惯例 -Wno-UNUSEDPARAM 豁免）。report-E2-RV1-rv-b-slice-20260912。**剩余**：CSR/trap 最小集、mem 流与 Spike 比对、`eth_axi` AXI4 主口替换（当前 I 口为简化取指）、缓存/BTB、轨迹口形式化、RV-C（FPU+Sv39）
 
   - id: E2-RV2
     title: eth_rv Stage RV-C（RV64GC + Sv39 MMU → GW5 单核验证 profile，boot Linux）
@@ -653,7 +653,7 @@ tasks:
     est_days: 8
     deliverable: eth_axi_xbar v0.1（beat 计数 + 突发通道端口）+ spec eth-axi-v0.md §5.2 修订 + TB
     acceptance: 突发事务经 xbar 到 eth_dram_ctrl 全链一致（对比直连基线）
-    status: todo   # 2026-09-12 由 E2-DRAM1 暴露：v0 xbar 从侧端口无 AxLEN/AxSIZE/AxBURST/WLAST/RLAST（eth-axi-v0.md §5.2 把突发推迟到 v0.1），因此完整 AXI4 的 DRAM 插座暂无法接在 v0 xbar 之后（可直连 BMC/DMA/应用核）；另 gowin_clkstub.sv 有一处 $error 字符串 '+' 拼接在 iverilog 14 下被求值为数字（E1-PLT1 侧一行修复）
+    status: done   # 2026-09-12: 新参数 `BURST_EN`（默认 0 = v0 单拍契约**逐位不变**；1 = 突发路由）+ 主/从侧 burst 端口；突发形状随 skid 载荷；每主 beat 计数（末拍 = LAST | cnt==AxLEN，与 DRAM stub 容错一致 ⇒ 不挂死/不截断）；锁步跨整突发（wr_busy 到 B、rd_busy 到 LAST R）⇒ (U)/(C)/(O) 不变式中途仍成立；DECERR 吞整突发 W 且只回 1 个 R 拍。证据：新 `tb_axi_xbar_burst` **2813 checks/0 errors**（256 拍 sweep 与直连基线一致、双主并发突发、3 项非空洞变异全 FAIL）；形式化 prove PASS（40 步 + k-induction，6m29）+ cover 11/11；既有 `tb_axi_xbar`/`tb_bmc_axi_xbar` 回归 PASS；lint 0 告警（含 -GBURST_EN=1）。spec §5.2 修订文本见 axi2-notes.md §4（agent 笔记，父侧并入）。report-E2-AXI2-xbar-burst-20260912
 
   - id: E2-DRAM1
     title: eth_dram_ctrl 封装件（AXI4 从接口 + Zynq-PS/GW5-hard-DDR3 glue + Verilator stub）

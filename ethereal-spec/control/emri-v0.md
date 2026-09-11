@@ -147,7 +147,12 @@ behaviour, which could not gate multi-column deploys (§3.3 step 4) and
 false-quarantined healthy regions in the §3.5 heartbeat.
 
 > **Blank-before-write (FABulous red line):** the OCC hardware-enforces this via
-> its per-region dirty bit + `S_NEEDS_BLANK` status (E0-FAB5). A WRITE to a dirty
+> its per-frame-window dirty bit + `S_NEEDS_BLANK` status (E0-FAB5); the window is
+> `frame_addr[15:8]` (region + column), matching the v0.6 `OCC_FRAME_ADDR` map — a
+> region-wide BLANK clears the bits of every window it covers. **v0.6 note:** before
+> the column map this was a per-region bit; §3.3's per-column BLANK→LOAD sequence
+> for packed images requires the finer granularity (E1-DMO2c found the contradiction).
+> A WRITE to a dirty
 > region returns `NEEDS_BLANK`; the host MUST issue `BLANK` first. EMRI does not
 > second-guess this — it surfaces the status verbatim.
 
