@@ -59,7 +59,11 @@ module clb_t #(
     output logic [N-1:0]      clb_out_o,
     input  logic              cfg_we_i,
     input  logic [5:0]        cfg_addr_i,
-    input  logic [31:0]       cfg_data_i
+    input  logic [31:0]       cfg_data_i,
+    // ---- context scan (ctx-scan-v0.md §2): cluster daisy-chain ----
+    input  logic              scan_en_i,
+    input  logic              scan_in_i,
+    output logic              scan_out_o
 );
     // Scoped UNOPTFLAT waiver (module scope): the CLB feedback
     // (clb_out_o -> pool -> eLUTs -> clb_out_o) is intended virtual logic
@@ -105,6 +109,12 @@ module clb_t #(
     // C01 §2.4 problem 2 (virtual combinational loops are legal user logic).
     /* verilator lint_off UNOPTFLAT */
     logic [31:0] pool;
+
+    // ---- context scan chain: elut0 <- scan_in_i, elut[k] <- elut[k-1]
+    // (ctx-scan-v0.md §2: element index e = tile_rm*N + gi; fixed order) ----
+    logic [N-1:0] elut_scan_in;
+    logic [N-1:0] elut_scan_out;
+    assign scan_out_o = elut_scan_out[N-1];
     always_comb begin
         pool             = '0;
         pool[EXT_IN-1:0] = clb_in_i;   // ext inputs at [0..EXT_IN-1] = [17:0]
@@ -115,6 +125,7 @@ module clb_t #(
     genvar gi, gk;
     generate
         for (gi = 0; gi < N; gi = gi + 1) begin : gen_lut
+            assign elut_scan_in[gi] = (gi == 0) ? scan_in_i : elut_scan_out[gi-1];
             for (gk = 0; gk < K; gk = gk + 1) begin : gen_in
                 localparam int M = gi*K + gk;
                 localparam logic PARITY = (M % 2) != 0;   // pi(m) = m%2 = gk%2 (K even)
@@ -135,7 +146,10 @@ module clb_t #(
                 .vout_o     (clb_out_o[gi]),
                 .cfg_we_i   (lut_cfg_we[gi]),
                 .cfg_data_i (cfg_data_i[19:0]),
-                .cfg_ce_i   (1'b1)
+                .cfg_ce_i   (1'b1),
+                .scan_en_i  (scan_en_i),
+                .scan_in_i  (elut_scan_in[gi]),
+                .scan_out_o (elut_scan_out[gi])
             );
         end
     endgenerate

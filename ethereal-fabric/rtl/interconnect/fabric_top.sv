@@ -86,7 +86,12 @@ module fabric_top #(
     input  logic [31:0]       cfg_data_i,
     output logic [R*C*N-1:0]  clb_out_obs_o,  // flattened CLB outputs (observable)
     output logic [R*C*32-1:0] mem_vd_obs_o,   // flattened mem_t vd_o (observable)
-    output logic [R*C*48-1:0] dsp_vp_obs_o    // flattened dsp_t vp_o (observable)
+    output logic [R*C*48-1:0] dsp_vp_obs_o,   // flattened dsp_t vp_o (observable)
+    // ---- context scan (ctx-scan-v0.md §2): one serial chain over all tiles,
+    // row-major tile order; every tile carries a clb_t (het tiles included) ----
+    input  logic              scan_en_i,
+    input  logic              scan_in_i,
+    output logic              scan_out_o
 );
     localparam int NTILES = R*C;
     localparam int TIW    = $clog2(NTILES);
@@ -120,6 +125,15 @@ module fabric_top #(
     // ---- per-tile SB I/O bundles (2D unpacked arrays) ----
     wire [W-1:0] sb_in_n  [R][C], sb_in_s  [R][C], sb_in_e  [R][C], sb_in_w  [R][C];
     wire [W-1:0] sb_out_n [R][C], sb_out_s [R][C], sb_out_e [R][C], sb_out_w [R][C];
+    // ---- context scan chain: tile[t].scan_in = tile[t-1].scan_out, t = r*C+c -
+    wire [R*C-1:0] tile_scan_in, tile_scan_out;
+    genvar gt;
+    generate
+        for (gt = 0; gt < R*C; gt = gt + 1) begin : g_scan_chain
+            assign tile_scan_in[gt] = (gt == 0) ? scan_in_i : tile_scan_out[gt-1];
+        end
+    endgenerate
+    assign scan_out_o = tile_scan_out[R*C-1];
 
     /* verilator lint_off UNOPTFLAT */
     genvar r, c;
@@ -317,7 +331,10 @@ module fabric_top #(
                     .clb_out_o  (clb_out_local),
                     .cfg_we_i   (clb_cfg_we),
                     .cfg_addr_i (intra[5:0]),
-                    .cfg_data_i (cfg_data_i)
+                    .cfg_data_i (cfg_data_i),
+                    .scan_en_i  (scan_en_i),
+                    .scan_in_i  (tile_scan_in[r*C+c]),
+                    .scan_out_o (tile_scan_out[r*C+c])
                 );
 
                 assign clb_out_obs_o[(r*C+c)*N +: N]    = clb_out_local;

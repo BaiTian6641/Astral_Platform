@@ -75,7 +75,10 @@ module tb_clb_t;
         .clb_out_o (clb_out),
         .cfg_we_i  (cfg_we),
         .cfg_addr_i(cfg_addr),
-        .cfg_data_i(cfg_data)
+        .cfg_data_i(cfg_data),
+        .scan_en_i (1'b0),          // ctx-scan-v0 (E2-FAB3): unused in this TB
+        .scan_in_i (1'b0),
+        .scan_out_o()
     );
 
     // ---- defaults ----

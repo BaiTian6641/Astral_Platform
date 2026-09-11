@@ -36,7 +36,10 @@ module tb_elut4;
         .vout_o    (vout),
         .cfg_we_i  (cfg_we),
         .cfg_data_i(cfg_data),
-        .cfg_ce_i  (cfg_ce)
+        .cfg_ce_i  (cfg_ce),
+        .scan_en_i(1'b0),
+        .scan_in_i(1'b0),
+        .scan_out_o()
     );
 
     // ---- defaults ----

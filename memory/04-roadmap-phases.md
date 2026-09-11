@@ -49,6 +49,12 @@
 - **新发现的运维/设计契约（写入报告）**：① `alloc_region` 只接受 FREE region → **跨镜像热替换 = stop+deploy**（`restart` 仅是"同镜像重跑"）；② TB 的 UART 包含匹配必须**消费式**（旧的"从队列头扫描"会让重复字符串匹配到上一轮的副本，脚本抢跑并与 daemon 竞争 doorbell → `region_full`/丢 doorbell）；③ **多列地址别名（结构性，待修 E1-DMO2b）**：`OCC_FRAME_ADDR` 的列字段 [11:4] 只给 16 词/列，而 v2c 列帧 34–68 词 → 同 region 内相邻列在回读存储重叠 → 多列部署 READBACK 必然失配（单列/每 region 一列不受影响）。方案：spec v0.6 列基址 `col[11:8]`、词 `[7:0]`（256 词/列）+ daemon `c<<4`→`c<<8`；DMO1 遗留的 4 列 uart 回放依赖此修复。
 - **工具**：`gen_daemon_vectors.py --frame-hex-b`（第二签名镜像，digest+Ed25519）+ `make stress` 独立目标（OCC soak + daemon 轮换；长时 TB 不并入 `test-sv`）。
 
+## Progress log (2026-09-11 evening — E2-FAB3 context save/restore)
+
+- **E2-FAB3 DONE (sim scope, report-E2-FAB3-ctx-scan-20260911).** Spec `ethereal-spec/fabric/ctx-scan-v0.md`（链拓扑/打包/驱动顺序/EMRI 拆期）+ RTL：`elut4`/`clb_t`/`fabric_top` 增 `scan_en_i`/`scan_in_i`/`scan_out_o`（FF 优先级 rst > scan > CE；链序号 `e = tile_rm*8 + gi`，覆盖**全部** eLUT vff，与配置无关）+ 新引擎 `ethereal-fabric/rtl/occ/ctx_scan.sv`（SAVE 采样打包 `element e → word e/32 的 bit e%32`；RESTORE 升序读字、MSB-first 驱动；单时钟域）。**capstone TB `tb_ctx_scan` PASS**：双 fabric 锁步 12 周期 → A 暂停+保存（窗口字 bit0 == 暂停点状态）→ 恢复 → **与不间断参考逐周期比对 24 周期位精确**（镜像为自触发 TFF，相位/位错即失败）。`make lint` OK；8 个受影响 TB 重跑 PASS（含 3 个 emri iverilog TB）；15 个测试文件扫描端口 tie-off 逐文件校验。
+- **两个镜像缺陷（TB 抓出并修复）**：① SAVE 累加器方向反（先采到的 element N-1 落在 bit0）→ 改 `acc <= {acc[30:0], scan_out}`；② RESTORE 按 LSB-first 驱动、与 ① 组合成**双重反向**（修 ① 后暴露）→ 改 MSB-first（`sreg <= {sreg[30:0], 1'b0}` + `scan_in = sreg[31]`），并同步修正 spec §4（链每移位一次元素上移一位 ⇒ 驱动顺序必须与采样顺序对称）。教训：链式读写的方向必须由"采样顺序 ↔ 驱动顺序"的对称性推导，不能各写一套。
+- **诚实边界**：TB 目前只覆盖 **words=1（32 位链）**，多字链路径未覆盖（→ E2-FAB3b 扩展）；真实时钟切换/SSRAM 窗口映射仍为 hal/glue ASSUMPTION；未配置瓦片的 vff 保持 X 语义（保存字高位 X 属预期）。
+
 ## Phase 0 progress log (2026-07-24)
 - **Wk1 infrastructure ✅ (committed `78ab251`):** E0-INF1 (8-repo skeleton) + E0-INF2 (CI) + E0-INF3 (Docker+Makefile+smoke) + E0-INF4 (trademark) + S04-P0#1 (mailbox migrated to ethereal-shell, CERN-OHL-S, lint cleanup pending `S04-P0#2`). Docker-gated validations pending.
 - **E0-FAB1 ✅ (elut4+FF):** `ethereal-fabric/rtl/clb/elut4.sv` G1-clean (in lint glob); golden model `elut4_model.py` validated by **1211 local pytest**; cocotb DUT-vs-model Docker-gated. Bitfield frozen in `ethereal-spec/fabric/elut4-config-v0.md`. Report: `docs/reports/report-E0-FAB1-elut4-20260724.md`.

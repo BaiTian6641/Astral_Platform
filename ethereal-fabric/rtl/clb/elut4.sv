@@ -14,8 +14,10 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-07-24
 // Modified:    2026-07-24 - initial implementation (task E0-FAB1)
+// Modified:    2026-09-11 - ctx_scan scan ports (E2-FAB3, ctx-scan-v0.md §2/§3)
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §1
+// Plan-Ref:    ethereal-plan/components/C01-fabric-核心单元.md §1;
+//              ethereal-spec/fabric/ctx-scan-v0.md §2/§3 (E2-FAB3)
 // Notes:       Frozen v1 interface per C01 §1.3. cfg_data_i bitfield follows the
 //              C01 concatenation order {tt[15:0], ff_en, ff_rst_en, ff_rst_val,
 //              out_inv}:  [19:4]=tt, [3]=ff_en, [2]=ff_rst_en, [1]=ff_rst_val,
@@ -37,7 +39,11 @@ module elut4 (
     output logic        vout_o,      // virtual output (combinational or registered)
     input  logic        cfg_we_i,    // config write enable (1 cycle when this unit is selected)
     input  logic [19:0] cfg_data_i,  // {tt[15:0], ff_en, ff_rst_en, ff_rst_val, out_inv}
-    input  logic        cfg_ce_i     // virtual FF clock-enable (maps the user CE)
+    input  logic        cfg_ce_i,    // virtual FF clock-enable (maps the user CE)
+    // ---- context scan (ctx-scan-v0.md §2/§3): daisy-chain capture of vff_r ----
+    input  logic        scan_en_i,   // 1 = scan mode: vff_d = scan_in_i (freezes the cone)
+    input  logic        scan_in_i,   // previous chain element's Q
+    output logic        scan_out_o   // this element's Q (raw, pre-out_inv)
 );
 
     // ---- Configuration registers (written only via cfg_we_i; persist across rst_ni) ----
@@ -65,14 +71,18 @@ module elut4 (
         end
     end
 
-    // ---- Virtual FF: synchronous reset (gated by ff_rst_en_r, priority over CE) + CE ----
+    // ---- Virtual FF: sync reset > scan capture > CE (ctx-scan-v0.md §3) ----
     always_ff @(posedge clk_i) begin
         if (ff_rst_en_r && !rst_ni) begin
             vff_r <= ff_rst_val_r;
+        end else if (scan_en_i) begin
+            vff_r <= scan_in_i;      // ctx_scan: freeze + chain shift
         end else if (cfg_ce_i) begin
             vff_r <= comb_out;
         end
     end
+
+    assign scan_out_o = vff_r;       // raw Q (same convention as the captured-D model)
 
     // ---- Output mux: registered vs combinational, then optional invert ----
     logic muxed;

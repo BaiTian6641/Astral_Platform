@@ -133,7 +133,10 @@ module shell_tb_mgmt_packed;
   fabric_top #(.R(R), .C(C), .W(W), .N(N), .K(K), .EXT_IN(EXT_IN)) u_fabric (
     .clk_i(clk), .rst_ni(rst_n),
     .cfg_we_i(dec_cfg_we), .cfg_addr_i(dec_cfg_addr), .cfg_data_i(dec_cfg_data),
-    .clb_out_obs_o(clb_out_obs), .mem_vd_obs_o(mem_vd_obs), .dsp_vp_obs_o(dsp_vp_obs)
+    .clb_out_obs_o(clb_out_obs), .mem_vd_obs_o(mem_vd_obs), .dsp_vp_obs_o(dsp_vp_obs),
+    .scan_en_i(1'b0),
+    .scan_in_i(1'b0),
+    .scan_out_o()
   );
 
   // ============================================================

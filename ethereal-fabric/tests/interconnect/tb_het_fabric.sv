@@ -39,7 +39,10 @@ module tb_het_fabric;
     fabric_top #(.R(R), .C(C), .TILE_TYPE(TT)) dut (
         .clk_i(clk), .rst_ni(rst_ni),
         .cfg_we_i(cfg_we), .cfg_addr_i(cfg_addr), .cfg_data_i(cfg_data),
-        .clb_out_obs_o(clb_obs), .mem_vd_obs_o(mem_obs), .dsp_vp_obs_o(dsp_obs)
+        .clb_out_obs_o(clb_obs), .mem_vd_obs_o(mem_obs), .dsp_vp_obs_o(dsp_obs),
+        .scan_en_i(1'b0),
+        .scan_in_i(1'b0),
+        .scan_out_o()
     );
 
     // cfg write helper: (tile_idx, unit, intra, data)

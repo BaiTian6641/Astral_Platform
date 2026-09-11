@@ -40,7 +40,10 @@ module tb_hotswap;
     fabric_top #(.R(R), .C(C), .W(W), .N(N), .K(K), .EXT_IN(EXT_IN)) dut (
         .clk_i(clk), .rst_ni(rst_ni),
         .cfg_we_i(cfg_we), .cfg_addr_i(cfg_addr), .cfg_data_i(cfg_data),
-        .clb_out_obs_o(clb_out_obs)
+        .clb_out_obs_o(clb_out_obs),
+        .scan_en_i(1'b0),
+        .scan_in_i(1'b0),
+        .scan_out_o()
     );
 
     always #5 clk = ~clk;                 // 100 MHz

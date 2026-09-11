@@ -274,7 +274,10 @@ module tb_ethctl_replay;
       .cfg_we_i(fbus_we), .cfg_addr_i(fbus_addr), .cfg_data_i(fbus_wdata),
       .clb_out_obs_o(clb_out_obs),
       .mem_vd_obs_o(mem_vd_obs),
-      .dsp_vp_obs_o(dsp_vp_obs)
+      .dsp_vp_obs_o(dsp_vp_obs),
+      .scan_en_i(1'b0),
+      .scan_in_i(1'b0),
+      .scan_out_o()
   );
 
   // -- Clock ---------------------------------------------------------------------

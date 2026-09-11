@@ -439,6 +439,14 @@ tasks:
     est_days: 5
     deliverable: rtl/tiles/ssm_t/ + context save/restore
     acceptance: 容器暂停/恢复演示通过
+    status: done   # 2026-09-11 对账: 暂停/恢复演示通过 —— ctx-scan-v0 扫描链（elut4/clb_t/fabric_top + occ/ctx_scan 引擎）+ tb_ctx_scan 位精确续跑比对 24 周期（report-E2-FAB3-ctx-scan-20260911）；BMC/EMRI 编排拆至 E2-FAB3b
+  - id: E2-FAB3b
+    title: 上下文保存 v1 编排（EMRI CTX_* 寄存器 + BMC 发起暂停/恢复 + 多字链扩展 TB）
+    phase: phase-2
+    deps: [E2-FAB3]
+    est_days: 3
+    deliverable: emri CTX_* register block + bmc-fw context orchestration
+    acceptance: BMC 驱动的容器暂停/恢复（多字链 ≥2 字）位精确
     status: todo
 
   - id: E2-FAB4
