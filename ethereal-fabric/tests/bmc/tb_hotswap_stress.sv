@@ -634,9 +634,9 @@ module tb_hotswap_stress;
   int          region;
   logic        sel_b;
 
-  // region r's per-column frame base (daemon: region<<12 | col<<4, col == r)
+  // region r's per-column frame base (daemon: OCC_FRAME_ADDR v0.6 {region[15:12],col[11:8],word[7:0]}: region<<12 | col<<8, col == r)
   function automatic logic [15:0] reg_base(input int r);
-      reg_base = 16'((r << 12) | (r << 4));
+      reg_base = 16'((r << 12) | (r << 8));
   endfunction
 
   // Compare one region's column_cfg_ram range against its shadow buffer.

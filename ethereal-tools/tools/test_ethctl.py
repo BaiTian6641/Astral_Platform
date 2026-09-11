@@ -2,18 +2,27 @@
 """Tests for ethctl + daemon (S08 / E1-RUN2/3) and the EMRI constant cross-check."""
 from __future__ import annotations
 
+import io
 import json
 import re
 import struct
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+# capcheck (E2-SEC1) lives in the sibling ethereal-runtime/security/ package.
+_SECURITY_DIR = str(Path(__file__).resolve().parents[2] / "ethereal-runtime")
+if _SECURITY_DIR not in sys.path:
+    sys.path.insert(0, _SECURITY_DIR)
+
+# pi-lens-ignore: E402
 import efp_client
 import ethimg
 from emri_constants import (
@@ -21,12 +30,17 @@ from emri_constants import (
     EFP_CMD_RUN_PACKED,
     EFP_ERR_BAD_CMD,
     EFP_ERR_BAD_SIG,
+    EFP_ERR_CAPABILITY_DENIED,
+    EFP_ERR_CRC_TRANSPORT,
+    EFP_ERR_FWUPDATE,
     EFP_ERR_IMG_LEN_MISMATCH,
     EFP_ERR_NONE,
     EFP_ERR_OCC_CRC,
     EFP_ERR_OCC_REJECT,
+    EFP_ERR_RATE_LIMITED,
     EFP_ERR_REGION_FULL,
     EFP_ERR_REGION_LOCKED,
+    EFP_ERR_WATCHDOG_TIMEOUT,
     EFP_REGION_AUTO,
     EFP_S_ERROR,
     EFP_S_IDLE,
@@ -38,6 +52,8 @@ from emri_constants import (
     OCC_CMD_START,
     OCC_S_DONE,
     OCC_WRITE,
+    R_CAP_DECL_IO,
+    R_CAP_DECL_SVC,
     R_EFP_CMD,
     R_EFP_ERR,
     R_EFP_IMG_COLS,
@@ -47,6 +63,7 @@ from emri_constants import (
     R_IMG_DIGEST,
     R_IMG_SIG,
     R_OCC_CMD,
+    R_OCC_FRAME_ADDR,
     R_OCC_STATUS,
     R_OCC_WDATA,
 )
@@ -56,6 +73,9 @@ from ethctl import (
     PythonEmriModel,
     RecordTransport,
 )
+
+# pi-lens-ignore: E402
+from security import capcheck
 
 # --------------------------------------------------------------------------- #
 # EMRI constant cross-check: Python mirror must match emri_pkg.sv
@@ -383,6 +403,85 @@ def _signed_eth(tmp_path: Path, name: str = "efp-img"):
     return out, pk_raw, list(IMG_A_WORDS)
 
 
+def _daemon_pub_pem(tmp_path: Path) -> Path:
+    """Write the daemon test public key as PEM (for ethctl --pubkey)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from gen_daemon_vectors import KEY_SEED
+
+    pub = Ed25519PrivateKey.from_private_bytes(KEY_SEED).public_key()
+    path = tmp_path / "daemon_pub.pem"
+    path.write_bytes(pub.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ))
+    return path
+
+
+def _signed_eth_with_caps(tmp_path: Path, caps_yaml: str, name: str):
+    """Pack+sign image A with an explicit capabilities.yaml body."""
+    from gen_daemon_vectors import IMG_A_WORDS
+
+    priv_pem, pk_raw = _fixed_keypair()
+    src = tmp_path / f"src_{name}"
+    (src / "targets").mkdir(parents=True)
+    (src / "targets" / "efab-1.0.frames").write_bytes(
+        b"".join(w.to_bytes(4, "little") for w in IMG_A_WORDS)
+    )
+    (src / "capabilities.yaml").write_text(caps_yaml)
+    out = tmp_path / f"{name}.eth"
+    ethimg.pack(src, out, name=name, target="efab-1.0", privkey_pem=priv_pem)
+    return out, pk_raw
+
+
+def _tamper_manifest_signature(eth_path: Path) -> None:
+    """Flip the first hex nibble of the manifest signature (digest unchanged:
+    ethimg's manifest_digest excludes the signature field)."""
+    with tarfile.open(eth_path, "r") as tf:
+        members = {
+            n: (tf.extractfile(n).read() if tf.extractfile(n) else b"")
+            for n in tf.getnames()
+        }
+    man = yaml.safe_load(members["manifest.yaml"])
+    val = man["signature"]["value"]
+    man["signature"]["value"] = ("1" if val[0] == "0" else "0") + val[1:]
+    members["manifest.yaml"] = yaml.safe_dump(man, sort_keys=True).encode("utf-8")
+    with tarfile.open(eth_path, "w") as tf:
+        for member, data in members.items():
+            info = tarfile.TarInfo(name=member)
+            info.size = len(data)
+            info.mtime = 0
+            tf.addfile(info, io.BytesIO(data))
+
+
+def _set_eth_capabilities(eth_path: Path, caps_yaml: str) -> None:
+    """Swap the capabilities.yaml member + re-sync its digest/manifest_digest.
+
+    This invalidates the manifest signature (manifest_digest changes); the
+    stage-1 schema check runs before the trust gate, so callers see the
+    capabilities error, not a signature error."""
+    import hashlib
+
+    with tarfile.open(eth_path, "r") as tf:
+        members = {
+            n: (tf.extractfile(n).read() if tf.extractfile(n) else b"")
+            for n in tf.getnames()
+        }
+    members["capabilities.yaml"] = caps_yaml.encode("utf-8")
+    man = yaml.safe_load(members["manifest.yaml"])
+    man["members"]["capabilities.yaml"] = hashlib.sha256(
+        members["capabilities.yaml"]
+    ).hexdigest()
+    man["manifest_digest"] = ethimg._manifest_digest(man)
+    members["manifest.yaml"] = yaml.safe_dump(man, sort_keys=True).encode("utf-8")
+    with tarfile.open(eth_path, "w") as tf:
+        for member, data in members.items():
+            info = tarfile.TarInfo(name=member)
+            info.size = len(data)
+            info.mtime = 0
+            tf.addfile(info, io.BytesIO(data))
+
+
 def test_efp_digest_sig_byte_packing_kat():
     """Word i = bytes[4i+3:4i] (LE in-word) — pinned to the E1-RUN2 vectors."""
     import hashlib
@@ -400,7 +499,7 @@ def test_efp_digest_sig_byte_packing_kat():
 
 
 def test_efp_err_decode_all_codes():
-    """All 8 v0.2 EFP_ERR codes decode to their spec names."""
+    """EFP_ERR codes decode: v0.2 0-8, v0.4 9-10, v0.6 11-12."""
     expected = {
         EFP_ERR_NONE: "none",
         EFP_ERR_BAD_SIG: "bad_sig",
@@ -410,11 +509,16 @@ def test_efp_err_decode_all_codes():
         EFP_ERR_OCC_REJECT: "occ_reject",
         EFP_ERR_BAD_CMD: "bad_cmd",
         EFP_ERR_IMG_LEN_MISMATCH: "img_len_mismatch",
+        EFP_ERR_CRC_TRANSPORT: "crc_transport",
+        EFP_ERR_WATCHDOG_TIMEOUT: "watchdog_timeout",
+        EFP_ERR_FWUPDATE: "fwupdate",
+        EFP_ERR_CAPABILITY_DENIED: "capability_denied",
+        EFP_ERR_RATE_LIMITED: "rate_limited",
     }
-    assert len(expected) == 8
+    assert len(expected) == 13
     for code, name in expected.items():
         assert efp_client.decode_err(code) == name
-    assert efp_client.decode_err(9).startswith("unknown")
+    assert efp_client.decode_err(13).startswith("unknown")
 
 
 def test_efp_state_decode_all():
@@ -428,10 +532,11 @@ def test_efp_state_decode_all():
 
 def test_efp_run_session_op_order(tmp_path):
     """The run session must mirror spec sec 3.2 steps 1-6 exactly."""
-    eth, _, img_words = _signed_eth(tmp_path)
+    eth, pk, img_words = _signed_eth(tmp_path)
     client = efp_client.EfpClient()
-    ops, img = client.run_image(eth, EFP_REGION_AUTO)
+    ops, img = client.run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
     assert img.frame_words == img_words
+    assert img.caps == capcheck.Capabilities()  # auto-filled empty declaration
 
     dw = efp_client.words_from_bytes(img.digest32)
     sw = efp_client.words_from_bytes(img.sig64)
@@ -444,31 +549,37 @@ def test_efp_run_session_op_order(tmp_path):
         assert ops[8 + i].data == sw[i]
     assert ops[24].addr == R_EFP_IMG_WORDS and ops[24].data == len(img_words)
     assert ops[25].addr == R_EFP_REGION and ops[25].data == EFP_REGION_AUTO
+    # E2-SEC1 staging: CAP_DECL_IO + CAP_DECL_SVC precede the doorbell (empty
+    # declaration -> zero bitmaps)
+    assert ops[26].op == "write" and ops[26].addr == R_CAP_DECL_IO
+    assert ops[26].data == 0
+    assert ops[27].op == "write" and ops[27].addr == R_CAP_DECL_SVC
+    assert ops[27].data == 0
     # busy=0 BEFORE the doorbell (single-outstanding-command rule)
-    assert ops[26].op == "poll" and ops[26].addr == R_EFP_STATUS
-    assert ops[26].mask == 0x10 and ops[26].value == 0
-    assert ops[27].op == "write" and ops[27].addr == R_EFP_CMD
-    assert ops[27].data == EFP_CMD_RUN
+    assert ops[28].op == "poll" and ops[28].addr == R_EFP_STATUS
+    assert ops[28].mask == 0x10 and ops[28].value == 0
+    assert ops[29].op == "write" and ops[29].addr == R_EFP_CMD
+    assert ops[29].data == EFP_CMD_RUN
     # step 5: wait for LOAD (OCC WRITE already armed), then stream
-    assert ops[28].op == "poll" and ops[28].mask == 0x0F
-    assert ops[28].value == EFP_S_LOAD
-    assert ops[29].op == "stream" and ops[29].addr == R_OCC_WDATA
-    assert ops[29].words == img_words
+    assert ops[30].op == "poll" and ops[30].mask == 0x0F
+    assert ops[30].value == EFP_S_LOAD
+    assert ops[31].op == "stream" and ops[31].addr == R_OCC_WDATA
+    assert ops[31].words == img_words
     # step 6: terminal-state completion poll (busy=0 AND state==RUNNING; a
     # bare busy=0 poll would race the daemon's accept latency) + self-checks
-    assert ops[30].op == "poll" and ops[30].mask == 0x1F
-    assert ops[30].value == EFP_S_RUNNING
-    assert ops[31].op == "read" and ops[31].addr == R_EFP_STATUS
-    assert ops[31].mask == 0x3F and ops[31].value == EFP_S_RUNNING | 0x20
-    assert ops[32].op == "read" and ops[32].addr == R_EFP_ERR
-    assert ops[32].mask == 0xFF and ops[32].value == EFP_ERR_NONE
-    assert len(ops) == 33
+    assert ops[32].op == "poll" and ops[32].mask == 0x1F
+    assert ops[32].value == EFP_S_RUNNING
+    assert ops[33].op == "read" and ops[33].addr == R_EFP_STATUS
+    assert ops[33].mask == 0x3F and ops[33].value == EFP_S_RUNNING | 0x20
+    assert ops[34].op == "read" and ops[34].addr == R_EFP_ERR
+    assert ops[34].mask == 0xFF and ops[34].value == EFP_ERR_NONE
+    assert len(ops) == 35
 
 
 def test_efp_run_happy_path_model(tmp_path):
     eth, pk, img_words = _signed_eth(tmp_path)
     client = efp_client.EfpClient()
-    ops, _ = client.run_image(eth, EFP_REGION_AUTO)
+    ops, _ = client.run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
     efp_client.execute_ops(ops, model)
     assert model.read(R_EFP_STATUS) == EFP_S_RUNNING | 0x20
@@ -503,9 +614,11 @@ def _signed_packed_eth(tmp_path: Path, columns, name: str = "efp-packed"):
 def test_efp_run_packed_session_op_order(tmp_path):
     """The run_packed session must mirror spec sec 3.3: stage (+IMG_COLS),
     doorbell run_packed, per-column handshake + stream, terminal checks."""
-    eth, _ = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
+    eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     client = efp_client.EfpClient()
-    ops, img = client.run_packed(eth, EFP_REGION_AUTO, column_words=4)
+    ops, img = client.run_packed(
+        eth, EFP_REGION_AUTO, column_words=4, trusted_pk=pk
+    )
     streams = [o for o in ops if o.op == "stream"]
     # one stream per column, each carrying exactly that column's DATA words
     assert len(streams) == len(_PACKED_COLUMNS)
@@ -549,7 +662,9 @@ def test_efp_run_packed_happy_path_model(tmp_path):
     """run_packed drives the model daemon to RUNNING over 2 columns."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     client = efp_client.EfpClient()
-    ops, _ = client.run_packed(eth, EFP_REGION_AUTO, column_words=4)
+    ops, _ = client.run_packed(
+        eth, EFP_REGION_AUTO, column_words=4, trusted_pk=pk
+    )
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
     efp_client.execute_ops(ops, model)
     assert model.read(R_EFP_STATUS) == EFP_S_RUNNING | 0x20
@@ -561,7 +676,7 @@ def test_efp_run_packed_happy_path_model(tmp_path):
 def test_efp_run_packed_bad_sig_rejected(tmp_path):
     """Tampered signature -> EFP_ERR=bad_sig, state ERROR (same as run)."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
-    img = efp_client.load_image(eth)
+    img = efp_client.load_image(eth, trusted_pk=pk)
     bad_sig = bytes([img.sig64[0] ^ 0x01]) + img.sig64[1:]
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
     s = efp_client.EfpSession()
@@ -575,7 +690,7 @@ def test_efp_run_packed_bad_sig_rejected(tmp_path):
 
 def test_efp_run_packed_geometry_validation(tmp_path):
     """Client-side geometry checks (v0 homogeneous, region->column mapping)."""
-    eth, _ = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
+    eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     client = efp_client.EfpClient()
     # ragged columns (not homogeneous)
     with pytest.raises(efp_client.EfpError, match="homogeneous"):
@@ -587,10 +702,10 @@ def test_efp_run_packed_geometry_validation(tmp_path):
         efp_client.EfpSession().run_packed(bytes(32), bytes(64), [], 0)
     # .eth without column_words
     with pytest.raises(efp_client.EfpError, match="column_words"):
-        client.run_packed(eth, EFP_REGION_AUTO)
+        client.run_packed(eth, EFP_REGION_AUTO, trusted_pk=pk)
     # more columns than fit from an explicit region (2 regions, region 1)
     with pytest.raises(efp_client.EfpError, match="do not fit"):
-        client.run_packed(eth, 1, column_words=4)
+        client.run_packed(eth, 1, column_words=4, trusted_pk=pk)
     # flat word list not a multiple of column_words
     with pytest.raises(efp_client.EfpError, match="multiple"):
         client.run_packed([0] * 6, EFP_REGION_AUTO, column_words=4)
@@ -599,7 +714,7 @@ def test_efp_run_packed_geometry_validation(tmp_path):
 def test_efp_busy_before_cmd_rejected(tmp_path):
     """A doorbell write while busy is ignored + flagged bad_cmd (spec 3.2)."""
     eth, pk, img_words = _signed_eth(tmp_path)
-    img = efp_client.load_image(eth)
+    img = efp_client.load_image(eth, trusted_pk=pk)
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
     s = efp_client.EfpSession()
     s.stage_image(img.digest32, img.sig64, len(img.frame_words), EFP_REGION_AUTO)
@@ -623,7 +738,7 @@ def test_efp_busy_before_cmd_rejected(tmp_path):
 def test_efp_bad_sig_rejected(tmp_path):
     """Tampered signature -> EFP_ERR=bad_sig, state ERROR, region untouched."""
     eth, pk, _ = _signed_eth(tmp_path)
-    img = efp_client.load_image(eth)
+    img = efp_client.load_image(eth, trusted_pk=pk)
     bad_sig = bytes([img.sig64[0] ^ 0x01]) + img.sig64[1:]
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
     s = efp_client.EfpSession()
@@ -641,7 +756,7 @@ def test_efp_stop_restart_semantics(tmp_path):
     client = efp_client.EfpClient()
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
 
-    run_ops, _ = client.run_image(eth, EFP_REGION_AUTO)
+    run_ops, _ = client.run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
     efp_client.execute_ops(run_ops, model)
     assert model.read(R_EFP_STATUS) & 0xF == EFP_S_RUNNING
 
@@ -652,8 +767,10 @@ def test_efp_stop_restart_semantics(tmp_path):
     assert model.region_state(0) == 0  # FREE again
 
     # re-run, then restart (re-verify + re-stream of the last staged image)
-    efp_client.execute_ops(client.run_image(eth, EFP_REGION_AUTO)[0], model)
-    rst_ops, _ = client.restart(eth)
+    efp_client.execute_ops(
+        client.run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)[0], model
+    )
+    rst_ops, _ = client.restart(eth, trusted_pk=pk)
     efp_client.execute_ops(rst_ops, model)
     st = model.read(R_EFP_STATUS)
     assert st & 0xF == EFP_S_RUNNING and st & 0x20
@@ -676,8 +793,8 @@ def test_efp_ps_pure_read():
 
 
 def test_efp_session_json_self_describing(tmp_path):
-    eth, _, img_words = _signed_eth(tmp_path)
-    ops, img = efp_client.EfpClient().run_image(eth, EFP_REGION_AUTO)
+    eth, pk, img_words = _signed_eth(tmp_path)
+    ops, img = efp_client.EfpClient().run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
     text = efp_client.session_to_json(ops, name="run", image=img, region=0xFF)
     doc = json.loads(text)
     assert doc["schema"] == "ethereal.efp-session.v0"
@@ -719,9 +836,10 @@ def test_cli_efp_run_emit_session(tmp_path, capsys):
     from ethctl import _cli
 
     eth, _, _ = _signed_eth(tmp_path)
+    pub = _daemon_pub_pem(tmp_path)
     sess = tmp_path / "session.json"
     rc = _cli(["--transport", "efp", "run", str(eth), "--region", "auto",
-               "--emit-session", str(sess)])
+               "--pubkey", str(pub), "--emit-session", str(sess)])
     out = capsys.readouterr().out
     assert rc == 0
     assert "RUNNING" in out
@@ -733,7 +851,9 @@ def test_cli_efp_stop_ps(tmp_path, capsys):
     from ethctl import _cli
 
     eth, _, _ = _signed_eth(tmp_path)
-    assert _cli(["--transport", "efp", "run", str(eth), "--region", "auto"]) == 0
+    pub = _daemon_pub_pem(tmp_path)
+    assert _cli(["--transport", "efp", "run", str(eth), "--region", "auto",
+                 "--pubkey", str(pub)]) == 0
     capsys.readouterr()
     assert _cli(["--transport", "efp", "ps"]) == 0
     assert "state=" in capsys.readouterr().out
@@ -750,9 +870,10 @@ def test_cli_efp_restart_without_staged_image(tmp_path, capsys):
     from ethctl import _cli
 
     eth, _, _ = _signed_eth(tmp_path)
+    pub = _daemon_pub_pem(tmp_path)
     sess = tmp_path / "restart.json"
     rc = _cli(["--transport", "efp", "restart", str(eth),
-               "--emit-session", str(sess)])
+               "--pubkey", str(pub), "--emit-session", str(sess)])
     # session JSON is still emitted (the op list is valid); the fresh model
     # honestly reports the device-side bad_cmd.
     assert rc == 1
@@ -780,6 +901,158 @@ def test_cli_stop_needs_efp_transport(capsys):
     rc = _cli(["stop", "--region", "0"])
     assert rc == 1
     assert "--transport efp" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# E2-SEC1: host-side signature enforcement + capability pre-flight
+# --------------------------------------------------------------------------- #
+def test_efp_signed_image_matrices(tmp_path):
+    """Signed images: trusted key ok, missing/wrong key refused, opt-out ok."""
+    eth, pk, _ = _signed_eth(tmp_path)
+    assert efp_client.load_image(eth, trusted_pk=pk).signed is True
+    with pytest.raises(ethimg.SignatureError, match="trusted_pk"):
+        efp_client.load_image(eth)
+    with pytest.raises(ethimg.SignatureError, match="did not verify"):
+        efp_client.load_image(eth, trusted_pk=bytes(32))
+    # explicit dev opt-out still allowed (and still stages the real signature)
+    opted = efp_client.load_image(eth, allow_unsigned=True)
+    assert opted.signed is True and opted.sig64 != bytes(64)
+
+
+def test_efp_unsigned_image_rejected_by_default(tmp_path):
+    src = tmp_path / "img"
+    (src / "targets").mkdir(parents=True)
+    (src / "targets" / "efab-1.0.frames").write_bytes(struct.pack("<I", 1))
+    out = tmp_path / "u.eth"
+    ethimg.pack(src, out, name="u")
+    with pytest.raises(ethimg.SignatureError, match="unsigned"):
+        efp_client.load_image(out)
+    img = efp_client.load_image(out, allow_unsigned=True)
+    assert img.signed is False and img.sig64 == bytes(64)
+
+
+def test_efp_tampered_signature_rejected(tmp_path):
+    eth, pk, _ = _signed_eth(tmp_path)
+    _tamper_manifest_signature(eth)
+    with pytest.raises(ethimg.SignatureError, match="did not verify"):
+        efp_client.load_image(eth, trusted_pk=pk)
+
+
+def test_efp_capabilities_staged_and_ordered(tmp_path):
+    eth, pk = _signed_eth_with_caps(
+        tmp_path,
+        "io:\n  - {group: 1, dir: out}\n  - {group: 7, dir: inout}\n"
+        "services:\n  - {name: spi0, access: rw}\n",
+        name="efp-caps-ok",
+    )
+    ops, img = efp_client.EfpClient().run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
+    assert img.decl_io == (1 << 1) | (1 << 7)
+    assert img.decl_svc == 1  # spi0 -> proxy index 0
+    cap_writes = [
+        o for o in ops
+        if o.op == "write" and o.addr in (R_CAP_DECL_IO, R_CAP_DECL_SVC)
+    ]
+    assert [o.addr for o in cap_writes] == [R_CAP_DECL_IO, R_CAP_DECL_SVC]
+    assert [o.data for o in cap_writes] == [img.decl_io, img.decl_svc]
+    doorbell = next(
+        i for i, o in enumerate(ops) if o.op == "write" and o.addr == R_EFP_CMD
+    )
+    assert ops.index(cap_writes[0]) < doorbell
+    assert ops.index(cap_writes[1]) < doorbell
+
+
+def test_efp_over_declared_io_group_denied(tmp_path):
+    eth, pk = _signed_eth_with_caps(
+        tmp_path, "io:\n  - {group: 200, dir: out}\nservices: []\n",
+        name="efp-caps-big",
+    )
+    with pytest.raises(capcheck.CapabilityDenied) as ei:
+        efp_client.load_image(eth, trusted_pk=pk)
+    assert ei.value.entry == capcheck.IoDecl(200, "out")
+    assert "200" in str(ei.value)
+
+
+def test_efp_unknown_service_denied(tmp_path):
+    eth, pk = _signed_eth_with_caps(
+        tmp_path, "io: []\nservices:\n  - {name: can0, access: r}\n",
+        name="efp-caps-svc",
+    )
+    with pytest.raises(capcheck.CapabilityDenied, match="can0"):
+        efp_client.load_image(eth, trusted_pk=pk)
+
+
+def test_efp_malformed_capabilities_rejected(tmp_path):
+    """A malformed member fails stage-1 schema even before the trust gate."""
+    bad_dir, pk = _signed_eth_with_caps(
+        tmp_path, "io:\n  - {group: 0, dir: in}\nservices: []\n",
+        name="efp-caps-bad",
+    )
+    _set_eth_capabilities(bad_dir, "io:\n  - {group: 0, dir: up}\nservices: []\n")
+    with pytest.raises(capcheck.CapabilitySchemaError, match="io\\[0\\].dir"):
+        efp_client.load_image(bad_dir, trusted_pk=pk)
+    dup, pk2 = _signed_eth_with_caps(
+        tmp_path, "io:\n  - {group: 0, dir: in}\nservices: []\n",
+        name="efp-caps-dup",
+    )
+    _set_eth_capabilities(
+        dup, "io:\n  - {group: 1, dir: in}\n  - {group: 1, dir: out}\nservices: []\n"
+    )
+    with pytest.raises(capcheck.CapabilitySchemaError, match="duplicate group 1"):
+        efp_client.load_image(dup, trusted_pk=pk2)
+
+
+def test_cli_efp_capability_denied_is_actionable(tmp_path, capsys):
+    from ethctl import _cli
+
+    eth, _ = _signed_eth_with_caps(
+        tmp_path, "io:\n  - {group: 9, dir: out}\nservices: []\n",
+        name="efp-caps-cli",
+    )
+    pub = _daemon_pub_pem(tmp_path)
+    rc = _cli(["--transport", "efp", "run", str(eth), "--region", "auto",
+               "--pubkey", str(pub)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "group 9" in err  # offending entry named
+    assert "CapabilityDenied" not in err  # message, not a class dump
+
+
+# --------------------------------------------------------------------------- #
+# OCC_FRAME_ADDR v0.6 (E1-DMO2b): per-column addressing must not alias
+# --------------------------------------------------------------------------- #
+def test_occ_frame_addr_v06_column_addressing():
+    assert efp_client.region_frame_base(0) == 0x0000
+    assert efp_client.region_frame_base(3) == 0x3000
+    assert efp_client.column_frame_base(0, 0) == 0x0000
+    assert efp_client.column_frame_base(0, 1) == 0x0100
+    assert efp_client.column_frame_base(1, 2) == 0x1200
+
+
+def test_occ_frame_addr_column_windows_do_not_overlap():
+    """A 68-word frame at col 0 and col 1 land in disjoint ranges (v0.6)."""
+    c0 = efp_client.column_frame_range(0, 0, 68)
+    c1 = efp_client.column_frame_range(0, 1, 68)
+    assert set(c0) & set(c1) == set()
+    assert max(c0) < min(c1)
+    # v0.5's 16-word stride (col << 4) WOULD have overlapped such frames
+    assert set(range(68)) & set(range(16, 84))
+    with pytest.raises(efp_client.EfpError, match="window"):
+        efp_client.column_frame_range(0, 0, 257)
+
+
+def test_efp_run_packed_two_columns_address_each_column(tmp_path):
+    """The daemon mirror arms OCC_FRAME_ADDR = region_base | (col << 8)."""
+    eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
+    ops, _ = efp_client.EfpClient().run_packed(
+        eth, EFP_REGION_AUTO, column_words=4, trusted_pk=pk
+    )
+    model = efp_client.EfpDaemonModel(trusted_pk=pk)
+    efp_client.execute_ops(ops, model)
+    addrs = model.column_addrs()
+    expected = {efp_client.column_frame_base(0, c) for c in range(len(_PACKED_COLUMNS))}
+    assert expected <= set(addrs)
+    assert set(addrs) <= {0x0000, 0x0100}  # no 16-word-stride aliasing
+    assert model.read(R_OCC_FRAME_ADDR) == efp_client.column_frame_base(0, 1)
 
 
 # --------------------------------------------------------------------------- #

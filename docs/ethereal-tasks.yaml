@@ -404,6 +404,24 @@ tasks:
     acceptance: 零配置损坏、零跨区干扰
     status: done   # 2026-09-11 (sim 范围): ① OCC 层字面 2×10000：tb_occ_soak 20000 次 BLANK→WRITE→READBACK（镜像 A/B 交替；v0.5 expected-CRC 门 + RAM 影子 + 邻区逐字比对）0 errors / 0 词失配（1.5 s wall）；② daemon 层轮换：tb_hotswap_stress 6 轮（STOP→run_packed→RUNNING，2 region × 签名镜像 A/B）**69 ok / 0 fail**，三层校验（EFP_ERR / RAM 影子 / 真实织物输出 + 邻区不受扰）；③ 工具：gen_daemon_vectors --frame-hex-b（第二签名镜像）+ `make stress` 独立目标。发现并记录：ALLOC 仅接受 FREE（热替换 = stop+deploy）、OCC_FRAME_ADDR 列字段 16 词步长 vs 34–68 词帧 → 同 region 多列别名（E1-DMO2b，spec v0.6 方案）。daemon 层字面 2×10000 = 硅范围（验签 ~0.84 s/轮）。report-E1-DMO2-hotswap-stress-20260911
 
+  - id: E1-DMO2b
+    title: OCC_FRAME_ADDR 列寻址修正（EMRI v0.6：col[11:8]/word[7:0]，256 词/列）
+    phase: phase-1
+    deps: [E1-DMO2]
+    est_days: 1
+    deliverable: spec v0.6 + daemon/tools 列基址迁移
+    acceptance: 相邻列窗口不再别名（2 列部署地址不相交）
+    status: done   # 2026-09-11 (维护者选方案 A): emri-v0.md v0.6 §2 重映射 {region[15:12],col[11:8],word[7:0]}；daemon.c 新增 column_frame_base(region,col)=region<<12|col<<8 并替换 4 处 per-column 调用（BLANK/WRITE/READBACK/heartbeat）；efp_client 增 region/column_frame_base + column_frame_range(>256 词拒绝) + packed 模型逐列 arming；frame_map.frame_addr 与 frame_addr_format 迁移到 v0.6；fw `-Werror` 干净 + 工具 pytest 406 passed（含 2 列地址不相交断言）。report-E1-DMO2b-frame-addr-v06-20260911
+
+  - id: E1-DMO2c
+    title: 多列 packed 部署端到端回放（≥2 列，真实 daemon 路径）
+    phase: phase-1
+    deps: [E1-DMO2b]
+    est_days: 2
+    deliverable: pack_tb_frames 多列镜像 + tb_bmc_daemon_packed 逐列流式/逐列 CRC 回读
+    acceptance: 2 列部署 READBACK 逐列通过（v0.6 在真实 daemon 路径上无别名）
+    status: todo   # 测试基建目前只产出单列 --frame-hex；E1-DMO1 的 4 列 uart 会话回放同属此项
+
   - id: E1-DMO3
     title: v0.1.0 里程碑发布（视频+博客+文档站）
     phase: phase-1
@@ -537,7 +555,15 @@ tasks:
     est_days: 4
     deliverable: runtime/security/
     acceptance: 未签名镜像拒绝；越权 IO 分配拒绝
-    status: todo
+    status: done   # 2026-09-11: ① 强制验签默认开启 —— 固件侧本就无条件 Ed25519；主机 EFP 路径此前**无**验签，现默认强制（efp_client.load_image(trusted_pk) / ethctl --pubkey），未签名与坏签名均拒绝（pytest + 既有 bad_sig TB）；② 能力清单校验 —— 新规范 ethereal-spec/security/capabilities-v0.md（带类型条目）+ ethereal-runtime/security/capcheck.py + ethimg/efp_client/ethctl 集成（越权 IO/未知服务拒绝、条目级报错）；设备侧 EMRI v0.6 §3.7 能力门（CAP_DECL_IO/SVC + CAP_STATUS）由 daemon 在 ALLOC 后/BLANK 前执行（EFP_ERR=11 + 事件 code=4，拒绝无副作用）；③ 异常监控 v1 —— EMRI v0.6 §3.8 实时窗口监控（逐区饱和计数/阈值/spike 标志/throttle 掩码/code=5 事件，环 push 仲裁在 regfile 内）+ daemon throttle 执行（EFP_ERR=12）+ MON_NOTIFY 通知点。证据：make lint OK / make test-model 2724 passed + 2 xfailed / fw `-Wall -Wextra -Werror` 干净 / tb_bmc_daemon 61 ok + tb_bmc_daemon_packed 25 ok（均 TEST PASSED）/ tb_mon_anomaly（新）+ 6 个 iverilog TB PASS。report-E2-SEC1-security-v1-20260911。**未含**：region 锁矩阵（现仅单 region_locked_i 门 + occ_region_locked_o 硬连线 0）→ E2-SEC1b
+  - id: E2-SEC1b
+    title: region 锁矩阵（LOCK_MATRIX 位图 + LKM_STATUS/LKM_CMD，S02 §2.3 / C03 §5）
+    phase: phase-2
+    deps: [E2-SEC1]
+    est_days: 3
+    deliverable: occ_top 逐区锁位 + EMRI LKM 寄存器面 + daemon 锁生命周期联动
+    acceptance: 越权 region 写被拒且事件上报（S10 §3 Phase-1 #1）
+    status: todo   # 现状：occ_top 单全局 region_locked_i + emri_regfile 硬连线 occ_region_locked_o=0；RUNNING 自动锁/LOADING 解锁与 BMC 独占解锁通道待实现
 
   - id: E2-AST1
     title: Astral 聚合 v1（Zephyr+WAMR + Type-F 容器经 EFP 调 vFPGA）

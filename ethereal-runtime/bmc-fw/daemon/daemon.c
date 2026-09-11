@@ -148,6 +148,8 @@ static void print_err(uint8_t err)
     case EFP_ERR_CRC_TRANSPORT:  uart_puts("crc_transport"); break;
     case EFP_ERR_WATCHDOG_TIMEOUT: uart_puts("watchdog_timeout"); break;
     case EFP_ERR_FWUPDATE:       uart_puts("fwupdate"); break;
+    case EFP_ERR_CAPABILITY_DENIED: uart_puts("capability_denied"); break;
+    case EFP_ERR_RATE_LIMITED:   uart_puts("rate_limited"); break;
     default:                     uart_puts("unknown"); break;
     }
 }
@@ -250,6 +252,9 @@ static uint8_t watchdog_abort(void)
         g_wdt_active = 1u;
         uart_puts("wdt: occ op timeout\n");
         event_push(EVT_CODE_WATCHDOG_TIMEOUT, g_wdt_region);
+        /* v0.6 sec 3.8: a sec 3.5 watchdog event notifies bit 8+r; the HW
+         * monitor owns the watchdog counter and the windowing. */
+        emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_WDT(g_wdt_region));
         if (g_wdt_write != 0u) {
             uart_puts("wdt: drain-complete\n");
             if (wdt_drain(g_wdt_words) == 0u) {
@@ -282,6 +287,15 @@ static uint8_t occ_result(uint32_t status)
 static uint32_t region_frame_base(uint8_t region)
 {
     return (uint32_t)region << 12;
+}
+
+/* Column frame base (emri-v0.md sec 2, OCC_FRAME_ADDR v0.6):
+ * {region_id[15:12], col_id[11:8], word[7:0]} — each column owns a 256-word
+ * (8 KB) window, so adjacent columns of a packed image never alias. v0.5's
+ * 16-word stride (col << 4) overlapped 34-68-word v2c column frames. */
+static uint32_t column_frame_base(uint8_t region, uint8_t col)
+{
+    return region_frame_base(region) | ((uint32_t)col << 8);
 }
 
 
@@ -341,7 +355,7 @@ static uint8_t occ_blank_column(uint8_t region, uint32_t col, uint16_t words)
     uart_putc((char)('0' + (int32_t)col));
     uart_puts("\n");
     emri_write(EMRI_OCC_FRAME_ADDR_WORD,
-               region_frame_base(region) | (col << 4));
+               column_frame_base(region, (uint8_t)col));
     emri_write(EMRI_OCC_WORD_COUNT_WORD, (uint32_t)words);
     emri_write(EMRI_OCC_DECODE_WORD, col);
     opctx_set(0u, region, 1u, (uint8_t)col, words);
@@ -425,6 +439,35 @@ static int32_t alloc_region(uint8_t region_sel)
     }
     return (int32_t)region_sel;
 }
+/* Return a region to the FREE pool. The v0 table records no intermediate
+ * ALLOC state (a region is only FREE or RUNNING — it is marked RUNNING once
+ * the deploy completes), so an allocation is not a side effect by itself;
+ * this reset keeps a gate refusal explicitly trace-free. */
+static void region_release(uint8_t region)
+{
+    g_regions[region].state     = REGION_FREE;
+    g_regions[region].img_words = 0u;
+    g_regions[region].img_cols  = 0u;
+}
+
+/* v0.6 sec 3.8: a region is throttled while MON_ANOM_STATUS[7:0] bit r is
+ * set (the RTL monitor sets it on a per-window spike; the host W1C-clears). */
+static uint8_t region_throttled(uint8_t region)
+{
+    if (region >= 8u) {
+        return 0u;   /* the v0 throttle mask only defines regions 0..7 */
+    }
+    return ((emri_read(EMRI_MON_ANOM_STATUS_WORD) &
+             EMRI_MON_ANOM_THROTTLE(region)) != 0u) ? 1u : 0u;
+}
+
+/* v0.6 sec 3.7: the RTL capability comparator exposes "declared ⊄ grantable"
+ * as the live CAP_STATUS[1] (the daemon stages no bitmap itself). */
+static uint8_t cap_denied(void)
+{
+    return ((emri_read(EMRI_CAP_STATUS_WORD) & EMRI_CAP_STATUS_DENIED) != 0u)
+               ? 1u : 0u;
+}
 
 /* ------------------------------------------------------------------ */
 /* run (also the re-run half of restart): VERIFY -> ALLOC -> BLANK ->  */
@@ -449,6 +492,13 @@ static void do_run(uint8_t region_sel)
     }
     uart_puts("verify ok\n");
 
+    /* v0.6 sec 3.8 throttle gate: an explicitly targeted throttled region is
+     * refused BEFORE any ALLOC (spec: "no ALLOC"). AUTO is resolved below. */
+    if (region_sel != EFP_REGION_AUTO && region_throttled(region_sel) != 0u) {
+        fail(EFP_ERR_RATE_LIMITED);
+        return;
+    }
+
     set_state(EFP_S_ALLOC);
     uart_puts("st ALLOC\n");
     int32_t region = alloc_region(region_sel);
@@ -459,6 +509,24 @@ static void do_run(uint8_t region_sel)
     uart_puts("alloc r");
     uart_putc((char)('0' + region));
     uart_puts("\n");
+
+    /* v0.6 sec 3.8: AUTO resolves the region only now; a throttled resolution
+     * is refused with the allocation released (spec: no ALLOC kept). */
+    if (region_sel == EFP_REGION_AUTO && region_throttled((uint8_t)region) != 0u) {
+        region_release((uint8_t)region);
+        fail(EFP_ERR_RATE_LIMITED);
+        return;
+    }
+
+    /* v0.6 sec 3.7 capability gate: post-ALLOC / pre-BLANK. CAP_STATUS[1] is
+     * the live HW verdict over the staged CAP_DECL_* bitmaps; a denial leaves
+     * no BLANK and no fabric mutation (region released, event code 4). */
+    if (cap_denied() != 0u) {
+        region_release((uint8_t)region);
+        event_push(EVT_CODE_POLICY_DENIED, (uint8_t)region);
+        fail(EFP_ERR_CAPABILITY_DENIED);
+        return;
+    }
 
     uint8_t err = occ_blank_region((uint8_t)region, words);
     if (err != EFP_ERR_NONE) {
@@ -522,6 +590,9 @@ static void do_run(uint8_t region_sel)
     g_last_packed = 0u;
     g_done        = 1u;
     set_state(EFP_S_RUNNING);   /* busy stays 1; the dispatcher clears it */
+    /* v0.6 sec 3.8: a completed deploy notifies the HW monitor (bit r); the
+     * regfile pulses MON_RECFG_COUNT[region] and runs the window/threshold. */
+    emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_DEPLOY((uint8_t)region));
     uart_puts("st RUNNING r");
     uart_putc((char)('0' + region));
     uart_puts(" done\n");
@@ -554,6 +625,13 @@ static void do_run_packed(uint8_t region_sel)
     }
     uart_puts("verify ok\n");
 
+    /* v0.6 sec 3.8 throttle gate: an explicitly targeted throttled region is
+     * refused BEFORE any ALLOC (spec: "no ALLOC"). AUTO is resolved below. */
+    if (region_sel != EFP_REGION_AUTO && region_throttled(region_sel) != 0u) {
+        fail(EFP_ERR_RATE_LIMITED);
+        return;
+    }
+
     set_state(EFP_S_ALLOC);
     uart_puts("st ALLOC\n");
     int32_t region = alloc_region(region_sel);
@@ -573,6 +651,24 @@ static void do_run_packed(uint8_t region_sel)
     uart_putc((char)('0' + (int32_t)cols));
     uart_puts("\n");
 
+    /* v0.6 sec 3.8: AUTO resolves the region only now; a throttled resolution
+     * is refused with the allocation released (spec: no ALLOC kept). */
+    if (region_sel == EFP_REGION_AUTO && region_throttled((uint8_t)region) != 0u) {
+        region_release((uint8_t)region);
+        fail(EFP_ERR_RATE_LIMITED);
+        return;
+    }
+
+    /* v0.6 sec 3.7 capability gate: post-ALLOC / pre-BLANK (same as run). The
+     * packed flow refuses before any per-column BLANK, so the fabric and the
+     * retained column metadata are untouched (event code 4 pushed). */
+    if (cap_denied() != 0u) {
+        region_release((uint8_t)region);
+        event_push(EVT_CODE_POLICY_DENIED, (uint8_t)region);
+        fail(EFP_ERR_CAPABILITY_DENIED);
+        return;
+    }
+
     uint8_t err = occ_blank_packed((uint8_t)region, cols, words);
     if (err != EFP_ERR_NONE) {
         fail(err);
@@ -587,7 +683,7 @@ static void do_run_packed(uint8_t region_sel)
     for (uint32_t c = (uint32_t)region; c < (uint32_t)region + (uint32_t)cols;
          c++) {
         emri_write(EMRI_OCC_FRAME_ADDR_WORD,
-                   region_frame_base((uint8_t)region) | (c << 4));
+                   column_frame_base((uint8_t)region, (uint8_t)c));
         emri_write(EMRI_OCC_WORD_COUNT_WORD, (uint32_t)words);
         emri_write(EMRI_OCC_DECODE_WORD, c);
         opctx_set(1u, (uint8_t)region, 1u, (uint8_t)c, words);
@@ -628,7 +724,7 @@ static void do_run_packed(uint8_t region_sel)
         uart_putc((char)('0' + (int32_t)c));
         uart_puts("\n");
         emri_write(EMRI_OCC_FRAME_ADDR_WORD,
-                   region_frame_base((uint8_t)region) | (c << 4));
+                   column_frame_base((uint8_t)region, (uint8_t)c));
         emri_write(EMRI_OCC_WORD_COUNT_WORD, (uint32_t)words);
         opctx_set(0u, (uint8_t)region, 1u, (uint8_t)c, words);
         emri_write(EMRI_OCC_EXPECT_CRC_WORD,
@@ -654,6 +750,9 @@ static void do_run_packed(uint8_t region_sel)
     g_last_packed = 1u;
     g_done        = 1u;
     set_state(EFP_S_RUNNING);   /* busy stays 1; the dispatcher clears it */
+    /* v0.6 sec 3.8: completed deploy -> notify bit r (one pulse per deploy,
+     * not per column; the HW monitor counts deploys, sec 3.8). */
+    emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_DEPLOY((uint8_t)region));
     uart_puts("st RUNNING r");
     uart_putc((char)('0' + region));
     uart_puts(" done\n");
@@ -776,7 +875,7 @@ static uint8_t hb_probe_region(uint8_t region)
     for (uint32_t c = (uint32_t)region;
          c < (uint32_t)region + (uint32_t)g_regions[region].img_cols; c++) {
         emri_write(EMRI_OCC_FRAME_ADDR_WORD,
-                   region_frame_base(region) | (c << 4));
+                   column_frame_base(region, (uint8_t)c));
         emri_write(EMRI_OCC_WORD_COUNT_WORD, (uint32_t)words);
         opctx_set(0u, region, 1u, (uint8_t)c, words);
         emri_write(EMRI_OCC_EXPECT_CRC_WORD,
@@ -820,6 +919,9 @@ static void heartbeat_probe(void)
         g_regions[i].img_words = 0u;
         g_regions[i].img_cols  = 0u;
         event_push(EVT_CODE_HB_MISMATCH, (uint8_t)i);
+        /* v0.6 sec 3.8: a sec 3.5 heartbeat mismatch is a watchdog-class
+         * event -> notify bit 8+r (HW counts it in MON_WDT_COUNT). */
+        emri_write(EMRI_MON_NOTIFY_WORD, EMRI_MON_NOTIFY_WDT((uint8_t)i));
         set_err(EFP_ERR_OCC_CRC);
         set_state(EFP_S_ERROR);
     }

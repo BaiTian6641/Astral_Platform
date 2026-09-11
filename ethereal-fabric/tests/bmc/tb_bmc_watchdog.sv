@@ -280,7 +280,7 @@ module tb_bmc_watchdog;
       // frame_base_i must track the in-flight op's frame base: the decoder
       // computes widx = fbus_addr - frame_base, so a hardwired 0 only works
       // for base-0 deploys (region 0 / column 0). Region 1's base is
-      // 0x1000|(1<<4) = 0x1010.
+      // 0x1000|(1<<8) = 0x1100 (OCC_FRAME_ADDR v0.6: 256-word column window).
       .frame_base_i(occ_frame_addr),
       .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
       .crc_error_o(dec_crc_error)

@@ -100,8 +100,8 @@ def test_het_layout_shape_validation():
 def test_frame_addr_format():
     fm = FrameMap(**V1)
     assert fm.frame_addr(0, 0) == 0x000
-    assert fm.frame_addr(1, 2) == 0x102          # region<<8 | col
-    assert fm.frame_addr(0xF, 0xFF) == 0xFFF
+    assert fm.frame_addr(1, 2) == 0x1200         # region<<12 | col<<8 (v0.6)
+    assert fm.frame_addr(0xF, 0xF) == 0xFF00      # 256-word column windows never alias
 
 
 # ---- 2. THE acceptance: readback round-trip --------------------------------

@@ -1,8 +1,8 @@
-# EMRI — Ethereal Management Register Interface (v0.5, draft)
+# EMRI — Ethereal Management Register Interface (v0.6, draft)
 
-> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.5** (v0.5 adds the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
+> Repo: `ethereal-spec` (CC-BY-SA-4.0) · Status: **draft v0.6** (v0.6 adds the **capability-declaration gate** (`CAP_DECL_IO` @ `0x22` / `CAP_DECL_SVC` @ `0x23` / `CAP_STATUS` @ `0x24`, §3.7) + **anomaly monitoring v1** (per-region reconfig/watchdog counters @ `0x32`/`0x33`, spike flags + throttle mask @ `0x34`, window/threshold config @ `0x35`/`0x36`, §3.8) + `EFP_ERR=11 capability_denied` / `12 rate_limited` + event codes 4/5, and **re-maps `OCC_FRAME_ADDR`** to `{region_id[15:12], col_id[11:8], word[7:0]}` — v0.5's 4-bit column field/16-word stride aliased adjacent columns of a multi-column packed image in the readback store (E1-DMO2b; `capabilities.yaml` schema in `ethereal-spec/security/capabilities-v0.md`). v0.5 added the **OCC expected-CRC gate** — `OCC_EXPECT_CRC` @ `0x0E` + `OCC_CRC_RESULT` @ `0x0F`, §3.1.1 — READBACK now compares the readback stream CRC against a **software-supplied** expected CRC the caller captures from `OCC_CRC_RESULT` after the WRITE; this makes multi-column packed deploys (§3.3 step 4) and the §3.5 region heartbeat sound and supersedes the v0.2–v0.4 implicit "compare against the last write anywhere" behaviour. v0.4 added the **event-log ring** @ `0x38`/`0x39` + `EFP_ERR=9 watchdog_timeout` + the OCC op-watchdog/region-heartbeat semantics §3.5 and the sim-scoped dual-partition fw-update demo cmds §3.6 — E1-RUN4/E1-BMC2; v0.3 added `EFP_IMG_COLS` @ `0x21` + `EFP_CMD=run_packed`, §3.3, plus the §7.1 EFP-SPI CRC16 transport-integrity addendum: `SPI_CRC` @ `0x3F`, status `0x04=CRC_ERR`, `EFP_ERR=8=crc_transport`)
 > Plan-Ref: `ethereal-plan/subsystems/S05-BMC与EMRI-mFSM.md §2.3`, `ethereal-plan/components/C05-BMC组件.md §3/§4`
-> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · Implements: ADR-013/014/015/016
+> Date: 2026-07-29 · v0.2: 2026-09-01 · v0.3: 2026-09-02 · v0.4: 2026-09-08 · v0.5: 2026-09-11 · v0.6: 2026-09-11 · Implements: ADR-013/014/015/016
 
 The **unified management register ABI** exposed to the host by **both** the BMC
 (NEORV32 soft-core) and the **mFSM** (register-based small-device fallback).
@@ -65,7 +65,7 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x08` | `OCC_CMD` | RW | 32 | OCC command trigger. See §3. Write → latches a command; self-clears on `OCC_STATUS.busy=0` transition. |
 | `0x09` | `OCC_WDATA` | W | 32 | OCC write-data stream. Each write pushes one 32-bit word into the OCC wdata FIFO. |
 | `0x0A` | `OCC_STATUS` | R | 32 | `{status[6:0], region_id[11:8], crc_error[16], reserved, frame_addr[31:16]}`. Mirrors `occ_top.status_o` + sticky `crc_error`. See §4. |
-| `0x0B` | `OCC_FRAME_ADDR` | RW | 16 | OCC frame base address (`frame_addr_i` to `occ_top`). `{region_id[15:12], col_id[11:4], rsv[3:0]}`. |
+| `0x0B` | `OCC_FRAME_ADDR` | RW | 16 | OCC frame base address (`frame_addr_i` to `occ_top`). `{region_id[15:12], col_id[11:8], word[7:0]}` (v0.6). `col_id` = column index; `word` = word offset within the column's frame (256 words = 8 KB/column). v0.5's `{col_id[11:4], rsv[3:0]}` gave a 16-word stride, which aliased adjacent columns of a packed image in the readback store (E1-DMO2b). |
 | `0x0C` | `OCC_WORD_COUNT` | RW | 16 | Frame word count (`word_count_i` to `occ_top`). |
 | `0x0D` | `OCC_DECODE` | W | 32 | **frame_decoder start trigger** (v0.1). Writing pulses `dec_start_o` → `frame_decoder.start_i`; `data[7:0]` = target fabric column (`col_i`). Self-clearing pulse. Makes a packed deploy self-contained (no host/TB sideband strobe). See §3.1. |
 | `0x0E` | `OCC_EXPECT_CRC` | RW | 32 | **Expected streaming CRC for the next READBACK** (v0.5, §3.1.1): latched by `occ_top` at command accept; the READBACK stream CRC must equal it or `crc_error`/`ERROR` (→ `EFP_ERR=occ_crc` in daemon mode). Plain RW storage in the regfile; the caller writes the value captured from `OCC_CRC_RESULT` after the corresponding WRITE/BLANK. |
@@ -77,26 +77,36 @@ Word-addressed, 32-bit. All offsets in **words** (×4 for byte address).
 | `0x14` | `EFP_REGION` | RW | 8 | Target region for the next `EFP_CMD`. `0xFF` = auto-allocate first free (run only). |
 | `0x15` | `EFP_IMG_WORDS` | RW | 16 | Frame-word count of the image being deployed (incl. CRC tail words). |
 | `0x16` | `EFP_STATUS` | R | 8 | Daemon lifecycle: `{state[3:0], busy[4], done[5]}`. States: `0=IDLE,1=VERIFY,2=ALLOC,3=BLANK,4=LOAD,5=READBACK,6=RUNNING,7=ERROR,8=STOPPED`. |
-| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch,8=crc_transport` (§7.1, SPI-transport CRC16 mismatch), `9=watchdog_timeout` (§3.5, v0.4), `10=fwupdate` (§3.6, v0.4 sim-demo CRC mismatch). Cleared on next `EFP_CMD` write. |
+| `0x17` | `EFP_ERR` | R | 8 | Sticky last-error: `0=none,1=bad_sig,2=region_full,3=region_locked,4=occ_crc,5=occ_reject,6=bad_cmd,7=img_len_mismatch,8=crc_transport` (§7.1, SPI-transport CRC16 mismatch), `9=watchdog_timeout` (§3.5, v0.4), `10=fwupdate` (§3.6, v0.4 sim-demo CRC mismatch). `11=capability_denied` (§3.7, v0.6 — declared capability set exceeds what the platform can grant), `12=rate_limited` (§3.8, v0.6 — target region throttled by anomaly monitoring). Cleared on next `EFP_CMD` write. |
 | `0x18-0x1F` | `IMG_DIGEST[0..7]` | RW | 8×32 | 32-byte manifest digest (SHA-256). Word `i` holds digest bytes `[4i+3:4i]` (little-endian in-word). |
 | `0x50-0x5F` | `IMG_SIG[0..15]` | RW | 16×32 | 64-byte Ed25519 signature over the digest. Same in-word byte order as `IMG_DIGEST`. |
 | `0x20` | `HEALTH_STATUS` | R | 32 | bit-per-region health: bit0=region0 ok, bit8=region1 ok, … v0: all-ok = `0x0000_0101`. |
 | `0x21` | `EFP_IMG_COLS` | RW | 8 | Number of fabric columns the staged image spans (`run_packed` only, v0.3 §3.3). Plain RW storage like the other EFP regs. **v0 region→column mapping ASSUMPTION:** in the v0 sim fabric (2×2, one column per region slot) region `r` covers the columns starting at column `r`. |
+| `0x22` | `CAP_DECL_IO` | RW | 32 | **Declared IO pin-group bitmap** (v0.6, §3.7): bit `g` = the staged image declares L1 pin group `g` (one group = 8 physical pins, S06:24). Plain RW staging storage, written by the host from `capabilities.yaml` before `EFP_CMD`. |
+| `0x23` | `CAP_DECL_SVC` | RW | 32 | **Declared service bitmap** (v0.6, §3.7): bit `k` = declares L2 proxy/virtual-device instance `k` (RFC-004 device-class index, S06:39). |
+| `0x24` | `CAP_STATUS` | R | 32 | **Capability-check verdict** (v0.6, §3.7): `[0]=checked`, `[1]=denied`, `[2]=throttled`, `[15:8]=denied_io` (low 8 bits of the offending group bitmap), rest reserved-0. Cleared on the next `EFP_CMD` write. |
 | `0x3F` | `SPI_CRC` | W | 16 | **EFP-SPI transport-CRC16 latch** (§7.1, v0.3): `DATA[15:0]` = expected CRC16 of the session's OCC_PUSH stream. Intercepted by the SPI front-end; not a regfile storage word. RD returns front-end debug `{state[17:16], crc_acc[15:0]}`. |
 | `0x30` | `MON_TEMP` | R | 16 | Temperature (°C, signed). v0: hardwired `0x0019` (25°C) in sim. |
 | `0x31` | `MON_VCCINT` | R | 16 | Core voltage (mV). v0: hardwired `0x0338` (824mV ≈ GW5 nominal... **ASSUMPTION** TBD). |
+| `0x32` | `MON_RECFG_COUNT` | R | 32 | **Per-region reconfiguration counter** (v0.6, §3.8): `{region1[31:16], region0[15:0]}`, incremented on each completed deploy (BLANK→RUNNING), saturating. |
+| `0x33` | `MON_WDT_COUNT` | R | 32 | **Per-region watchdog-event counter** (v0.6, §3.8): same layout; counts §3.5 watchdog timeouts + heartbeat mismatches per region, saturating. |
+| `0x34` | `MON_ANOM_STATUS` | R/W1C | 32 | **Anomaly flags + throttle mask** (v0.6, §3.8): `[7:0]` throttle mask (bit `r` = deploys targeting region `r` are refused with `EFP_ERR=12`), `[11:8]` flags (8+r0/9+r1 = reconfig-rate spike, 10+r0/11+r1 = watchdog-rate spike). Write-1-clears the written bits; `W1C` release is host-initiated. |
+| `0x35` | `MON_ANOM_WINDOW` | RW | 16 | **Anomaly observation window** (v0.6, §3.8) in monitor ticks; `0` disables the monitor. Reset default `0x1000`. // ASSUMPTION: value TBD at bring-up (TBD, 2026-09-11). |
+| `0x36` | `MON_ANOM_THRESH` | RW | 32 | **Per-window spike thresholds** (v0.6, §3.8): `{wdt[31:16], recfg[15:0]}`. A counter delta exceeding its threshold inside one window sets the matching flag + throttle bit. Reset default `0x0008_0010`. // ASSUMPTION: values TBD at bring-up (TBD, 2026-09-11). |
+| `0x37` | `MON_NOTIFY` | W | 16 | **Event notify (v0.6, §3.8)**: write-1 pulses — bit `r` (0..7) = "a deploy completed in region `r`" (reconfig counter `+1`), bit `8+r` = "a §3.5 watchdog/heartbeat event was observed on region `r`" (watchdog counter `+1`). The daemon writes it; hardware does the counting/windowing. Reads as 0. |
 | `0x38` | `EVT_LOG_CTRL` | R/W1C | 32 | **Event-log ring control** (v0.4, §3.4): R = `{count[15:0], wr_ptr[31:16]}`; a write with `bit16=1` CLEARS the ring (count/wr_ptr/read-ptr = 0, entries dropped); all other writes are no-ops. |
 | `0x39` | `EVT_LOG_DATA` | push-W / pop-R | 32 | **Event-log ring data** (v0.4, §3.4): a WRITE pushes one entry (the written word, `{code[7:0], region[15:8], stamp[31:16]}`); a READ pops the OLDEST un-read entry (advancing the read pointer; empty reads 0, no advance). Depth 16, overwrite-oldest when full. |
 
-**Reserved ranges** after v0.5 allocations: `0x07`, `0x22-0x2F`,
-`0x32-0x37`, `0x3A-0x3E`, `0x60+` — read-as-0, write-ignored. Allocation map:
+**Reserved ranges** after v0.6 allocations: `0x07`, `0x25-0x2F`,
+`0x3A-0x3E`, `0x60+` — read-as-0, write-ignored. Allocation map:
 telemetry @ `0x40-0x4F` (planned), `IMG_SIG` @ `0x50-0x5F` (v0.2), scheduler @
 `0x60+` (planned).
 History: `0x06`=`REGION_SEL` (v0.1, §6), `0x0D`=`OCC_DECODE` (v0.1, §3.1),
 `0x13-0x1F`/`0x50-0x5F`=EFP block (v0.2, §3.2),
 `0x21`=`EFP_IMG_COLS` (v0.3, §3.3), `0x3F`=`SPI_CRC` (v0.3, §7.1),
 `0x0E`=`OCC_EXPECT_CRC` / `0x0F`=`OCC_CRC_RESULT` (v0.5, §3.1.1),
-`0x38-0x39`=event-log ring (v0.4, §3.4).
+`0x38-0x39`=event-log ring (v0.4, §3.4),
+`0x22-0x24`=capability gate / `0x32-0x36`=anomaly monitor (v0.6, §3.7/§3.8).
 
 ---
 
@@ -329,6 +339,8 @@ the EFP block: roles are software).
 | `1` | `watchdog_timeout` — the §3.5 OCC op watchdog fired on this region | affected region id | daemon tick |
 | `2` | `hb_readback_mismatch` — the §3.5 heartbeat READBACK CRC mismatched | affected region id | daemon tick |
 | `3` | `slot_change` — §3.6 dual-partition demo: slot selected at boot or marked active by an update | slot id (0=A, 1=B) | slot version |
+| `4` | `policy_denied` — §3.7 capability gate refused the staged declaration (`EFP_ERR=11`) | target region id | daemon tick |
+| `5` | `anomaly_throttle` — §3.8 anomaly monitor set a throttle bit for this region | throttled region id | daemon tick |
 
 **Stamp semantics (v0):** producer-supplied 16-bit; the daemon uses a
 free-running firmware loop tick (wraps at 65536). v0 has no RTC — stamps
@@ -430,6 +442,71 @@ ring):
 the corrupted-active-slot fallback).
 
 ---
+
+## 3.7 Capability-declaration gate (offsets `0x22`-`0x24`, v0.6, E2-SEC1)
+
+Enforces the `capabilities.yaml` declaration (`ethereal-spec/security/capabilities-v0.md`)
+at deploy time. **Division of labour:** the host parses the YAML and stages a
+compact bitmap; the daemon checks it — firmware parses no YAML.
+
+| Step | Actor | Action |
+| --- | --- | --- |
+| 1 | host | `CAP_DECL_IO` ← declared pin-group bitmap (`io[].group` → bit `g`), `CAP_DECL_SVC` ← declared service bitmap (`services[].name` → device-class index `k`) |
+| 2 | daemon | post-ALLOC / pre-BLANK: `declared_io ⊆ DAEMON_IO_GROUPS` and `declared_svc ⊆ DAEMON_SERVICES` |
+| 3a | daemon (pass) | `CAP_STATUS[0]=checked`, deploy continues to BLANK |
+| 3b | daemon (fail) | `EFP_ERR=11 capability_denied`, `CAP_STATUS[1]=denied` + `[15:8]=denied_io`, event `code=4`, `EFP_STATUS=ERROR`; **no ALLOC kept, no BLANK, no fabric mutation** |
+
+Rules:
+
+0. **`CAP_STATUS[0]` (`checked`) semantics.** It latches on the first
+   `CAP_DECL_*` write and is cleared by the next `EFP_CMD` write — i.e. it is a
+   *pre-doorbell staging indicator* for the host (did my staging land?), not a
+   device-side verdict: a device-side reader sampling it after the doorbell
+   always sees 0. **Enforcement therefore uses the live `denied`/`throttled`
+   bits only** (both daemon implementations read `[1]`, never `[0]`).
+1. **Empty declaration is always allowed** (no bits set) — pure-logic images.
+2. **No silent narrowing**: a declaration that exceeds the grantable set is
+   refused outright; the host may re-pack and redeploy.
+3. Both words are cleared/ignored unless the corresponding `EFP_CMD` run
+   command was preceded by a host write in the same session; a stale bitmap
+   from a previous session is the host's responsibility to overwrite (the
+   regfile clears `CAP_STATUS` on every `EFP_CMD` write).
+4. Checkpoint (S10 §3 Phase-2 #2): *越权 IO 请求拒绝* — covered by case 3b.
+
+**v0 sim scope:** the fabric has no physical IO and no board manifest, so
+`DAEMON_IO_GROUPS` / `DAEMON_SERVICES` are daemon-side compile-time masks.
+// ASSUMPTION: sim allowed-mask stands in for the Board Manifest pin table +
+EBI proxy inventory until E1-IO3 / E2-IO1 land (TBD, 2026-09-11).
+
+## 3.8 Anomaly monitoring v1 (offsets `0x32`-`0x36`, v0.6, E2-SEC1)
+
+Implements S10 §3 Phase-2 #3 (*重构次数突增/看门狗频发 → 标记并限流*) with
+**real-time counters + per-window thresholds** in hardware/EMRI (maintainer
+decision 2026-09-11: option A, not host-side post-hoc analysis).
+
+| Element | Behaviour |
+| --- | --- |
+| `MON_NOTIFY` (`0x37`) | the daemon (or the host in mFSM mode) writes bit `r` on a completed deploy, bit `8+r` on a watchdog/heartbeat event; hardware latches the pulse and does all counting |
+| `MON_RECFG_COUNT` | `+1` for region `r` on each notify bit `r`, saturating at `0xFFFF` per region |
+| `MON_WDT_COUNT` | `+1` for region `r` on each notify bit `8+r`, saturating at `0xFFFF` per region |
+| window | `MON_ANOM_WINDOW` monitor ticks (`0` disables), **1 tick = 4096 clock cycles** (fixed divider in RTL): the default `0x1000` ticks ≈ 160 ms @ 100 MHz. On window expiry: `delta = counter − snapshot`; if `delta_recfg > thr_recfg` set flag `8+r`; if `delta_wdt > thr_wdt` set flag `10+r`; a set flag also sets throttle bit `r`; snapshot ← counter |
+| throttle | while bit `r` is set, the daemon refuses `EFP_CMD=run`/`run_packed` targeting region `r`: `EFP_ERR=12 rate_limited`, `CAP_STATUS[2]=throttled`, `EFP_STATUS=ERROR`, no ALLOC |
+| release | host writes `MON_ANOM_STATUS` with 1s in the bits to clear (W1C); clearing a throttle bit re-enables deploys to that region |
+| event | on the first flag set for a region in a window: push event `code=5 anomaly_throttle` |
+
+**Region scoping (v0):** the monitor covers `NUM_REGIONS` regions (v0: 2). Notify
+bits and throttle bits for region indices ≥ `NUM_REGIONS` are ignored (never act,
+always read 0). A wider monitor needs an explicit flag-field allocation in a
+later revision.
+
+Not covered in v1 (explicit): power/temperature-driven isolation (S10 §2 L2
+puts that P2-P3; `MON_TEMP`/`MON_VCCINT` are still hardwired constants),
+side-channel/fault-injection defence (L4, commercial), and automatic
+un-throttling (host-initiated only).
+
+// ASSUMPTION: window length and thresholds ship with reset defaults
+`0x1000` ticks / `0x10` reconfig / `0x8` watchdog; final values TBD at
+bring-up (TBD, 2026-09-11).
 
 ## 4. OCC_STATUS register (offset `0x0A`)
 
@@ -642,6 +719,9 @@ fields both expose.
 3. **Region count discovery** — v0 hardcodes `NUM_REGIONS=2` in RTL; the host
    reads it. No runtime re-partition (ADR-004: regions are build-time).
 4. **Ed25519 public-key provisioning** — where does the verify key live? v0:
-   host-side only (mFSM doesn't verify). BMC mode: TBD key store (Boot ROM vs
-   fuse vs image-bundled) — Phase-1 E1-BMC2 decision.
+   host-side only (mFSM doesn't verify). BMC mode: a single compiled-in key
+   (`bmc-fw/daemon/keyring.h`, generated by `gen_daemon_vectors.py`) — **E2-SEC1
+   keeps this as the trust anchor and makes the host path enforce verification
+   by default**; real key management (key ring/rotation/anti-rollback, multiple
+   keys, keyless signing à la sigstore) remains OPEN — Phase 4 evaluation.
 5. **I²C monitor transport** — separate from EFP-SPI; not in v0 EMRI (E1-IO2).

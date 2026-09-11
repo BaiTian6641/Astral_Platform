@@ -5,10 +5,10 @@
 // Details:     Single source of truth for the EMRI register map (v0), the EFP-SPI
 //              operation opcodes, and the OCC status encoding mirror. Must stay in
 //              sync with ethereal-spec/control/emri-v0.md (spec-first rule).
-// Maintainer:  BaiTian6641
-// Created:     2026-07-29
+// Modified:    2026-09-11 - v0.6: capability-gate (§3.7) + anomaly-monitor (§3.8)
+//              offsets, sim allowed masks, monitor tick divider, event codes 4/5.
 // Tags:        RTL, SYNTH
-// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4/§7
+// Plan-Ref:    ethereal-spec/control/emri-v0.md §2/§3/§4/§7 (§3.7/§3.8 v0.6)
 // Notes:       v0 scope: minimum for the sim-complete minimal loop (mFSM → OCC).
 package emri_pkg;
 
@@ -48,6 +48,35 @@ package emri_pkg;
   localparam logic [15:0] R_HEALTH_STATUS  = 16'h20;
   localparam logic [15:0] R_MON_TEMP       = 16'h30;
   localparam logic [15:0] R_MON_VCCINT     = 16'h31;
+  // v0.6 §3.7 capability-declaration gate. The host stages a compact bitmap
+  // from capabilities.yaml before the EFP_CMD doorbell; the regfile exposes it
+  // + the hardware verdict (CAP_STATUS). ALLOWED_* are the v0 sim platform
+  // inventory ("declared ⊆ grantable"): pin groups 0..7 / EBI proxy indices
+  // 0..7 — mirrored by the daemon/BMC (ethereal-runtime/security/capcheck.py
+  // SIM_ALLOWED_*_MASK) and replaced by the Board Manifest pin table in
+  // E1-IO3/E2-IO1.
+  // ASSUMPTION: sim allowed-mask stands in for the Board Manifest + proxy
+  // inventory (TBD, 2026-09-11; spec §3.7 v0 sim scope).
+  localparam logic [15:0] R_CAP_DECL_IO    = 16'h22;
+  localparam logic [15:0] R_CAP_DECL_SVC   = 16'h23;
+  localparam logic [15:0] R_CAP_STATUS     = 16'h24;
+  localparam logic [31:0] ALLOWED_IO_GROUPS = 32'h0000_00FF;  // groups 0..7
+  localparam logic [31:0] ALLOWED_SERVICES  = 32'h0000_00FF;  // proxies 0..7
+
+  // v0.6 §3.8 anomaly monitoring v1: real-time per-region counters + per-window
+  // spike thresholds in the regfile (1 monitor tick = EMRI_MON_TICK_DIV
+  // clocks). MON_ANOM_WINDOW/MON_ANOM_THRESH reset to the spec defaults
+  // (0x1000 / 0x0008_0010) — see emri_regfile.
+  localparam logic [15:0] R_MON_RECFG_COUNT = 16'h32;
+  localparam logic [15:0] R_MON_WDT_COUNT   = 16'h33;
+  localparam logic [15:0] R_MON_ANOM_STATUS = 16'h34;
+  localparam logic [15:0] R_MON_ANOM_WINDOW = 16'h35;
+  localparam logic [15:0] R_MON_ANOM_THRESH = 16'h36;
+  localparam logic [15:0] R_MON_NOTIFY      = 16'h37;
+  localparam int          EMRI_MON_TICK_DIV = 4096;  // clocks per monitor tick
+  // ASSUMPTION: window length/thresholds TBD at bring-up (TBD, 2026-09-11).
+  localparam logic [15:0] EMRI_MON_ANOM_WINDOW_DEF = 16'h1000;
+  localparam logic [31:0] EMRI_MON_ANOM_THRESH_DEF = 32'h0008_0010;  // {wdt,recfg}
   // Event-log ring (v0.4, spec §3.4): 16-entry ring in the regfile; daemon
   // writes entries via R_EVT_LOG_DATA (push), host reads them back (pop-
   // oldest) and clears via R_EVT_LOG_CTRL write-1-to-bit16.
@@ -168,6 +197,8 @@ package emri_pkg;
   localparam logic [7:0] EFP_ERR_CRC_TRANSPORT    = 8'd8;  // §7.1 SPI CRC16 gate
   localparam logic [7:0] EFP_ERR_WATCHDOG_TIMEOUT = 8'd9;   // v0.4 §3.5 OCC op watchdog
   localparam logic [7:0] EFP_ERR_FWUPDATE         = 8'd10;  // v0.4 §3.6 sim-demo CRC mismatch
+  localparam logic [7:0] EFP_ERR_CAPABILITY_DENIED = 8'd11;  // v0.6 §3.7 declared ⊄ grantable
+  localparam logic [7:0] EFP_ERR_RATE_LIMITED      = 8'd12;  // v0.6 §3.8 region throttled
 
   // ------------------------------------------------------------------
   // Event-log ring entry codes (v0.4, spec §3.4; entry {code[7:0],
@@ -177,6 +208,8 @@ package emri_pkg;
   localparam logic [7:0] EVT_CODE_WATCHDOG_TIMEOUT = 8'd1;
   localparam logic [7:0] EVT_CODE_HB_MISMATCH      = 8'd2;
   localparam logic [7:0] EVT_CODE_SLOT_CHANGE      = 8'd3;
+  localparam logic [7:0] EVT_CODE_POLICY_DENIED    = 8'd4;  // v0.6 §3.7 (daemon-pushed)
+  localparam logic [7:0] EVT_CODE_ANOMALY_THROTTLE = 8'd5;  // v0.6 §3.8 (hw + daemon)
   /* verilator lint_on UNUSEDPARAM */
 
 endpackage : emri_pkg

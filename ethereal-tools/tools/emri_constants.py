@@ -36,6 +36,14 @@ R_RX_BUF_CTRL = 0x12
 R_HEALTH_STATUS = 0x20
 R_MON_TEMP = 0x30
 R_MON_VCCINT = 0x31
+# Anomaly monitoring (spec sec 3.8, v0.6): per-region reconfig/watchdog counters,
+# spike flags + throttle mask, window/threshold config, event notify.
+R_MON_RECFG_COUNT = 0x32  # {region1[31:16], region0[15:0]}, saturating
+R_MON_WDT_COUNT = 0x33  # same layout; watchdog/heartbeat events
+R_MON_ANOM_STATUS = 0x34  # [7:0] throttle mask, [11:8] spike flags; R/W1C
+R_MON_ANOM_WINDOW = 0x35  # observation window in monitor ticks; 0 disables
+R_MON_ANOM_THRESH = 0x36  # {wdt[31:16], recfg[15:0]} per-window thresholds
+R_MON_NOTIFY = 0x37  # write-1 pulses: bit r=deploy done, bit 8+r=wdt event
 
 # ---- EFP command block (spec sec 3.2, v0.2) ----
 # Host<->BMC-daemon mailbox. All plain RW storage in the regfile (no port-role
@@ -47,6 +55,10 @@ R_EFP_IMG_WORDS = 0x15
 R_EFP_STATUS = 0x16  # {state[3:0], busy[4], done[5]}
 R_EFP_ERR = 0x17  # sticky last-error, cleared on next EFP_CMD
 R_EFP_IMG_COLS = 0x21  # v0.3 (spec sec 3.3): fabric columns a run_packed image spans
+# Capability-declaration gate (spec sec 3.7, v0.6)
+R_CAP_DECL_IO = 0x22  # declared pin-group bitmap: bit g = L1 pin group g
+R_CAP_DECL_SVC = 0x23  # declared service bitmap: bit k = proxy index k
+R_CAP_STATUS = 0x24  # [0]checked [1]denied [2]throttled [15:8]denied_io bitmap
 R_IMG_DIGEST = 0x18  # base; +0..7 (32-byte manifest digest)
 R_IMG_SIG = 0x50  # base; +0..15 (64-byte Ed25519 signature)
 IMG_DIGEST_WORDS = 8
@@ -85,6 +97,8 @@ EFP_ERR_IMG_LEN_MISMATCH = 7
 EFP_ERR_CRC_TRANSPORT = 8  # v0.3 (spec sec 7.1): EFP-SPI OCC_PUSH CRC16 mismatch
 EFP_ERR_WATCHDOG_TIMEOUT = 9  # v0.4 (spec sec 3.5): OCC op watchdog fired
 EFP_ERR_FWUPDATE = 10  # v0.4 (spec sec 3.6): sim-demo fw-update CRC mismatch
+EFP_ERR_CAPABILITY_DENIED = 11  # v0.6 (spec sec 3.7): declared caps exceed grantable
+EFP_ERR_RATE_LIMITED = 12  # v0.6 (spec sec 3.8): region throttled by anomaly monitor
 
 # ---- Event-log ring (spec sec 3.4, v0.4) ----
 # 16-entry ring in the regfile: write 0x39 pushes, read 0x39 pops-oldest,
@@ -96,6 +110,8 @@ EVT_LOG_CLEAR = 0x0001_0000  # write-1-to-bit16-clears
 EVT_CODE_WATCHDOG_TIMEOUT = 1
 EVT_CODE_HB_MISMATCH = 2
 EVT_CODE_SLOT_CHANGE = 3
+EVT_CODE_POLICY_DENIED = 4  # v0.6 (spec sec 3.7): capability refusal
+EVT_CODE_RATE_LIMITED = 5  # v0.6 (spec sec 3.8): anomaly throttle refusal
 
 # ---- CAPABILITIES bits ----
 CAPB_HAS_BMC = 0
@@ -103,6 +119,19 @@ CAPB_HAS_DMA = 1
 CAPB_HAS_I2C_MON = 2
 CAPB_HAS_TRNG = 3
 CAPB_HAS_JTAG_DBG = 4
+# ---- Capability-declaration gate bit layout (spec sec 3.7, v0.6) ----
+CAP_DECL_BITS = 32  # CAP_DECL_IO/CAP_DECL_SVC are 32-bit bitmaps
+CAP_STATUS_CHECKED = 0  # bit index of CAP_STATUS[0]
+CAP_STATUS_DENIED = 1
+CAP_STATUS_THROTTLED = 2
+CAP_STATUS_DENIED_IO_LO = 8  # denied_io occupies bits [15:8]
+
+# ---- Anomaly monitor encodings (spec sec 3.8, v0.6) ----
+MON_ANOM_THROTTLE_MASK = 0x0000_00FF  # [7:0]: bit r throttles deploys to region r
+MON_ANOM_FLAG_LO = 8  # flags [11:8]: 8+r0/9+r1 recfg spike, 10+r0/11+r1 wdt spike
+MON_ANOM_WINDOW_DEFAULT = 0x1000  # reset default, // ASSUMPTION: TBD at bring-up
+MON_ANOM_THRESH_DEFAULT = 0x0008_0010  # {wdt=8, recfg=16}, // ASSUMPTION: TBD
+MON_NOTIFY_WDT_LO = 8  # MON_NOTIFY bit 8+r = watchdog event on region r
 
 # ---- OCC_CMD bitfield (spec sec 3) ----
 # OCC_CMD_START is the BIT INDEX of the start trigger (matches emri_pkg.sv,

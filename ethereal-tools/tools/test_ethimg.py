@@ -16,6 +16,7 @@ _TOOLS_DIR = str(Path(__file__).resolve().parent)
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+import ethimg
 from ethimg import (
     EthimgError,
     IntegrityError,
@@ -218,6 +219,42 @@ def test_cli_pack_verify(src_dir: Path, tmp_path: Path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# capabilities.yaml schema gate (capabilities-v0.md sec 1, E2-SEC1)
+# --------------------------------------------------------------------------- #
+def test_pack_rejects_malformed_capabilities(src_dir: Path, tmp_path: Path):
+    (src_dir / "capabilities.yaml").write_text(
+        "io:\n  - {group: 0, dir: sideways}\nservices: []\n"
+    )
+    with pytest.raises(EthimgError, match="io\\[0\\].dir"):
+        pack(src_dir, tmp_path / "x.eth", name="t")
+
+
+def test_verify_rejects_malformed_capabilities(src_dir: Path, tmp_path: Path):
+    out = tmp_path / "x.eth"
+    pack(src_dir, out, name="t")
+    _set_capabilities(
+        out,
+        "io:\n  - {group: 1, dir: in}\n  - {group: 1, dir: out}\nservices: []\n",
+    )
+    with pytest.raises(EthimgError, match="duplicate group 1"):
+        verify(out, allow_unsigned=True)
+
+
+def test_verify_accepts_empty_and_nonempty_capabilities(
+    src_dir: Path, tmp_path: Path
+):
+    out = tmp_path / "x.eth"
+    pack(src_dir, out, name="t")  # auto-fills the empty declaration
+    assert verify(out, allow_unsigned=True).name == "t"
+    _set_capabilities(
+        out,
+        "io:\n  - {group: 2, dir: inout}\n"
+        "services:\n  - {name: spi0, access: rw}\n",
+    )
+    assert verify(out, allow_unsigned=True).name == "t"
+
+
+# --------------------------------------------------------------------------- #
 # tar-tampering helpers
 # --------------------------------------------------------------------------- #
 def _read_tar(path: Path) -> dict:
@@ -232,6 +269,22 @@ def _write_tar(path: Path, members: dict) -> None:
             info.size = len(data)
             info.mtime = 0
             tf.addfile(info, io.BytesIO(data))
+
+
+def _set_capabilities(eth_path: Path, caps_yaml: str) -> None:
+    """Swap the capabilities.yaml member and re-sync its digest + manifest_digest
+    so the ONLY difference from a packed image is the declaration body."""
+    import hashlib
+
+    m = _read_tar(eth_path)
+    m["capabilities.yaml"] = caps_yaml.encode("utf-8")
+    man = yaml.safe_load(m["manifest.yaml"]) or {}
+    man.setdefault("members", {})["capabilities.yaml"] = hashlib.sha256(
+        m["capabilities.yaml"]
+    ).hexdigest()
+    man["manifest_digest"] = ethimg._manifest_digest(man)
+    m["manifest.yaml"] = yaml.safe_dump(man, sort_keys=True).encode("utf-8")
+    _write_tar(eth_path, m)
 
 
 def _tamper_member(path: Path, member: str, byte_index: int, xor: int) -> None:

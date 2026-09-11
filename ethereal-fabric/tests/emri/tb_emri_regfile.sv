@@ -1,10 +1,13 @@
 `default_nettype none
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      tb_emri_regfile (testbench, self-checking)
-// Description: Exercises the EMRI register file (v0): identity reads, RW config,
+// Description: Exercises the EMRI register file: identity reads, RW config,
 //              REGION_INFO windowing, OCC command passthrough (cmd_valid +
 //              accept), OCC wdata streaming with backpressure, OCC_STATUS mirror,
-//              reserved-read-as-0.
+//              reserved-read-as-0, the EFP staging block, the event-log ring, and
+//              the v0.6 register file's reset defaults / RW behaviour (§3.7
+//              capability staging, §3.8 monitor counters+window+thresholds).
+//              The full v0.6 semantics are covered by tb_mon_anomaly.sv.
 // Details:     Uses a minimal OCC stub (NOT the real occ_top) so the test stays
 //              focused on EMRI's register/passthrough behavior. The stub:
 //                * accepts a command 1 cycle after cmd_valid (cmd_ready pulse);
@@ -318,14 +321,39 @@ module tb_emri_regfile;
       chk(rd == 32'h5160_0000 + 32'(i), "IMG_SIG word RW");
     end
 
-    // ---- 10. Reserved map SHRANK (v0.2): 0x18-0x1F / 0x50-0x5F are now
-    //      storage; the rest of the old reserved ranges still read-as-0.
-    host_read(16'h22, rd); chk(rd == 32'h0, "reserved 0x22 read-as-0");
-    host_read(16'h37, rd); chk(rd == 32'h0, "reserved 0x37 read-as-0");
+    // ---- 10. Reserved map SHRANK again in v0.6 (§3.7/§3.8): 0x22-0x24
+    //      (capability gate) and 0x32-0x37 (anomaly monitor) are storage now;
+    //      their full semantics live in tb_mon_anomaly.sv. The remaining
+    //      reserved ranges still read-as-0 / write-ignored (spec §2).
+    host_read(16'h22, rd); chk(rd == 32'h0, "0x22 = CAP_DECL_IO empty at reset");
+    host_read(16'h37, rd); chk(rd == 32'h0, "0x37 = MON_NOTIFY reads 0 (write-only)");
+    host_read(16'h25, rd); chk(rd == 32'h0, "reserved 0x25 read-as-0");
+    host_read(16'h2F, rd); chk(rd == 32'h0, "reserved 0x2F read-as-0");
     host_read(16'h3A, rd); chk(rd == 32'h0, "reserved 0x3A read-as-0 (0x38/0x39 now event ring)");
+    host_read(16'h3E, rd); chk(rd == 32'h0, "reserved 0x3E read-as-0");
     host_read(16'h60, rd); chk(rd == 32'h0, "reserved 0x60 read-as-0");
     host_read(16'h1F, rd); chk(rd == 32'hD160_0007, "0x1F = IMG_DIGEST[7] (not reserved)");
     host_read(16'h5F, rd); chk(rd == 32'h5160_000F, "0x5F = IMG_SIG[15] (not reserved)");
+
+    // ---- 10b. v0.6 registers: staging storage + spec reset defaults ----
+    host_write(R_CAP_DECL_IO, 32'h0000_0003);   // groups 0,1 (allowed)
+    host_read(R_CAP_DECL_IO, rd);  chk(rd == 32'h3, "CAP_DECL_IO RW");
+    host_write(R_CAP_DECL_SVC, 32'h0000_0001);  // proxy 0 (allowed)
+    host_read(R_CAP_DECL_SVC, rd); chk(rd == 32'h1, "CAP_DECL_SVC RW");
+    host_read(R_CAP_STATUS, rd);
+    chk(rd[0] == 1'b1 && rd[1] == 1'b0 && rd[15:8] == 8'h0,
+        "CAP_STATUS: checked set, denied clear");
+    host_read(R_MON_ANOM_WINDOW, rd); chk(rd == 32'h0000_1000, "MON_ANOM_WINDOW default 0x1000");
+    host_read(R_MON_ANOM_THRESH, rd); chk(rd == 32'h0008_0010, "MON_ANOM_THRESH default");
+    host_read(R_MON_ANOM_STATUS, rd); chk(rd == 32'h0, "MON_ANOM_STATUS reset 0");
+    host_read(R_MON_RECFG_COUNT, rd); chk(rd == 32'h0, "MON_RECFG_COUNT reset 0");
+    host_read(R_MON_WDT_COUNT, rd);   chk(rd == 32'h0, "MON_WDT_COUNT reset 0");
+    host_write(R_MON_ANOM_WINDOW, 32'h0000_0007);
+    host_read(R_MON_ANOM_WINDOW, rd); chk(rd == 32'h7, "MON_ANOM_WINDOW RW");
+    host_write(R_MON_ANOM_THRESH, 32'h0001_0002);
+    host_read(R_MON_ANOM_THRESH, rd); chk(rd == 32'h0001_0002, "MON_ANOM_THRESH RW");
+    host_write(R_MON_ANOM_STATUS, 32'h0000_0000);  // W1C no-op on a zero word
+    host_read(R_MON_ANOM_STATUS, rd); chk(rd == 32'h0, "MON_ANOM_STATUS W1C no-op");
 
     // ---- 11. Event-log ring (v0.4, spec sec 3.4): push/pop/clear ----
     // reset state: empty

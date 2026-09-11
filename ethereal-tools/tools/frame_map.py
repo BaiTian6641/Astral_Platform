@@ -214,7 +214,9 @@ class FrameMap:
         return self.data_words_per_frame + 1  # + CRC tail word
 
     def frame_addr(self, region: int, col: int) -> int:
-        return ((region & 0xF) << 8) | (col & 0xFF)
+        # emri-v0.md §2 (OCC_FRAME_ADDR, v0.6): {region[15:12], col[11:8], word[7:0]}
+        # — the column owns a 256-word window, so adjacent columns never alias.
+        return ((region & 0xF) << 12) | ((col & 0xF) << 8)
 
     def _tile_points(self) -> list[ConfigPoint]:
         return list(self.clb.points) + list(self.sb.points) + list(self.cblock.points)
@@ -343,7 +345,7 @@ class FrameMap:
             "data_words_per_frame": self.data_words_per_frame,
             "words_per_frame": self.words_per_frame,
             "tile_points": [{"name": p.name, "width": p.width} for p in pts],
-            "frame_addr_format": {"region": "[11:8]", "col": "[7:0]"},
+            "frame_addr_format": {"region": "[15:12]", "col": "[11:8]", "word": "[7:0]"},
             "crc": {"algorithm": "CRC-16/CCITT-FALSE", "tail_word": True, "field": "[15:0]"},
         }
         if self.TILE_LAYOUT is not None:

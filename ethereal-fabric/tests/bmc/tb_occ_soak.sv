@@ -49,9 +49,9 @@ module tb_occ_soak;
   localparam int SWAPS = 20000;                 // 2 regions x 10000 swaps
 `endif
 
-  // region r's per-column frame base (daemon convention: region<<12 | col<<4)
+  // region r's per-column frame base (daemon convention: OCC_FRAME_ADDR v0.6 {region[15:12],col[11:8],word[7:0]} — region<<12 | col<<8, col == r)
   function automatic logic [15:0] reg_base(input int r);
-      reg_base = 16'((r << 12) | (r << 4));
+      reg_base = 16'((r << 12) | (r << 8));
   endfunction
 
   // ---- clock / reset ----

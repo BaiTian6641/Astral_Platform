@@ -46,6 +46,14 @@ from typing import Any
 
 import yaml
 
+# capcheck (E2-SEC1) lives in the sibling ethereal-runtime/security/ package.
+_SECURITY_DIR = str(Path(__file__).resolve().parents[2] / "ethereal-runtime")
+if _SECURITY_DIR not in sys.path:
+    sys.path.insert(0, _SECURITY_DIR)
+
+# pi-lens-ignore: E402
+from security import capcheck
+
 SCHEMA = "ethereal.logic.v0.1"
 DIGEST_ALGO = "sha256"
 MANIFEST_NAME = "manifest.yaml"
@@ -275,6 +283,10 @@ def pack(
         else:
             members[m] = defaults[m].encode("utf-8")
 
+    # stage-1 schema check (capabilities-v0.md sec 1): a malformed declaration
+    # never packs. `--allow-unsigned` does not relax capability checks.
+    _check_capabilities(members, str(src_dir))
+
     # build manifest
     name = name or src_dir.name
     man = Manifest(
@@ -347,6 +359,24 @@ def _default_optional_yaml(name: str, target: str) -> dict[str, str]:
     }
 
 
+def _check_capabilities(members: dict[str, bytes], where: str) -> None:
+    """Stage-1 schema check of the ``capabilities.yaml`` member.
+
+    An absent member is the empty capability set (capabilities-v0.md sec 1
+    rule 3). A malformed declaration raises :class:`EthimgError` whose message
+    names the offending entry (via ``capcheck``).
+    """
+    blob = members.get("capabilities.yaml")
+    if blob is None:
+        return
+    try:
+        capcheck.load_capabilities(blob.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise EthimgError(f"{where}: capabilities.yaml is not UTF-8: {e}") from e
+    except capcheck.CapabilitySchemaError as e:
+        raise EthimgError(f"{where}: {e}") from e
+
+
 def read_manifest(eth_path: Path) -> Manifest:
     """Read & parse the manifest from a ``.eth`` tar (no verification)."""
     with tarfile.open(Path(eth_path), "r") as tf:
@@ -414,6 +444,10 @@ def verify(
         raise IntegrityError(
             f"manifest_digest mismatch: expected {man.manifest_digest}, got {md}"
         )
+
+    # 3b. capability-declaration schema (capabilities-v0.md sec 1). Runs before
+    # the signature step so a malformed member fails even with allow_unsigned.
+    _check_capabilities(members, str(eth_path))
 
     # 4. signature
     if man.signature is None:

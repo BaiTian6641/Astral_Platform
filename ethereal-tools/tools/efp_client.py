@@ -27,7 +27,13 @@ Spec rules mirrored here (sec 3.2):
     moment LOAD is observed) and then streams every frame word;
   * byte order: word ``i`` of ``IMG_DIGEST``/``IMG_SIG`` holds bytes
     ``[4i+3:4i]`` (little-endian in-word) — see :func:`words_from_bytes`;
-  * ``EFP_ERR`` decoding with all 8 v0.2 codes (:func:`decode_err`).
+  * ``EFP_ERR`` decoding (:func:`decode_err`);
+  * E2-SEC1: HOST-SIDE Ed25519 enforcement (fail-closed) plus the
+    ``capabilities.yaml`` schema + grantability pre-flight in
+    :func:`load_image`, and ``CAP_DECL_IO``/``CAP_DECL_SVC`` staging before the
+    doorbell (emri-v0.md sec 3.7, capabilities-v0.md sec 2);
+  * OCC_FRAME_ADDR v0.6 per-column addressing (emri-v0.md sec 2):
+    :func:`region_frame_base`/:func:`column_frame_base`.
 
 Plan-Ref: ethereal-spec/control/emri-v0.md sec 3.2;
           ethereal-plan/subsystems/S08-运行时daemon与ethctl.md (E1-RUN3).
@@ -51,7 +57,6 @@ if _THIS_DIR not in sys.path:
 import ethimg
 from emri_constants import (
     EFP_CMD_ABORT,
-    EFP_ERR_CRC_TRANSPORT,
     EFP_CMD_NOP,
     EFP_CMD_RESTART,
     EFP_CMD_RUN,
@@ -59,12 +64,17 @@ from emri_constants import (
     EFP_CMD_STOP,
     EFP_ERR_BAD_CMD,
     EFP_ERR_BAD_SIG,
+    EFP_ERR_CAPABILITY_DENIED,
+    EFP_ERR_CRC_TRANSPORT,
+    EFP_ERR_FWUPDATE,
     EFP_ERR_IMG_LEN_MISMATCH,
     EFP_ERR_NONE,
     EFP_ERR_OCC_CRC,
     EFP_ERR_OCC_REJECT,
+    EFP_ERR_RATE_LIMITED,
     EFP_ERR_REGION_FULL,
     EFP_ERR_REGION_LOCKED,
+    EFP_ERR_WATCHDOG_TIMEOUT,
     EFP_REGION_AUTO,
     EFP_S_ALLOC,
     EFP_S_BLANK,
@@ -77,6 +87,8 @@ from emri_constants import (
     EFP_S_VERIFY,
     IMG_DIGEST_WORDS,
     IMG_SIG_WORDS,
+    R_CAP_DECL_IO,
+    R_CAP_DECL_SVC,
     R_EFP_CMD,
     R_EFP_ERR,
     R_EFP_IMG_COLS,
@@ -86,8 +98,10 @@ from emri_constants import (
     R_IMG_DIGEST,
     R_IMG_SIG,
     R_NUM_REGIONS,
-    R_OCC_WDATA,
+    R_OCC_FRAME_ADDR,
     R_OCC_STATUS,
+    R_OCC_WDATA,
+    R_OCC_WORD_COUNT,
     R_REGION_INFO,
     R_REGION_SEL,
     R_SPI_CRC,
@@ -101,6 +115,14 @@ from emri_constants import (
     SPI_STAT_NOT_READY,
     SPI_STAT_OK,
 )
+
+# capcheck (E2-SEC1) lives in the sibling ethereal-runtime/security/ package.
+_SECURITY_DIR = str(Path(__file__).resolve().parents[2] / "ethereal-runtime")
+if _SECURITY_DIR not in sys.path:
+    sys.path.insert(0, _SECURITY_DIR)
+
+# pi-lens-ignore: E402
+from security import capcheck
 
 SESSION_SCHEMA = "ethereal.efp-session.v0"
 
@@ -135,6 +157,10 @@ EFP_ERR_NAMES = {
     EFP_ERR_BAD_CMD: "bad_cmd",
     EFP_ERR_IMG_LEN_MISMATCH: "img_len_mismatch",
     EFP_ERR_CRC_TRANSPORT: "crc_transport",
+    EFP_ERR_WATCHDOG_TIMEOUT: "watchdog_timeout",
+    EFP_ERR_FWUPDATE: "fwupdate",
+    EFP_ERR_CAPABILITY_DENIED: "capability_denied",
+    EFP_ERR_RATE_LIMITED: "rate_limited",
 }
 
 SPI_STATUS_NAMES = {
@@ -157,13 +183,71 @@ def decode_state(state: int) -> str:
 
 
 def decode_err(code: int) -> str:
-    """Decode a sticky ``EFP_ERR`` code (spec sec 3.2, all 9 v0.3 codes)."""
+    """Decode a sticky ``EFP_ERR`` code (spec sec 3.2 + v0.6 codes 9-12)."""
     return EFP_ERR_NAMES.get(code & 0xFF, f"unknown({code & 0xFF})")
 
 
 def decode_spi_status(code: int) -> str:
     """Decode an EFP-SPI response STATUS byte (spec sec 7 + sec 7.1)."""
     return SPI_STATUS_NAMES.get(code & 0xFF, f"unknown({code & 0xFF})")
+
+
+def verify_raw_ed25519(raw_pk: bytes, digest32: bytes, sig64: bytes) -> bool:
+    """Verify an Ed25519 signature over the hex-UTF-8 digest (ethimg convention).
+
+    ``raw_pk`` is the 32-byte raw public key (the sim daemon keyring form). The
+    signed message is the lowercase-hex UTF-8 of ``digest32``, identical to
+    ``ethimg._sign_digest`` and the C daemon's ``eth_ed25519_verify`` (spec
+    sec 3.2 step 3). Returns False for any verification failure.
+    """
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+
+        Ed25519PublicKey.from_public_bytes(raw_pk).verify(
+            sig64, digest32.hex().encode("utf-8")
+        )
+        return True
+    except Exception:  # noqa: BLE001 - verify raises many error types
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# OCC frame addressing (emri-v0.md sec 2, OCC_FRAME_ADDR 0x0B v0.6)
+# --------------------------------------------------------------------------- #
+OCC_FRAME_WINDOW_WORDS = 0x100  # word field [7:0]: 256-word (8 KB) per column
+
+
+def region_frame_base(region: int) -> int:
+    """OCC_FRAME_ADDR region base: ``{region_id[15:12]}`` (v0.6)."""
+    return (region & 0xF) << 12
+
+
+def column_frame_base(region: int, col: int) -> int:
+    """OCC_FRAME_ADDR for column ``col`` of ``region`` (v0.6).
+
+    Layout ``{region_id[15:12], col_id[11:8], word[7:0]}``: every column owns a
+    256-word (8 KB) window, so adjacent columns of a packed image never alias.
+    v0.5's 16-word stride (``col << 4``) overlapped 34-68-word v2c column
+    frames (E1-DMO2b). Mirrors ``column_frame_base`` in bmc-fw/daemon/daemon.c.
+    """
+    return region_frame_base(region) | ((col & 0xF) << 8)
+
+
+def column_frame_range(region: int, col: int, words: int) -> range:
+    """Word addresses ``[base, base+words)`` a column frame occupies (v0.6).
+
+    Refuses a frame longer than the 256-word per-column window: it would spill
+    into the next column's window and alias it in the OCC readback store.
+    """
+    if not 0 <= words <= OCC_FRAME_WINDOW_WORDS:
+        raise EfpError(
+            f"column frame of {words} words exceeds the "
+            f"{OCC_FRAME_WINDOW_WORDS}-word OCC window (spec sec 2, v0.6)"
+        )
+    base = column_frame_base(region, col)
+    return range(base, base + words)
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +378,7 @@ class Op:
 
 @dataclass
 class EfpSession:
-    """Ordered EFP op-list builder (mirrors emri-v0.md sec 3.2 exactly)."""
+    """Ordered EFP op-list builder (emri-v0.md sec 3.2 + the sec 3.7 gate)."""
 
     ops: list[Op] = field(default_factory=list)
 
@@ -328,6 +412,18 @@ class EfpSession:
 
     def poll_status(self, mask: int = EFP_STATUS_BUSY, value: int = 0, comment: str = "") -> None:
         self.poll(R_EFP_STATUS, mask, value, comment or "poll EFP_STATUS")
+
+    def stage_capabilities(self, decl_io: int, decl_svc: int) -> None:
+        """Stage the declared capability bitmaps (EMRI v0.6 sec 3.7).
+
+        ``CAP_DECL_IO``/``CAP_DECL_SVC`` are the host's declaration; the daemon
+        binds them against what the allocated region can expose (post-ALLOC /
+        pre-BLANK). Written before the ``EFP_CMD`` doorbell.
+        """
+        if not 0 <= decl_io <= 0xFFFF_FFFF or not 0 <= decl_svc <= 0xFFFF_FFFF:
+            raise EfpError("capability bitmaps must be 32-bit")
+        self.write(R_CAP_DECL_IO, decl_io, "CAP_DECL_IO")
+        self.write(R_CAP_DECL_SVC, decl_svc, "CAP_DECL_SVC")
 
     def cmd(self, code: int, comment: str = "") -> None:
         """Ring the doorbell — ALWAYS after a busy=0 poll (spec sec 3.2: the
@@ -366,9 +462,10 @@ class EfpSession:
         self.read(R_EFP_ERR, 0xFF, EFP_ERR_NONE, "expect EFP_ERR=none")
 
     def run(self, digest32: bytes, sig64: bytes, frame_words: list[int],
-            region: int) -> None:
+            region: int, *, decl_io: int = 0, decl_svc: int = 0) -> None:
         """Full run sequence (spec sec 3.2 run steps 1-6)."""
         self.stage_image(digest32, sig64, len(frame_words), region)
+        self.stage_capabilities(decl_io, decl_svc)
         self.cmd(EFP_CMD_RUN, "EFP_CMD=run")
         self.poll_status(EFP_STATUS_STATE_MASK, EFP_S_LOAD,
                          "wait state=LOAD (OCC WRITE armed)")
@@ -382,7 +479,8 @@ class EfpSession:
         self.read(R_EFP_ERR, 0xFF, EFP_ERR_NONE, "expect EFP_ERR=none")
 
     def run_packed(self, digest32: bytes, sig64: bytes,
-                   columns: list[list[int]], region: int) -> None:
+                   columns: list[list[int]], region: int, *,
+                   decl_io: int = 0, decl_svc: int = 0) -> None:
         """Full run_packed sequence (spec sec 3.3, v0.3).
 
         ``columns`` is the image as a list of per-column DATA word lists
@@ -412,6 +510,7 @@ class EfpSession:
             raise EfpError(f"run_packed: column count {len(columns)} out of range")
         self.stage_image(digest32, sig64, words, region)
         self.write(R_EFP_IMG_COLS, len(columns), "EFP_IMG_COLS")
+        self.stage_capabilities(decl_io, decl_svc)
         self.cmd(EFP_CMD_RUN_PACKED, "EFP_CMD=run_packed")
         for c, col_words in enumerate(columns):
             if c > 0:
@@ -482,17 +581,35 @@ class StagedImage:
     frame_words: list[int]
     manifest_digest_hex: str
     signed: bool
+    caps: capcheck.Capabilities  # parsed+schema-checked capabilities.yaml
+    decl_io: int  # CAP_DECL_IO bitmap (EMRI v0.6 sec 3.7)
+    decl_svc: int  # CAP_DECL_SVC bitmap
 
 
-def load_image(eth_path: Path) -> StagedImage:
-    """Unpack a .eth via ethimg: integrity-check, then extract the manifest
-    digest + signature + frame words for EFP staging.
+def load_image(
+    eth_path: Path,
+    *,
+    trusted_pk: bytes | None = None,
+    allow_unsigned: bool = False,
+    allowed_io_mask: int = capcheck.SIM_ALLOWED_IO_MASK,
+    allowed_svc_mask: int = capcheck.SIM_ALLOWED_SVC_MASK,
+) -> StagedImage:
+    """Unpack a .eth: integrity, host-side signature, then EFP staging data.
 
-    Host-side, only INTEGRITY is checked here (per-member SHA-256 +
-    manifest_digest); the SIGNATURE is verified by the BMC daemon in VERIFY
-    (spec sec 3.2 step 3) — the whole point of the EFP split. ``ethctl``
-    MAY additionally verify the signature host-side when the caller supplies
-    trusted pubkeys (done in the CLI, mirroring ``ethimg.verify``).
+    E2-SEC1 makes this path **fail-closed**: the manifest Ed25519 signature is
+    verified host-side by default. ``trusted_pk`` is the raw 32-byte Ed25519
+    public key and is REQUIRED for a signed image unless the caller explicitly
+    opts out with ``allow_unsigned=True``; unsigned images are likewise
+    rejected without that flag. The BMC daemon still re-verifies in VERIFY
+    (spec sec 3.2 step 3) — this is defence in depth, not a replacement.
+
+    The ``capabilities.yaml`` member is parsed + schema-checked
+    (capabilities-v0.md sec 1) and pre-flighted for grantability (sec 2
+    stage 2) against the platform inventory masks, so an over-declared image
+    never reaches a deploy command.
+
+    Raises ``ethimg.IntegrityError``/``ethimg.SignatureError``,
+    ``capcheck.CapabilitySchemaError``/``CapabilityDenied``, or ``EfpError``.
     """
     eth_path = Path(eth_path)
     man, members = ethimg._read_members(eth_path)
@@ -522,24 +639,70 @@ def load_image(eth_path: Path) -> StagedImage:
         for i in range(0, len(frames_bytes), 4)
     ]
 
-    if man.signature is not None:
-        if man.signature.get("algo") != "ed25519":
-            raise EfpError(f"unsupported sig algo: {man.signature.get('algo')}")
-        sig64 = bytes.fromhex(man.signature.get("value", ""))
-        if len(sig64) != 4 * IMG_SIG_WORDS:
-            raise EfpError(f"signature must be {4 * IMG_SIG_WORDS} bytes")
-        signed = True
-    else:
+    digest32 = bytes.fromhex(man.manifest_digest)
+
+    # capabilities.yaml stage-1 schema: a CONTENT check, run before the trust
+    # gate (identical to ethimg.verify). An absent member is the empty set
+    # (capabilities-v0.md sec 1 rule 3); `allow_unsigned` never relaxes it.
+    caps_blob = members.get("capabilities.yaml")
+    try:
+        caps = (
+            capcheck.Capabilities()
+            if caps_blob is None
+            else capcheck.load_capabilities(caps_blob.decode("utf-8"))
+        )
+    except UnicodeDecodeError as e:
+        raise capcheck.CapabilitySchemaError(
+            f"{eth_path}: capabilities.yaml is not UTF-8: {e}"
+        ) from e
+
+    # signature: HOST-SIDE Ed25519 enforcement (E2-SEC1), fail-closed. The
+    # daemon re-verifies in VERIFY (spec sec 3.2 step 3); this is defence in
+    # depth so an unverified image never reaches a deploy command.
+    if man.signature is None:
+        if not allow_unsigned:
+            raise ethimg.SignatureError(
+                f"{eth_path}: unsigned image (pass allow_unsigned=True for dev)"
+            )
         # unsigned dev image: stage zeros; the daemon will reject (bad_sig).
         sig64 = bytes(4 * IMG_SIG_WORDS)
         signed = False
+    else:
+        if man.signature.get("algo") != "ed25519":
+            raise EfpError(f"unsupported sig algo: {man.signature.get('algo')}")
+        try:
+            sig64 = bytes.fromhex(man.signature.get("value", ""))
+        except ValueError as e:
+            raise EfpError(f"{eth_path}: malformed signature hex: {e}") from e
+        if len(sig64) != 4 * IMG_SIG_WORDS:
+            raise EfpError(f"signature must be {4 * IMG_SIG_WORDS} bytes")
+        signed = True
+        if trusted_pk is None:
+            if not allow_unsigned:
+                raise ethimg.SignatureError(
+                    f"{eth_path}: signed but no trusted_pk supplied (pass "
+                    "trusted_pk=<raw 32-byte Ed25519 key> or allow_unsigned=True)"
+                )
+        elif not verify_raw_ed25519(trusted_pk, digest32, sig64):
+            raise ethimg.SignatureError(
+                f"{eth_path}: signature did not verify against the supplied trusted_pk"
+            )
+
+    # stage-2 grantability pre-flight (after the trust gate) + EMRI v0.6
+    # CAP_DECL bitmaps for staging (emri-v0.md sec 3.7).
+    capcheck.validate_grantable(caps, allowed_io_mask, allowed_svc_mask)
+    decl_io, decl_svc = capcheck.to_emri_bitmaps(caps)
+
     return StagedImage(
         name=man.name,
-        digest32=bytes.fromhex(man.manifest_digest),
+        digest32=digest32,
         sig64=sig64,
         frame_words=frame_words,
         manifest_digest_hex=man.manifest_digest,
         signed=signed,
+        caps=caps,
+        decl_io=decl_io,
+        decl_svc=decl_svc,
     )
 
 
@@ -552,10 +715,18 @@ class EfpClient:
 
     num_regions: int = 2
 
-    def run_image(self, eth_path: Path, region: int = EFP_REGION_AUTO) -> tuple[list[Op], StagedImage]:
-        img = load_image(eth_path)
+    def run_image(
+        self,
+        eth_path: Path,
+        region: int = EFP_REGION_AUTO,
+        *,
+        trusted_pk: bytes | None = None,
+        allow_unsigned: bool = False,
+    ) -> tuple[list[Op], StagedImage]:
+        img = load_image(eth_path, trusted_pk=trusted_pk, allow_unsigned=allow_unsigned)
         s = EfpSession()
-        s.run(img.digest32, img.sig64, img.frame_words, region)
+        s.run(img.digest32, img.sig64, img.frame_words, region,
+              decl_io=img.decl_io, decl_svc=img.decl_svc)
         return s.ops, img
 
     def stop(self, region: int) -> list[Op]:
@@ -563,8 +734,14 @@ class EfpClient:
         s.stop(region)
         return s.ops
 
-    def restart(self, eth_path: Path) -> tuple[list[Op], StagedImage]:
-        img = load_image(eth_path)
+    def restart(
+        self,
+        eth_path: Path,
+        *,
+        trusted_pk: bytes | None = None,
+        allow_unsigned: bool = False,
+    ) -> tuple[list[Op], StagedImage]:
+        img = load_image(eth_path, trusted_pk=trusted_pk, allow_unsigned=allow_unsigned)
         s = EfpSession()
         s.restart(img.frame_words)
         return s.ops, img
@@ -581,7 +758,9 @@ class EfpClient:
 
     def run_packed(self, eth_path_or_frames: Path | str | list,
                    region: int = EFP_REGION_AUTO, *,
-                   column_words: int | None = None) -> tuple[list[Op], StagedImage | None]:
+                   column_words: int | None = None,
+                   trusted_pk: bytes | None = None,
+                   allow_unsigned: bool = False) -> tuple[list[Op], StagedImage | None]:
         """run_packed session (spec sec 3.3) from a .eth or raw frames.
 
         ``eth_path_or_frames``:
@@ -595,7 +774,10 @@ class EfpClient:
         """
         img: StagedImage | None = None
         if isinstance(eth_path_or_frames, (str, Path)):
-            img = load_image(Path(eth_path_or_frames))
+            img = load_image(
+                Path(eth_path_or_frames), trusted_pk=trusted_pk,
+                allow_unsigned=allow_unsigned,
+            )
             digest32, sig64 = img.digest32, img.sig64
             flat: list[Any] = img.frame_words
         else:
@@ -631,7 +813,8 @@ class EfpClient:
             )
         s = EfpSession()
         if img is not None:
-            s.run_packed(img.digest32, img.sig64, columns, region)
+            s.run_packed(img.digest32, img.sig64, columns, region,
+                         decl_io=img.decl_io, decl_svc=img.decl_svc)
             return s.ops, img
         s.run_packed(digest32, sig64, columns, region)
         return s.ops, None
@@ -712,6 +895,8 @@ class EfpDaemonModel:
     _occ_done_flag: int = 0  # OCC_STATUS[3] sticky completion (spec sec 4)
     _cols: int = 0  # run_packed: staged EFP_IMG_COLS
     _col: int = 0  # run_packed: current column of the per-column loop
+    _occ_frame_addr: int = 0  # OCC_FRAME_ADDR programmed for the current column
+    _col_addrs: list[int] = field(default_factory=list)  # per-column arming trace
 
     def __post_init__(self) -> None:
         self._regions = [_Region.FREE] * self.num_regions
@@ -788,6 +973,21 @@ class EfpDaemonModel:
             blob += self._regs.get(base + i, 0).to_bytes(4, "little")
         return bytes(blob)
 
+    def _arm_column_frame(self, region: int, col: int, words: int) -> None:
+        """Program OCC_FRAME_ADDR/OCC_WORD_COUNT for one column (spec sec 2).
+
+        Mirrors ``column_frame_base`` in bmc-fw/daemon/daemon.c: the v0.6
+        layout ``{region_id[15:12], col_id[11:8], word[7:0]}`` gives every
+        column its own 256-word window, so adjacent columns of a packed image
+        never alias in the OCC readback store (v0.5's 16-word stride did,
+        E1-DMO2b).
+        """
+        addr = column_frame_base(region, col)
+        self._occ_frame_addr = addr
+        self._col_addrs.append(addr)
+        self._regs[R_OCC_FRAME_ADDR] = addr
+        self._regs[R_OCC_WORD_COUNT] = words & 0xFFFF
+
     def _verify_staged(self) -> bool:
         digest = self._staged_blob(R_IMG_DIGEST, IMG_DIGEST_WORDS)
         sig = self._staged_blob(R_IMG_SIG, IMG_SIG_WORDS)
@@ -797,17 +997,7 @@ class EfpDaemonModel:
             # device keyring unmodelled (no --pubkey): assume the daemon
             # trusts the signer; only zero signatures are rejected above.
             return True
-        try:
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-                Ed25519PublicKey,
-            )
-
-            Ed25519PublicKey.from_public_bytes(self.trusted_pk).verify(
-                sig, digest.hex().encode("utf-8")
-            )
-            return True
-        except Exception:  # noqa: BLE001 - verify raises InvalidSignature etc.
-            return False
+        return verify_raw_ed25519(self.trusted_pk, digest, sig)
 
     def _alloc(self, sel: int) -> int:
         if sel == EFP_REGION_AUTO:
@@ -896,14 +1086,18 @@ class EfpDaemonModel:
                 self._run_region = region
                 self._cols = cols
                 self._col = 0
+                self._col_addrs = []
                 self._state = EFP_S_BLANK
         elif self._state == EFP_S_BLANK:
+            # BLANK every covered column up front (spec sec 3.3 step 2).
+            self._arm_column_frame(self._run_region, self._col, words)
             self._occ_done_flag = 1  # BLANK col complete (sticky, spec sec 4)
             self._col += 1
             if self._col >= self._cols:
                 self._col = 0
                 self._streamed = 0
                 self._occ_done_flag = 0  # WRITE col 0 armed (clears flag)
+                self._arm_column_frame(self._run_region, self._col, words)
                 self._state = EFP_S_LOAD
         elif self._state == EFP_S_LOAD:
             if self._occ_done_flag:
@@ -914,9 +1108,11 @@ class EfpDaemonModel:
                     self._state = EFP_S_READBACK
                 else:
                     self._occ_done_flag = 0  # WRITE col armed (clears flag)
+                    self._arm_column_frame(self._run_region, self._col, words)
             elif self._streamed >= (self._col + 1) * words:
                 self._occ_done_flag = 1  # WRITE col complete (sticky)
         elif self._state == EFP_S_READBACK:
+            self._arm_column_frame(self._run_region, self._col, words)
             self._occ_done_flag = 1
             self._col += 1
             if self._col >= self._cols:
@@ -963,6 +1159,10 @@ class EfpDaemonModel:
     # ---- convenience ----
     def region_state(self, region: int) -> int:
         return self._regions[region]
+
+    def column_addrs(self) -> list[int]:
+        """OCC_FRAME_ADDR values armed during the current command (v0.6 trace)."""
+        return list(self._col_addrs)
 
 
 def execute_ops(ops: list[Op], model: EfpDaemonModel, *,
@@ -1046,6 +1246,14 @@ def build_demo_sessions(out_dir: Path) -> dict[str, str]:
     ethimg.pack(src, eth_path, name="ethctl-replay-a", target="efab-1.0",
                 privkey_pem=priv_pem)
 
+    # E2-SEC1: the EFP path verifies the manifest signature host-side by
+    # default, so the demo CLI run needs the matching public key on disk.
+    pub_path = out_dir / "daemon_pub.pem"
+    pub_path.write_bytes(sk.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ))
+
     import ethctl
 
     run_json = out_dir / "session_run_a.json"
@@ -1053,6 +1261,7 @@ def build_demo_sessions(out_dir: Path) -> dict[str, str]:
     rc = ethctl._cli([
         "--transport", "efp", "run", str(eth_path),
         "--region", "auto",
+        "--pubkey", str(pub_path),
         "--emit-session", str(run_json),
     ])
     if rc != 0:

@@ -379,7 +379,8 @@ def build_words_occ(frame_addr: int, data: list[int]) -> list[int]:
     x30=cmd / status readback, x31=poll scratch.
     """
     n = len(data)
-    region = (frame_addr >> 12) & 0xF  # occ_top region id = frame_addr top 4 bits
+    # region_id[15:12] (emri-v0.md sec 2, OCC_FRAME_ADDR v0.6).
+    region = (frame_addr >> 12) & 0xF
     cmd_word = (1 << OCC_CMD_START) | (region << 2) | OCC_WRITE
 
     prog: list[int] = [
@@ -427,7 +428,9 @@ def build_words_occ_fabric(frame_words: list[int]) -> list[int]:
     host BFM) configures a real fabric region with a packed column image.
 
     Sequence (self-contained deploy, emri-v0.md §3.1):
-      1. OCC_FRAME_ADDR=0, OCC_WORD_COUNT=N (N = DATA words, CRC tail excluded)
+      1. OCC_FRAME_ADDR=0 == ``column_frame_base(0, 0)`` in the v0.6 layout
+         {region_id[15:12], col_id[11:8], word[7:0]} (emri-v0.md sec 2, 0x0B),
+         OCC_WORD_COUNT=N (N = DATA words, CRC tail excluded)
       2. OCC_DECODE = col 0  -> pulses dec_start_o (frame_decoder starts capture)
       3. OCC_CMD = START|WRITE|region0
       4. loop: read each packed word from a ROM data table (IMEM) and push it

@@ -41,6 +41,35 @@
 #define EMRI_EFP_STATUS_WORD   0x16u  /* R_EFP_STATUS   {state,busy,done} */
 #define EMRI_EFP_ERR_WORD      0x17u  /* R_EFP_ERR      sticky error */
 #define EMRI_EFP_IMG_COLS_WORD 0x21u  /* R_EFP_IMG_COLS (v0.3, sec 3.3: run_packed column count) */
+/* Capability-declaration gate (v0.6 sec 3.7): the host stages the compact
+ * capabilities.yaml bitmap before EFP_CMD; CAP_STATUS is the RTL verdict
+ * (read-only — cap_decl_* are plain RW staging, CAP_STATUS is produced by the
+ * regfile comparator). */
+#define EMRI_CAP_DECL_IO_WORD  0x22u  /* R_CAP_DECL_IO  declared pin-group bitmap */
+#define EMRI_CAP_DECL_SVC_WORD 0x23u  /* R_CAP_DECL_SVC declared service bitmap */
+#define EMRI_CAP_STATUS_WORD   0x24u  /* R_CAP_STATUS  HW verdict (emri_regfile) */
+/* CAP_STATUS bitfield (spec sec 2/§3.7). */
+#define EMRI_CAP_STATUS_CHECKED   (1u << 0)                       /* decl staged */
+#define EMRI_CAP_STATUS_DENIED    (1u << 1)                       /* declared ⊄ grantable */
+#define EMRI_CAP_STATUS_THROTTLED (1u << 2)                       /* §3.8 throttle mask */
+#define EMRI_CAP_STATUS_DENIED_IO(s) (((s) >> 8) & 0xFFu)         /* offending bitmap low byte */
+/* Anomaly monitoring v1 (v0.6 sec 3.8): counters/window/threshold live in the
+ * RTL monitor; the daemon only reads the status and writes MON_NOTIFY pulses. */
+#define EMRI_MON_RECFG_COUNT_WORD 0x32u /* {region1[31:16], region0[15:0]} deploys */
+#define EMRI_MON_WDT_COUNT_WORD   0x33u /* same layout: watchdog/heartbeat events */
+#define EMRI_MON_ANOM_STATUS_WORD 0x34u /* [7:0] throttle, [11:8] spike flags, W1C */
+#define EMRI_MON_ANOM_WINDOW_WORD 0x35u /* ticks/window; 0 disables the monitor */
+#define EMRI_MON_ANOM_THRESH_WORD 0x36u /* {wdt[31:16], recfg[15:0]} per-window */
+#define EMRI_MON_NOTIFY_WORD      0x37u /* write-1 pulse into the HW counters */
+/* MON_ANOM_STATUS bitfield: throttle mask bit r, spike flags 8+r (reconfig
+ * rate) / 10+r (watchdog rate); a set flag also sets throttle bit r. */
+#define EMRI_MON_ANOM_THROTTLE(r)   (1u << (r))
+#define EMRI_MON_ANOM_FLAG_RECFG(r) (1u << (8u + (r)))
+#define EMRI_MON_ANOM_FLAG_WDT(r)   (1u << (10u + (r)))
+/* MON_NOTIFY write-1 pulses: bit r = deploy completed in region r (recfg
+ * counter +1); bit 8+r = sec 3.5 watchdog/heartbeat event on region r. */
+#define EMRI_MON_NOTIFY_DEPLOY(r) (1u << (r))
+#define EMRI_MON_NOTIFY_WDT(r)    (1u << (8u + (r)))
 #define EMRI_IMG_DIGEST_WORD   0x18u  /* R_IMG_DIGEST   base, +0..7 */
 #define EMRI_IMG_SIG_WORD      0x50u  /* R_IMG_SIG      base, +0..15 */
 /* SPI_CRC @ 0x3F (v0.3, spec sec 7.1): EFP-SPI transport-CRC16 latch. NOT a

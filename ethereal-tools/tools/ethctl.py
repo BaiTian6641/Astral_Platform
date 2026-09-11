@@ -35,6 +35,11 @@ _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+# capcheck (E2-SEC1) lives in the sibling ethereal-runtime/security/ package.
+_SECURITY_DIR = str(Path(__file__).resolve().parents[2] / "ethereal-runtime")
+if _SECURITY_DIR not in sys.path:
+    sys.path.insert(0, _SECURITY_DIR)
+
 # pi-lens-ignore: E402
 import efp_client
 import ethimg
@@ -68,6 +73,9 @@ from emri_constants import (
     R_REGION_INFO,
     R_REGION_SEL,
 )
+
+# pi-lens-ignore: E402
+from security import capcheck
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +340,8 @@ class Daemon:
         raise DaemonError("OCC poll timeout (done_flag never set)")
 
     def _blank(self, region: int, frame_addr: int, word_count: int) -> None:
+        # OCC_FRAME_ADDR layout is v0.6 {region_id[15:12], col_id[11:8],
+        # word[7:0]} (emri-v0.md sec 2); callers pass it fully formed.
         self.transport.write(R_OCC_FRAME_ADDR, frame_addr)
         self.transport.write(R_OCC_WORD_COUNT, word_count)
         # OCC_CMD = {start@8, region@[5:2], cmd=BLANK@[1:0]}
@@ -453,9 +463,9 @@ def _cli_efp(args: Any) -> int:
     JSON (``--emit-session``) for SV testbench replay (tb_ethctl_replay).
     """
     client = efp_client.EfpClient()
-    # Trusted key for the sim model's VERIFY: with --pubkey the model enforces
-    # Ed25519 against it (raw 32-byte key); without, the device keyring is
-    # unmodelled and only zero-signature (unsigned) images are rejected.
+    # Trusted key (raw 32-byte Ed25519): enforces the HOST-SIDE signature check
+    # in efp_client.load_image (E2-SEC1) and the sim model's VERIFY. Without it
+    # a signed image is refused unless --allow-unsigned is passed explicitly.
     trusted_pk: bytes | None = None
     if getattr(args, "pubkey", None):
         from cryptography.hazmat.primitives import serialization
@@ -465,6 +475,7 @@ def _cli_efp(args: Any) -> int:
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
+    allow_unsigned = bool(getattr(args, "allow_unsigned", False))
     model = efp_client.EfpDaemonModel(trusted_pk=trusted_pk)
 
     ops: list[efp_client.Op]
@@ -473,10 +484,15 @@ def _cli_efp(args: Any) -> int:
     name = args.cmd
     if args.cmd == "run":
         region = _parse_region(args.region)
-        ops, image = client.run_image(Path(args.eth), region)
+        ops, image = client.run_image(
+            Path(args.eth), region, trusted_pk=trusted_pk,
+            allow_unsigned=allow_unsigned,
+        )
         name = f"run {args.eth} region={'auto' if region == EFP_REGION_AUTO else region}"
     elif args.cmd == "restart":
-        ops, image = client.restart(Path(args.eth))
+        ops, image = client.restart(
+            Path(args.eth), trusted_pk=trusted_pk, allow_unsigned=allow_unsigned
+        )
         name = f"restart {args.eth}"
     elif args.cmd == "stop":
         region = _parse_region(args.region)
@@ -572,6 +588,8 @@ def _cli(argv: list[str] | None = None) -> int:
     sp_stop.add_argument("--region", default="0")
     sp_restart = sub.add_parser("restart", help="re-run last staged image (efp)")
     sp_restart.add_argument("eth", help=".eth supplying the frame words to re-stream")
+    sp_restart.add_argument("--allow-unsigned", action="store_true")
+    sp_restart.add_argument("--pubkey", action="append", default=[])
     sp_abort = sub.add_parser("abort", help="best-effort BLANK -> IDLE (efp)")
 
     # allow the transport flags AFTER the subcommand too
@@ -585,7 +603,13 @@ def _cli(argv: list[str] | None = None) -> int:
     if args.transport == "efp":
         try:
             return _cli_efp(args)
-        except (DaemonError, efp_client.EfpError, ethimg.EthimgError) as e:
+        except (
+            DaemonError,
+            efp_client.EfpError,
+            ethimg.EthimgError,
+            capcheck.CapabilityError,
+        ) as e:
+            # Capability refusal names the offending entry in `e` (E2-SEC1).
             print(f"ethctl: error: {e}", file=sys.stderr)
             return 1
     if args.emit_session:
@@ -651,7 +675,7 @@ def _cli(argv: list[str] | None = None) -> int:
                 Path(args.plan_out).write_text(json.dumps(plan, indent=2))
                 print(f"wrote deploy plan -> {args.plan_out}")
         return 0
-    except (DaemonError, ethimg.EthimgError) as e:
+    except (DaemonError, ethimg.EthimgError, capcheck.CapabilityError) as e:
         print(f"ethctl: error: {e}", file=sys.stderr)
         return 1
 

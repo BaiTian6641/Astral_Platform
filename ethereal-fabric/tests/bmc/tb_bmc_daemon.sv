@@ -23,6 +23,9 @@
 //
 //              Scenario (spec §3.2):
 //                1. run image A (TFF) auto-alloc  -> RUNNING, clb_out[0] toggles
+//                  1a. MON_RECFG_COUNT.region0 == 1 (deploy notify, v0.6 §3.8)
+//                  1b. CAP_DECL_IO over-declared -> EFP_ERR=11, no BLANK,
+//                      no fabric mutation; the next deploy still succeeds
 //                2. restart                       -> re-verify+reload, toggles
 //                3. stop r0                       -> STOPPED, output blanked
 //                4. run image B (const1) auto     -> RUNNING, clb_out[0] == 1
@@ -30,6 +33,8 @@
 //                                                    fabric untouched
 //                6. run on RUNNING region 0       -> EFP_ERR=region_full
 //                7. abort                         -> IDLE, region blanked
+//                8. forced reconfig spike         -> MON_ANOM_STATUS throttle;
+//                      run to that region -> EFP_ERR=12, no ALLOC
 //
 //              The daemon's UART log (state transitions + errors) is
 //              exact-matched byte-for-byte, in order, at every phase.
@@ -531,6 +536,7 @@ module tb_bmc_daemon;
   // Test sequence (spec §3.2 EFP flows)
   // ============================================================================
   logic [31:0] rd;
+  logic [31:0] cap_shadow;   // region-1 RAM shadow snapshot for the §3.7 refusal check
 
   initial begin : main_seq
       // idle the host BFM + UART RX
@@ -571,8 +577,40 @@ module tb_bmc_daemon;
       chk(rd[3:0] == EFP_S_RUNNING && rd[5] == 1'b1,
           "EFP_STATUS = RUNNING + done");
       observe_toggle("run A: clb_out_obs[0] toggles (TFF on real fabric)");
+      // ---- 1a. v0.6 §3.8: completed deploy notified the HW monitor ----------
+      $display("[1a] MON_RECFG_COUNT after run A (region-0 deploy count)");
+      host_rd(R_MON_RECFG_COUNT, rd);
+      chk(rd[15:0] == 32'd1, "MON_RECFG_COUNT.region0 == 1 after one deploy");
+
+      // ---- 1b. v0.6 §3.7 capability gate: over-declared IO -> err 11 --------
+      $display("[1b] run with CAP_DECL_IO=0xFFFFFFFF (auto-alloc region 1)");
+      host_stage(SEL_A, 32'd12, 32'h0000_00FF);
+      cap_shadow = u_cfgram.mem[16'h1000];   // region-1 window, untouched so far
+      host_wr(R_CAP_DECL_IO, 32'hFFFF_FFFF);
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_RUN});
+      expect_uart("cmd run\nst VERIFY\n", "cap: accepted + VERIFY");
+      expect_uart("verify ok\nst ALLOC\nalloc r1\n",
+                  "cap: VERIFY ok -> ALLOC r1 (auto)");
+      expect_uart("err capability_denied\nst ERROR\n",
+                  "cap: EFP_ERR=capability_denied, ERROR (no BLANK)");
+      host_wait_idle();
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_CAPABILITY_DENIED, "EFP_ERR = capability_denied (11)");
+      host_rd(R_EFP_STATUS, rd);
+      chk(rd[3:0] == EFP_S_ERROR, "cap: EFP_STATUS = ERROR");
+      host_rd(R_CAP_STATUS, rd);
+      chk(rd[1] == 1'b1, "cap: CAP_STATUS.denied[1] set by the HW comparator");
+      observe_toggle("cap deny: fabric untouched (image A still toggling)");
+      chk(u_cfgram.mem[16'h1000] === cap_shadow,
+          "cap deny: region-1 RAM shadow unchanged (no BLANK/mutation)");
+      host_wr(R_CAP_DECL_IO, 32'h0000_0000);   // release the declaration
+      host_rd(R_CAP_STATUS, rd);
+      chk(rd[1] == 1'b0, "cap: CAP_STATUS.denied clears when undeclared");
 
       // ---- 2. restart (stop + re-run last staged metadata) -------------------
+      // Also the "subsequent good deploy" after the §3.7 refusal: a full
+      // VERIFY->ALLOC->BLANK->LOAD->READBACK->RUNNING completes, so the
+      // capability denial left no stuck state.
       $display("[2] restart (re-verify + reload of image A)");
       host_wr(R_EFP_CMD, {24'h0, EFP_CMD_RESTART});
       expect_uart("cmd restart\nst BLANK\nblank ok\nst VERIFY\n",
@@ -584,6 +622,9 @@ module tb_bmc_daemon;
                   "restart: RUNNING again");
       host_wait_idle();
       observe_toggle("restart: clb_out_obs[0] toggles again");
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_NONE,
+          "recovery: EFP_ERR none after the cap refusal (no stuck state)");
 
       // ---- 3. stop region 0 ---------------------------------------------------
       $display("[3] stop region 0");
@@ -643,10 +684,38 @@ module tb_bmc_daemon;
       host_rd(R_EFP_STATUS, rd);
       chk(rd[3:0] == EFP_S_IDLE, "EFP_STATUS = IDLE after abort");
       observe_const(1'b0, "abort: clb_out_obs[0] constant 0 (blanked)");
+      // ---- 8. v0.6 §3.8 anomaly monitor: forced reconfig spike -> throttle --
+      $display("[8] anomaly monitor: reconfig spike throttles region 0");
+      host_wr(R_MON_ANOM_WINDOW, 32'd1);           // 1 tick (~4096 clk) window
+      host_wr(R_MON_ANOM_THRESH, 32'h0000_0000);  // any delta > 0 spikes
+      repeat (5000) @(posedge clk);               // let the window snapshot settle
+      host_wr(R_MON_ANOM_STATUS, 32'hFFFF_FFFF);  // W1C: drop stale spike flags
+      host_wr(R_MON_NOTIFY, 32'h0000_0001);       // one completed-deploy pulse, r0
+      repeat (5000) @(posedge clk);               // cross the next monitor tick
+      host_rd(R_MON_ANOM_STATUS, rd);
+      chk(rd[0] == 1'b1, "anomaly: MON_ANOM_STATUS throttle[0] set");
+      chk(rd[8] == 1'b1, "anomaly: MON_ANOM_STATUS flag[8] (recfg spike r0) set");
+      host_rd(R_MON_RECFG_COUNT, rd);
+      chk(rd[15:0] == 32'd4,
+          "anomaly: MON_RECFG_COUNT.region0 == 4 (3 deploys + host notify)");
+      host_rd(R_CAP_STATUS, rd);
+      chk(rd[2] == 1'b1, "anomaly: CAP_STATUS.throttled[2] set");
+      // A deploy to the throttled region is refused with no ALLOC at all.
+      host_stage(SEL_B, 32'd1, 32'h0000_0000);
+      host_wr(R_EFP_CMD, {24'h0, EFP_CMD_RUN});
+      expect_uart("cmd run\nst VERIFY\n", "throttle: accepted + VERIFY");
+      expect_uart("verify ok\nerr rate_limited\nst ERROR\n",
+                  "throttle: EFP_ERR=rate_limited, ERROR (no ALLOC)");
+      host_wait_idle();
+      host_rd(R_EFP_ERR, rd);
+      chk(rd[7:0] == EFP_ERR_RATE_LIMITED, "EFP_ERR = rate_limited (12)");
+      host_rd(R_EFP_STATUS, rd);
+      chk(rd[3:0] == EFP_S_ERROR, "throttle: EFP_STATUS = ERROR");
+      observe_const(1'b0, "throttle: region 0 fabric untouched (stays blanked)");
 
       // ---- report ---------------------------------------------------------------
       if (errors == 0)
-          $display("TEST PASSED: E1-RUN2 daemon — EFP run/restart/stop/abort on real fabric, bad_sig + region_full rejected, UART log exact-matched");
+          $display("TEST PASSED: E1-RUN2 daemon — EFP run/restart/stop/abort on real fabric, bad_sig + region_full rejected, v0.6 cap-gate (11) + anomaly throttle (12) enforced, MON_RECFG_COUNT notified, UART log exact-matched");
       else
           $display("TEST FAILED: %0d errors", errors);
       $finish;
@@ -654,7 +723,7 @@ module tb_bmc_daemon;
 
   // -- Watchdog -------------------------------------------------------------------
   initial begin
-      // Total sim ≈ 8 verify-equivalents × ~0.84 s + deploys ≈ ~7 s sim.
+      // Total sim ≈ 10 verify-equivalents × ~0.84 s + deploys ≈ ~9 s sim.
       repeat (25) #(1000000000);   // 25 s hard cap
       $display("TEST FAILED: watchdog timeout (rxn=%0d rxr=%0d errors=%0d)",
                rxn, rxr, errors);

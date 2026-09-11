@@ -20,11 +20,16 @@ implementation change in the other repos.
 - [`fabric/elut4-config-v0.md`](fabric/elut4-config-v0.md) — eLUT4 atomic element (LUT4 + FF).
 - [`fabric/interconnect-config-v0.md`](fabric/interconnect-config-v0.md) — SB (Wilton) + CB.
 - [`fabric/heterogeneous-config-v0.md`](fabric/heterogeneous-config-v0.md) — mem_t / dsp_t tiles.
+- [`fabric/ctx-scan-v0.md`](fabric/ctx-scan-v0.md) — FF scan-chain context save/restore (E2-FAB3).
 - [`fabric/fabric_*.yaml`](fabric/) — machine-readable fabric descriptors.
 
 ### Control plane (Phase-1, in progress)
 - [`control/emri-v0.md`](control/emri-v0.md) — **EMRI**: unified management register ABI
   (BMC + mFSM), EFP-SPI transport, OCC passthrough. ADR-013/014/015/016.
+
+### Security (Phase-2, in progress)
+- [`security/capabilities-v0.md`](security/capabilities-v0.md) — logic-image capability
+  declaration (`capabilities.yaml` typed schema + the three validation stages, E2-SEC1).
 
 **License:** **Creative Commons Attribution-ShareAlike 4.0 International**
 (**CC-BY-SA-4.0**). See [LICENSE](LICENSE).
