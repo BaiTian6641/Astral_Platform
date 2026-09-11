@@ -237,6 +237,13 @@ module tb_bmc_daemon_packed;
   // v0.1 R_OCC_DECODE outputs -> frame_decoder
   logic        dec_start;
   logic [7:0]  dec_col;
+  // Decoder frame-window contract flag (E1-DMO2c): frame_decoder raises the
+  // sticky cfg_error_o when a captured DATA word's frame-relative offset
+  // (fbus_addr_i - frame_base_i) leaves [0, MAX_WORDS) — the signature of a
+  // frame_base_i that does not match the streamed column's base. It is cleared
+  // on each decode start, so latch it here across the whole deploy.
+  logic        dec_cfg_error;
+  logic        dec_cfg_error_seen = 1'b0;
 
   // occ_top frame bus -> frame_decoder AND column_cfg_ram (readback target)
   logic [15:0] fbus_addr;
@@ -317,7 +324,8 @@ module tb_bmc_daemon_packed;
       // guard, and the decoder re-decodes the STALE column-0 buffer: E1-DMO2c.)
       .frame_base_i(occ_frame_addr),
       .cfg_we_o(dec_cfg_we), .cfg_addr_o(dec_cfg_addr), .cfg_data_o(dec_cfg_data),
-      .crc_error_o(dec_crc_error)
+      .crc_error_o(dec_crc_error),
+      .cfg_error_o(dec_cfg_error)
   );
 
   // Fabric user/region reset: pulsed AFTER the WRITE decode completes so the
@@ -749,6 +757,7 @@ module tb_bmc_daemon_packed;
   // (2 columns) = 7, stage 6 stop (2 columns) = 9.
   integer dec_done_count = 0;
   always @(posedge clk) if (dec_done) dec_done_count = dec_done_count + 1;
+  always @(posedge clk) if (dec_cfg_error) dec_cfg_error_seen = 1'b1;
 
   // Per-column WRITE-command frame-address trace (E1-DMO2c): the daemon
   // programs OCC_FRAME_ADDR immediately before each OCC_CMD=WRITE. occ_cmd_valid
@@ -900,6 +909,8 @@ module tb_bmc_daemon_packed;
           "run_packed C: config window 0x0000 = col 0 frame (no col 1 aliasing)");
       chk(cfg_window_bad(0, 1) == 0,
           "run_packed C: config window 0x0100 = col 1 frame");
+      chk(!dec_cfg_error_seen,
+          "run_packed C: decoder frame-window contract clean (every per-column DATA word offset in [0,34))");
       wait_dec_done(7, "run_packed C: BLANK c0/c1 + WRITE c0/c1 decodes done");
       fab_region_reset();
       observe_toggle(0, "run_packed C: col 0 clb_out_obs[0] toggles (TFF image)");

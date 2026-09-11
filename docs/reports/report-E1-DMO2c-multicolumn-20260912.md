@@ -30,5 +30,8 @@
 
 ## 4. 下一阶段需要做的内容
 
-- **frame_decoder 加固**（RTL 属主进行中）：按捕获序索引 + 越界显式标志，并给 `tb_frame_decoder` 加"基址错配不得静默复用陈旧缓冲"的负例。
+- ✅ **frame_decoder 加固已完成（commit `5113f6e`）**：捕获缓冲改为**按捕获序**索引（`fbuf[cap_count_r]`，与地址偏移无关 ⇒ 陈旧缓冲不可能被重新译码）+
+  新增 sticky `cfg_error_o`（捕获字偏移越出 `[0,MAX_WORDS)` 时置位，供 OCC 上报调用方错接线，不阻断译码）；
+  `tb_frame_decoder` 负例（0x100 流 + `frame_base_i=0` + cb_sel 变异）证明**解出新流值而非陈旧值**且标志置位，回退变异恰好令该两点失败；
+  tb_bmc_daemon_packed（2 列）在加固后仍 PASS。
 - **E3-REP2 / E2-DOC1** — 把"多列镜像 ≥2 列的部署契约"写进 S09 冻结文本（含 `EFP_IMG_COLS` 与逐列 CRC 的配套要求）。
