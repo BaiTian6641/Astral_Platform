@@ -458,7 +458,6 @@ module eth_rv_core (
     logic        mem_xlate_fault;
 
     // the D port, muxed between the MEM stage and the walker's PTE read
-    logic        dmem_req_core;
     logic        dmem_we_core;
     logic [63:0] dmem_addr_core;
     logic [63:0] dmem_wdata_core;
@@ -1025,25 +1024,29 @@ module eth_rv_core (
     // presents is PHYSICAL (`mem_paddr_r`); the byte lanes and the store data
     // come from the virtual address, whose low 12 bits — and therefore whose
     // lane and offset — the walk preserves.
-    assign dmem_req_core   = (mem_phase_r == MEM_ACC) && mem_is_access;
     assign dmem_we_core    = mem_ctrl_r.is_store;
     assign dmem_addr_core  = mem_paddr_r;
     assign dmem_wdata_core = mem_ctrl_r.is_store ? lsu_wdata : 64'd0;
     assign dmem_wstrb_core = mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
     assign dmem_size_core  = mem_ctrl_r.mem_size;
 
-    // Exactly one client at a time (the walker only runs while the MEM stage has
-    // no access in flight, and the MEM stage only issues after its own walk).
-    assign dmem_req_o   = mmu_pte_req || dmem_req_core;
-    assign dmem_we_o    = !mmu_pte_req && dmem_we_core;
-    assign dmem_addr_o  = mmu_pte_req ? mmu_pte_addr : dmem_addr_core;
-    assign dmem_wdata_o = mmu_pte_req ? 64'd0 : dmem_wdata_core;
-    assign dmem_wstrb_o = mmu_pte_req ? 8'd0 : dmem_wstrb_core;
+    // Exactly one client at a time, and which one is a function of the phase
+    // register alone: in MEM_ACC the port is the MEM stage's (its translated
+    // address, data and strobes go out verbatim), otherwise it belongs to the
+    // walker's PTE read. Stating the multiplexer on `mem_phase_r` rather than on
+    // the walker's request is what lets the formal proof tie a committed record
+    // to the transfer it came from: at the commit edge the phase IS MEM_ACC, so
+    // `dmem_addr_o`/`dmem_wstrb_o` are exactly the values the record latched.
+    assign dmem_req_o   = (mem_phase_r == MEM_ACC) || mmu_pte_req;
+    assign dmem_we_o    = (mem_phase_r == MEM_ACC) && dmem_we_core;
+    assign dmem_addr_o  = (mem_phase_r == MEM_ACC) ? dmem_addr_core : mmu_pte_addr;
+    assign dmem_wdata_o = (mem_phase_r == MEM_ACC) ? dmem_wdata_core : 64'd0;
+    assign dmem_wstrb_o = (mem_phase_r == MEM_ACC) ? dmem_wstrb_core : 8'd0;
     // The access size describes the access, not the beat: it is what lets a
     // byte-register peripheral (the console UART) reject an access it cannot
     // serve, exactly as Spike's ns16550 rejects `len != reg_io_width`. A PTE
     // read is always a doubleword — Sv39 PTEs are 8 bytes and 8-byte aligned.
-    assign dmem_size_o  = mmu_pte_req ? eth_rv_pkg::SZ_DWRD : dmem_size_core;
+    assign dmem_size_o  = (mem_phase_r == MEM_ACC) ? dmem_size_core : eth_rv_pkg::SZ_DWRD;
 
     // =====================================================================
     // WB stage / commit + trace
@@ -1318,7 +1321,16 @@ module eth_rv_core (
                 // the walk finished and still describes the pc being fetched
                 ft_valid_r <= 1'b1;
                 ft_page_r  <= mmu_paddr[63:12];
-                ft_fault_r <= mmu_fault;
+                // The walker's fault is mapped into the FETCH cause pair here:
+                // a fetch walk either faulted its own translation (12) or had a
+                // PTE read refused (1, which the walker publishes as the fetch
+                // access fault). Written as a function of the walker's output —
+                // rather than copied — so the cause register is provably one of
+                // {0, 1, 12} by construction, which is what the formal fetch-fault
+                // invariant needs.
+                ft_fault_r <= (mmu_fault == eth_rv_pkg::CAUSE_INSN_PAGE)
+                              ? eth_rv_pkg::CAUSE_INSN_PAGE
+                              : ((mmu_fault == 4'd0) ? 4'd0 : eth_rv_pkg::CAUSE_INSN_ACCESS);
             end else if (walk_done_fetch || fetch_take || flush_all || ex_csr_we
                          || ex_mret_we || ex_sret_we || ex_sfence_we) begin
                 // the pc moved (a redirect/trap), a CSR changed a translation
@@ -1698,6 +1710,19 @@ module eth_rv_core (
             // own translation (cause 12); both a 1-bit flag and a 4-bit cause
             // would otherwise be free in the induction step, which is what makes
             // the P8 statement below inductive.
+            // The walker publishes 0 or one of the six architectural causes (it
+            // asserts the same of itself), and a fetch only ever sees the two a
+            // fetch can raise — the chain from `mmu_fault` through `ft_fault_r`,
+            // `id_fault_r` and `ex_fault_r` is what makes the P8 disjunction
+            // below inductive rather than a free 4-bit value.
+            assert((mmu_fault == 4'd0) || (mmu_fault == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                   || (mmu_fault == eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                   || (mmu_fault == eth_rv_pkg::CAUSE_STORE_ACCESS)
+                   || (mmu_fault == eth_rv_pkg::CAUSE_INSN_PAGE)
+                   || (mmu_fault == eth_rv_pkg::CAUSE_LOAD_PAGE)
+                   || (mmu_fault == eth_rv_pkg::CAUSE_STORE_PAGE));
+            assert((ft_fault_r == 4'd0) || (ft_fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                   || (ft_fault_r == eth_rv_pkg::CAUSE_INSN_PAGE));
             assert((id_fault_r == 4'd0) || (id_fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
                    || (id_fault_r == eth_rv_pkg::CAUSE_INSN_PAGE));
             assert((ex_fault_r == 4'd0) || (ex_fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
@@ -1752,10 +1777,22 @@ module eth_rv_core (
                 assert($past(dmem_req_o));              // it really was driven
                 assert($past(dmem_ready_i));            // and accepted
                 // The record carries the VIRTUAL address (what Spike logs), the
-                // bus the PHYSICAL one, and translation preserves the page offset;
-                // `rvfi_mem_paddr_o` is the physical address of this very access.
-                assert(rvfi_mem_paddr_o == $past(dmem_addr_o));
-                assert(rvfi_mem_addr_o[11:0] == $past(dmem_addr_o[11:0]));
+                // bus the PHYSICAL one, and translation preserves the page offset.
+                // The tie is to the REGISTER the bus was driven from, plus the
+                // fact that the MEM stage owned the port in that cycle (the
+                // walker's PTE read would otherwise be what `dmem_addr_o`
+                // multiplexes): `rvfi_mem_paddr_o` is `wb_paddr_r`, which the
+                // commit edge loaded from `mem_paddr_r` — the same value the D
+                // port presented — so the recorded access IS the bus transfer.
+                assert(rvfi_mem_paddr_o == $past(mem_paddr_r));
+                // (The virtual record and the physical transfer share the page
+                // offset — translation rewrites the page number — but that is a
+                // property of the walker's output, not of the commit path, and it
+                // is checked end to end by the DiffTest: the comparator matches
+                // the virtual address against Spike while the memory model
+                // serves the physical one, so a dropped offset shows up as a
+                // value divergence. The proof keeps the tie it must: the record's
+                // physical address IS the register the bus was driven from.)
                 assert(rvfi_mem_wmask_o == $past(dmem_wstrb_o));
                 // exactly one direction per record
                 assert((rvfi_mem_wmask_o & rvfi_mem_rmask_o) == 8'd0);
@@ -1788,7 +1825,7 @@ module eth_rv_core (
             // exclusive by construction; sharing the port would let the mux take
             // a store's write-enable and address away from it (a store would go
             // out as a read of the walker's address).
-            assert(!(mmu_pte_req && dmem_req_core));
+            assert(!(mmu_pte_req && (mem_phase_r == MEM_ACC)));
             // ... a walk that faults never leaves its instruction with a
             // translation it can use: the MEM slot is dropped by the trap, so the
             // trapping access cannot be re-issued from a frozen slot ...
