@@ -665,3 +665,10 @@ python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --difftest
 | `ethereal-shell/verif/eth_rv_core/run_linux_boot.py` | `--clint-dump`；`build_model(..., spike_cadence=True)`（`obj_s4_fw`）；`--difftest` 用该档 |
 | `ethereal-shell/verif/eth_rv/tests/test_rv_linux_boot.py` | 新增 `test_linux_dts_declares_the_hart_pmp_profile` |
 | `ethereal-shell/verif/eth_rv/README.md` | S4 边界更正（PMP/DT、时基档位、两套节拍、诊断开关） |
+
+## 追补七：定时器吞吐是当前瓶颈（60 MHz 实验与量化）
+
+`--clint-dump=2000000` 的 299 条采样（10 MHz 配置）给出决定性数值：`mtimecmp` **确实在武装**（`0x22ed5ece`/`0x232a6fe3`/`0x236780f8`/`0x23a4920d` 与 `mtime` 同步推进）、`mtip` 在 0/1 间翻转、`mip=0x0a0`（STIP|…）、`mie=0x02a/0x0aa`、`priv` 在 S/M 间切换、**每 2M 周期约 190 次陷阱**（`traps` 18,138 @ 600M）⇒ 内核**并非死锁**，而是在**以约 1 次/10,500 周期的频率处理 tick**，几乎没有前向进展。10,500 周期 = HZ=1000 在 10 MHz + 1:1 周期节拍下的一个 tick ⇒ 与声明频率自洽。
+
+据此把 DTS 的 `timebase-frequency` 提到 **60 MHz**（tick ≈ 60,000 周期 ≈ Spike 的 10,000 指令节拍，按本核 ~0.17 IPC 折算）：控制台从 3.47 s 推进到 **4.73 s**（Mount-cache/Mountpoint-cache）后再次停滞 ⇒ **改善但未解决**。结论：瓶颈是**每 tick 的指令成本 vs 无 TLB 时的取指翻译开销**（每次翻译 3 次 PTE 读 + 取指），即差距清单 G10 的性能项；DT 频率只是可调的"时间尺度"，不能无限外推。
+下一步（廉价、可迭代）：① 用 `--clint-dump` 复测 60 MHz 下的 tick 间隔与陷阱率，确认是否仍与 HZ 自洽；② 在同一树上把 tick 处理一次的总周期数量出来（相邻两次 `mtip=1` 的周期差 vs 一次完整 M→S→M 往返的周期数）；③ 若确认为吞吐瓶颈，短期把声明频率再抬高（纯尺度调整，需在 DT 注释里写清是仿真尺度）或在 cmdline 上减少早期 tick 需求；长期是 S3/G10 的 **TLB + 小 I-cache**（会让 `sfence.vma` 真正有意义，也是上板的前置）。
