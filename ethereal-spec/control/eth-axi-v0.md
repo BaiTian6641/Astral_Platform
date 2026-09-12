@@ -105,7 +105,12 @@ Single unidirectional channel: `tvalid, tready, tdata[DW-1:0], tkeep[(DW/8)-1:0]
   (`AxLEN=0`, `AxSIZE` = bus width, `AxBURST=INCR`, `WLAST=0`), so existing single-beat
   users keep the v0 contract **bit-identically**; at 1 bursts are routed. The slave-facing
   burst port set exists and is well-formed at either setting.
-- ATOP atomics: still deferred (needed only for SMP Linux; not the single-core profile).
+- ATOP atomics: still deferred. This is the **bus-level** AXI `ATOP` transaction: it is
+  needed only for SMP Linux, and the single-core profile does not use it. It does **not**
+  excuse the **instruction-level RISC-V `A` extension** (LR/SC/AMO), which single-core
+  Linux/OpenSBI firmware *does* require — an AMO instruction is executed as an ordinary
+  read-modify-write over the D port, with no `ATOP` on the wire. See
+  `docs/reports/report-E2-RV2-linux-gap-20260912.md` G2.
 
 ### 5.3 The decode-error slave
 A built-in default slave that answers any unmapped access with `DECERR` and consumes the
@@ -170,7 +175,7 @@ Every `eth_axi` module ships with SVA properties checked by `sby` (and simulated
 1. ~~**AXI4 full bursts vs AXI4-Lite-only in v0:** ... Decision at RTL time.~~
    **Resolved (E2-AXI2, 2026-09-12):** both — burst routing behind `BURST_EN` (default 0
    keeps the Lite/single-beat contract bit-identical, 1 routes INCR bursts); see §5.2.
-2. **ATOP atomics timing:** v0.1, needed only for SMP Linux (not the single-core GW5
+2. **ATOP atomics timing:** 见 §5.2 的说明 —— v0.1 的 `ATOP` 是**总线级**事务（SMP 才需要）；**指令级 RISC-V A 扩展（LR/SC/AMO）**单核固件/内核就需要，且以普通读写经 D 口完成、不在线上产生 `ATOP`（2026-09-12 澄清，见 `docs/reports/report-E2-RV2-linux-gap-20260912.md` G2）。原文：needed only for SMP Linux (not the single-core GW5
    profile).
 3. **64-bit datapath:** `AXI_DW=64` parameter — enable when the app-cluster/DRAM path lands.
 4. **NI adapter (AXI↔mailbox NoC):** separate RFC-002 update; not in this spec.
