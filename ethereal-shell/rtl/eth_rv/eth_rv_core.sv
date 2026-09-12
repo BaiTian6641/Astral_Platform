@@ -179,6 +179,18 @@ module eth_rv_core (
     input  logic        msip_i,          // machine software interrupt (CLINT msip[0])
     input  logic        mtip_i,          // machine timer interrupt (mtime >= mtimecmp)
     input  logic        meip_i,          // machine external interrupt (no PLIC: tied 0)
+    // ---- the hart's mtime (the `time` CSR's source) ----
+    // `time` is not a hart-side counter: the golden model's `time` is a proxy of
+    // its CLINT's `mtime` register (`clint.cc:116` syncs the hart's shadow on every
+    // tick), so this port carries exactly that register out of `eth_rv_clint`.
+    // The value is sampled while the reading instruction is in EX, which is the
+    // same value the D-port load of 0x200_bff8 returns to that instruction: the
+    // CLINT advances on the step strobe of the instruction that just left EX, so
+    // the register in this cycle is the "steps before this instruction" value
+    // (the table in local://rv10-counter-notes.md §1.4 measures the two paths to
+    // be one function of the instruction index, differing only in the single
+    // instruction the tick itself lands on).
+    input  logic [63:0] mtime_i,
 
     // ---- RVFI-style commit trace (C14 §4) ----
     output logic        rvfi_valid_o,
@@ -221,7 +233,6 @@ module eth_rv_core (
     typedef eth_rv_pkg::ctrl_t        ctrl_t;
     typedef eth_rv_pkg::mem_ctrl_t    mem_ctrl_t;
     typedef eth_rv_pkg::commit_ctrl_t commit_ctrl_t;
-
     localparam logic [63:0]           RESET_PC   = eth_rv_pkg::RESET_PC;
     localparam eth_rv_pkg::op_a_sel_e OP_A_PC    = eth_rv_pkg::OP_A_PC;
     localparam eth_rv_pkg::op_a_sel_e OP_A_ZERO  = eth_rv_pkg::OP_A_ZERO;
@@ -459,6 +470,10 @@ module eth_rv_core (
     logic        ex_csr_write_form;
     logic        ex_csr_priv_ok;
     logic        ex_csr_illegal;
+    // the counter proxy gate (E2-RV2 increment 4): which enable bit this access
+    // needs, and whether the current mode is missing it
+    logic [2:0]  ex_counter_bit;
+    logic        ex_counter_denied;
     logic        ex_mret_illegal;
     logic        ex_sret_illegal;
     logic        ex_sfence_illegal;
@@ -656,14 +671,33 @@ module eth_rv_core (
     // mode. csr_priv = 2'b10 (H-owned) is never legal here — the address decode
     // rejects it.
     assign priv_eff = (csr_priv_r == eth_rv_pkg::PRV_S) ? 2'd2 : csr_priv_r;
+    // A write FORM (not an actual write): CSRRS/CSRRC with rs1 = x0 (or uimm = 0)
+    // read without writing, so a read-only CSR accepts them — and mcycle/`cycle`
+    // are read-only, so only the read form may reach them.
     assign ex_csr_write_form = ex_ctrl_r.is_csr
                                && ((ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW)
                                    || ((ex_ctrl_r.csr_imm ? (ex_imm_r[4:0] != 5'd0)
                                                           : (ex_rs1_r != 5'd0))));
     assign ex_csr_priv_ok = (ex_ctrl_r.csr_addr[9:8] != 2'b10)
                             && (ex_ctrl_r.csr_addr[9:8] <= priv_eff);
+    // The three user counter proxies (`cycle`/`time`/`instret`) carry a permission
+    // rule of their own on top of their privilege level (Spike's
+    // counter_proxy_csr_t::verify_permissions): M-mode is never gated, below M-mode
+    // the matching `mcounteren` bit must be set, and from U-mode (`prv < PRV_S`)
+    // the matching `scounteren` bit as well — `scounteren` gates S -> U, never
+    // M -> S. A denied access is an illegal instruction, never a silent read of a
+    // frozen counter. (`cor_counters` caught the missing M-mode exemption on the
+    // first RTL run: `rdcycle` in M-mode with `mcounteren = 0` must be legal.)
+    assign ex_counter_bit = eth_rv_pkg::csr_counter_bit(ex_ctrl_r.csr_addr[1:0]);
+    assign ex_counter_denied =
+        eth_rv_pkg::csr_is_counter_proxy(ex_ctrl_r.csr_addr)
+        && (((csr_priv_r != eth_rv_pkg::PRV_M)
+             && ((csr_mcounteren_r & ex_counter_bit) == 3'd0))
+            || ((csr_priv_r == eth_rv_pkg::PRV_U)
+                && ((csr_scounteren_r & ex_counter_bit) == 3'd0)));
     assign ex_csr_illegal = ex_ctrl_r.is_csr
                             && (!ex_csr_priv_ok
+                                || ex_counter_denied
                                 || ((ex_ctrl_r.csr_addr[11:10] == 2'b11)
                                     && ex_csr_write_form)
                                 || ((ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_SATP)
@@ -985,9 +1019,7 @@ module eth_rv_core (
     // from FS on every read (Spike's adjust_sd()). `sstatus` is a *view* of the
     // same register, so a write through sstatus and a read through mstatus can
     // never disagree — the DiffTest leans on exactly that. The S-mode trap CSRs
-    // (stvec/sepc/scause/stval/sscratch) are independent registers, and
-    // mcounteren/scounteren have no state at all: with no Zicntr in the ISA the
-    // golden model's write mask is zero, so a write is legal and drops.
+    // (stvec/sepc/scause/stval/sscratch) are independent registers.
     logic [1:0]  csr_priv_r;        // current privilege, PRV_U/PRV_S/PRV_M
     logic [63:0] csr_mstatus_r;
     logic [63:0] csr_mie_r;
@@ -1009,6 +1041,22 @@ module eth_rv_core (
     // through `fcsr` and a read through `fflags` + `frm` can never disagree.
     logic [4:0]  csr_fflags_r;
     logic [2:0]  csr_frm_r;
+    // ---- Zicntr + the counter enables (E2-RV2 increment 4) ----------------
+    // `mcycle`/`minstret` are the state; `cycle`/`instret` are read-only views of
+    // them and `time` is `mtime_i` (the CLINT's register), exactly Spike's
+    // counter_proxy_csr_t over mcycle/minstret/time. Both counters start at the
+    // golden model's boot-ROM count (COUNTER_PRELOAD) so absolute values match.
+    // The three enable registers hold their architectural bits only:
+    // mcounteren/scounteren are CY|TM|IR (bits 2:0) and mcountinhibit is CY|IR
+    // (bits 2 and 0) — the masks are Spike's, so a write of all-ones reads back
+    // 0x7 / 0x7 / 0x5 (probe1/probe2). menvcfg/senvcfg are FIOM-only (bit 0).
+    logic [63:0] csr_mcycle_r;
+    logic [63:0] csr_minstret_r;
+    logic [2:0]  csr_mcounteren_r;
+    logic [2:0]  csr_scounteren_r;
+    logic [2:0]  csr_mcountinhibit_r;   // bit 2 = IR (minstret), bit 0 = CY (mcycle)
+    logic        csr_menvcfg_r;
+    logic        csr_senvcfg_r;
 
     logic [63:0] csr_rdata;
     logic [63:0] csr_wdata;
@@ -1020,6 +1068,34 @@ module eth_rv_core (
     logic [63:0] mstatus_wr;
     logic [1:0]  mpp_wr;
     logic        ex_sfence_we;
+    // ---- the counters as a READER sees them (E2-RV2 increment 4) -----------
+    // `csr_mcycle_r`/`csr_minstret_r` hold the count of instructions retired
+    // through the previous cycle: the increment is applied at the MEM -> WB edge,
+    // which is the retirement edge (`mem_retire` below is exactly the next value
+    // of `wb_valid_r`). A reader in EX therefore has to add the pending
+    // retirement of the one older instruction that is still in MEM — unless that
+    // instruction is the counter's own writer, whose write already landed when it
+    // left EX, or the counter is inhibited.
+    // Spike's rule this mirrors (probe table §1.2/§1.3 in
+    // local://rv10-counter-notes.md): the counters advance once per RETIRED
+    // instruction — a trapping instruction is never counted — and an explicit
+    // write stores its value without incrementing the writing instruction.
+    logic        mem_retire;
+    logic        mem_inc_mcycle;
+    logic        mem_inc_minstret;
+    logic [63:0] csr_mcycle_rd;
+    logic [63:0] csr_minstret_rd;
+    logic [1:0]  ex_counter_wr;     // which counter this instruction WRITES
+    logic [1:0]  ex_counter_inc;    // which counters it INCREMENTS when it retires
+    assign mem_retire     = mem_valid_r && !mem_wait && !wfi_wait && !mem_trap;
+    // The MEM slot's pending retirement: its own increment decision, made in EX
+    // (see `ex_counter_inc`). A reader one stage behind adds it, which is what
+    // makes its value the "count of instructions retired before this one" that
+    // Spike reports.
+    assign mem_inc_mcycle   = mem_retire && mem_ctrl_r.counter_inc[0];
+    assign mem_inc_minstret = mem_retire && mem_ctrl_r.counter_inc[1];
+    assign csr_mcycle_rd   = csr_mcycle_r   + {63'd0, mem_inc_mcycle};
+    assign csr_minstret_rd = csr_minstret_r + {63'd0, mem_inc_minstret};
 
     // mstatus as read: the stored value with SD derived from FS (Spike sets SD on
     // every write of FS = 11 and clears it otherwise).
@@ -1040,9 +1116,31 @@ module eth_rv_core (
             eth_rv_pkg::CSR_STVEC:     csr_rdata = csr_stvec_r;
             eth_rv_pkg::CSR_MEDELEG:   csr_rdata = csr_medeleg_r;
             eth_rv_pkg::CSR_MIDELEG:   csr_rdata = csr_mideleg_r;
-            // mcounteren/scounteren exist but have a zero write mask under
-            // `--isa=rv64imc` (no Zicntr), so they read 0 whatever is written.
-            eth_rv_pkg::CSR_MCOUNTEREN, eth_rv_pkg::CSR_SCOUNTEREN: csr_rdata = 64'd0;
+            // The counter enables and the inhibit register: each holds its
+            // architectural bits (Spike's WARL masks), so an all-ones write reads
+            // back 0x7/0x7/0x5 — never the written value.
+            eth_rv_pkg::CSR_MCOUNTEREN:   csr_rdata = {61'd0, csr_mcounteren_r};
+            eth_rv_pkg::CSR_SCOUNTEREN:   csr_rdata = {61'd0, csr_scounteren_r};
+            eth_rv_pkg::CSR_MCOUNTINHIBIT: csr_rdata = {61'd0, csr_mcountinhibit_r};
+            // The counters. `cycle`/`instret` are the read-only user views of
+            // mcycle/minstret and `time` IS the CLINT's mtime register (see the
+            // `mtime_i` port) — Spike's three counter_proxy_csr_t.
+            eth_rv_pkg::CSR_MCYCLE:       csr_rdata = csr_mcycle_rd;
+            eth_rv_pkg::CSR_MINSTRET:     csr_rdata = csr_minstret_rd;
+            eth_rv_pkg::CSR_CYCLE:        csr_rdata = csr_mcycle_rd;
+            eth_rv_pkg::CSR_INSTRET:      csr_rdata = csr_minstret_rd;
+            eth_rv_pkg::CSR_TIME:         csr_rdata = mtime_i;
+            // The identification + environment-configuration floor: four read-only
+            // constants and two FIOM-only registers.
+            eth_rv_pkg::CSR_MVENDORID:    csr_rdata = eth_rv_pkg::MVENDORID_VALUE;
+            eth_rv_pkg::CSR_MARCHID:      csr_rdata = eth_rv_pkg::MARCHID_VALUE;
+            eth_rv_pkg::CSR_MIMPID:       csr_rdata = eth_rv_pkg::MIMPID_VALUE;
+            eth_rv_pkg::CSR_MCONFIGPTR:   csr_rdata = eth_rv_pkg::MCONFIGPTR_VALUE;
+            eth_rv_pkg::CSR_MENVCFG:      csr_rdata = {63'd0, csr_menvcfg_r};
+            eth_rv_pkg::CSR_SENVCFG:      csr_rdata = {63'd0, csr_senvcfg_r};
+            // mhpmcounter3..31 and mhpmevent3..31 fall through to the default: both
+            // read zero (Spike's const_csr_t counters and its zero-mask mevent
+            // registers), and a write to either is legal and drops.
             eth_rv_pkg::CSR_SATP:      csr_rdata = csr_satp_r;
             eth_rv_pkg::CSR_MIP:       csr_rdata = mip_eff;
             // sip sees the delegated pending bits: mip & mideleg (Spike's
@@ -1557,6 +1655,14 @@ module eth_rv_core (
             csr_satp_r     <= 64'd0;
             csr_fflags_r   <= 5'd0;
             csr_frm_r      <= 3'd0;
+            // the counter enables, the inhibit register and the envcfg pair all
+            // reset to zero (Spike's masked_csr_t(…, 0) / envcfg_csr_t(…, 0)); the
+            // counters themselves reset to COUNTER_PRELOAD in their own block
+            csr_mcounteren_r    <= 3'd0;
+            csr_scounteren_r    <= 3'd0;
+            csr_mcountinhibit_r <= 3'd0;
+            csr_menvcfg_r       <= 1'b0;
+            csr_senvcfg_r       <= 1'b0;
         end else if (trap_hit) begin
             if (trap_to_s) begin
                 // Delegated trap: the S-mode stack. SPIE <= SIE, SPP <= the mode
@@ -1674,9 +1780,33 @@ module eth_rv_core (
                     csr_fflags_r <= csr_wdata_fflags;
                     csr_frm_r    <= csr_wdata_frm;
                 end
-                 // misa is WARL read-only in practice, mcounteren/scounteren have a
-                // zero write mask without Zicntr, and a write to the read-only
-                // mhartid never gets here (it traps as an illegal instruction).
+                // The counter enables and the inhibit register: WARL storage with
+                // Spike's masks (0x7/0x7/0x5). The counters themselves are written
+                // by the dedicated block below, because their write lands as the
+                // instruction leaves EX — one stage earlier than the retirement
+                // edge — so that the very next instruction reads the written value
+                // (probe2: `csrw mcycle, 100` then `rdcycle` reads 100).
+                eth_rv_pkg::CSR_MCOUNTEREN: begin
+                    csr_mcounteren_r <= csr_wdata[2:0] & eth_rv_pkg::MCOUNTEREN_WMASK[2:0];
+                end
+                eth_rv_pkg::CSR_SCOUNTEREN: begin
+                    csr_scounteren_r <= csr_wdata[2:0] & eth_rv_pkg::SCOUNTEREN_WMASK[2:0];
+                end
+                eth_rv_pkg::CSR_MCOUNTINHIBIT: begin
+                    csr_mcountinhibit_r <= csr_wdata[2:0] & eth_rv_pkg::MCOUNTINHIBIT_WMASK[2:0];
+                end
+                // menvcfg/senvcfg are FIOM-only: no cache-block or Svpbmt bit is
+                // writable, so a write of all-ones reads back 1 (probe1/probe2).
+                eth_rv_pkg::CSR_MENVCFG: begin
+                    csr_menvcfg_r <= csr_wdata[0] & eth_rv_pkg::MENVCFG_WMASK[0];
+                end
+                eth_rv_pkg::CSR_SENVCFG: begin
+                    csr_senvcfg_r <= csr_wdata[0] & eth_rv_pkg::SENVCFG_WMASK[0];
+                end
+                // misa is WARL read-only in practice, a write to the read-only
+                // mhartid/mvendorid/marchid/mimpid/mconfigptr never gets here (it
+                // traps as an illegal instruction), and a write to a mhpm counter or
+                // event register is legal and drops.
                 default: ;
             endcase
         end else if (ex_fpu_ff_we) begin
@@ -1712,6 +1842,52 @@ module eth_rv_core (
                              | eth_rv_pkg::MSTATUS_SPIE
                              | (csr_mstatus_r[5] ? eth_rv_pkg::MSTATUS_SIE : 64'd0);
             csr_priv_r    <= csr_mstatus_r[8] ? eth_rv_pkg::PRV_S : eth_rv_pkg::PRV_U;
+        end
+    end
+
+    // ---- mcycle / minstret (E2-RV2 increment 4) ----------------------------
+    // Two rules, both measured on the pinned Spike and both needed for exact
+    // parity (local://rv10-counter-notes.md §1.2):
+    //   * an explicit write lands as the instruction leaves EX — the write value
+    //     is registered there, so the NEXT instruction reads exactly what was
+    //     written, and the writing instruction's own retirement does not add one;
+    //   * every other instruction adds one when it retires, i.e. at the MEM -> WB
+    //     edge this block shares with `wb_valid_r`, and only while the counter's
+    //     `mcountinhibit` bit is clear.
+    // A trapping instruction never retires (`mem_retire` is gated by `mem_trap`,
+    // exactly like `wb_valid_r`), so it is not counted — Spike counts only
+    // instructions that advance its pc, which a trap skips (probe4c: an illegal
+    // instruction, a faulted fetch and a faulting load all count zero).
+    // Both counters start at the golden model's boot-ROM count: Spike executes
+    // five instructions before the ELF entry and counts them.
+    assign ex_counter_wr = {ex_csr_we && (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_MINSTRET),
+                            ex_csr_we && (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_MCYCLE)};
+    // The increment decision is taken HERE, in EX, because that is the whole of
+    // `mcountinhibit`'s timing: Spike samples the register once per quantum, a
+    // `csrw mcountinhibit` ends its quantum, and the deferred re-issue of the next
+    // CSR op makes the sampled value the one the instruction was gated by. Sampling
+    // the registered inhibit here reproduces that: the writing instruction still
+    // sees the OLD value (its write registers at the end of this cycle), and every
+    // instruction after it sees the new one. `cor_counters`'s CY block is exactly
+    // the case that caught this: `csrw mcountinhibit, 1` must itself be counted.
+    assign ex_counter_inc = {!(ex_counter_wr[1]) && !csr_mcountinhibit_r[eth_rv_pkg::COUNTER_IR_BIT],
+                             !(ex_counter_wr[0]) && !csr_mcountinhibit_r[eth_rv_pkg::COUNTER_CY_BIT]};
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            csr_mcycle_r   <= eth_rv_pkg::COUNTER_PRELOAD;
+            csr_minstret_r <= eth_rv_pkg::COUNTER_PRELOAD;
+        end else begin
+            if (ex_counter_wr[0]) begin
+                csr_mcycle_r <= csr_wdata;
+            end else if (mem_inc_mcycle) begin
+                csr_mcycle_r <= csr_mcycle_r + 64'd1;
+            end
+            if (ex_counter_wr[1]) begin
+                csr_minstret_r <= csr_wdata;
+            end else if (mem_inc_minstret) begin
+                csr_minstret_r <= csr_minstret_r + 64'd1;
+            end
         end
     end
 
@@ -1988,6 +2164,10 @@ module eth_rv_core (
                 mem_ctrl_r.amo_op     <= ex_ctrl_r.amo_op;
                 mem_ctrl_r.rd_late    <= ex_ctrl_r.rd_late;
                 mem_ctrl_r.is_wfi     <= ex_ctrl_r.is_wfi;
+                // ... and which counters this instruction increments when it
+                // retires (decided in EX, where the inhibit value it was gated by
+                // is still the registered one — E2-RV2 increment 4).
+                mem_ctrl_r.counter_inc <= ex_counter_inc;
                 mem_rd_r         <= ex_rd_r;
                 mem_wb_pre_r     <= ex_wb_pre;
                 mem_addr_r       <= ex_alu_res;      // load/store address

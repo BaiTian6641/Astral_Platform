@@ -50,7 +50,7 @@ from pathlib import Path
 from rv_image import load_elf_image
 from rv_trace import Commit, TraceFormatError, format_trace
 
-DEFAULT_ISA = "rv64imafdc_zicsr"
+DEFAULT_ISA = "rv64imafdc_zicsr_zicntr"
 """ISA string the corpus is built for (RV-C: RV64IMAFDC + Zicsr, no MMU).
 
 I|M|A|F|D|C|S|U is what the core advertises in ``misa`` (0x800000000014112d).

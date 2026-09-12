@@ -136,6 +136,7 @@ module eth_rv_mmio_mux #(
     // ---- CLINT: interrupt lines to the hart + the hart's step strobe ----
     output logic        msip_o,     // machine software interrupt pending
     output logic        mtip_o,     // machine timer interrupt pending
+    output logic [63:0] mtime_o,    // the CLINT's mtime register: the `time` CSR
     input  logic        step_i      // one pulse per instruction that left EX
 );
 
@@ -190,6 +191,7 @@ module eth_rv_mmio_mux #(
         .rdata_o      (clint_rdata),
         .msip_o       (msip_o),
         .mtip_o       (mtip_o),
+        .mtime_o      (mtime_o),
         .step_i       (step_i)
     );
 
@@ -295,6 +297,7 @@ module eth_rv_clint #(
     output logic [63:0] rdata_o,     // eight bytes at (addr_i & ~7)
     output logic        msip_o,      // machine software interrupt pending
     output logic        mtip_o,      // machine timer interrupt pending
+    output logic [63:0] mtime_o,     // the register itself: the hart's `time` CSR
 
     input  logic        step_i       // one pulse per instruction that left EX
 );
@@ -411,6 +414,13 @@ module eth_rv_clint #(
     assign mtimecmp_eff = mtimecmp_wr ? mtimecmp_next : mtimecmp_r;
     assign msip_o       = msip_next;
     assign mtip_o       = (mtime_r >= mtimecmp_eff);
+    // The register a `rdtime` must see: the hart samples it while the reading
+    // instruction is in EX, which is the same value the D-port load of MTIME_BASE
+    // returns to that instruction (see the adjustment note above and
+    // local://rv10-counter-notes.md §1.4). Deliberately the RAW register, not
+    // `mtime_rd`: the load's -1-step adjustment compensates for reading in MEM,
+    // one cycle after the CSR read's EX.
+    assign mtime_o      = mtime_r;
 
     // ---------------------------------------------------------------- state
     always_ff @(posedge clk_i or negedge rst_ni) begin

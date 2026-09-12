@@ -10,7 +10,8 @@
  *     MXR|TVM|TW|TSR), SD derived from FS, MPP legalization (2'b10 -> U)
  *   * sstatus is a view of mstatus: a write through it touches only S bits
  *   * mtvec/stvec clear bit 1 (MODE), sepc/mepc clear bit 0 (IALIGN = 16)
- *   * medeleg/mideleg write masks (0xb3fe / 0x222)
+ *   * medeleg/mideleg write masks (0x8b3fe / 0x222 — bit 19 is Zicntr's
+ *     hardware-error delegation bit, which is WARL storage here)
  *   * mcounteren/scounteren exist but have a zero write mask without Zicntr
  *   * mip at reset: MTIP is pending (the CLINT's mtime and mtimecmp are both 0)
  *   * mret from M to S: MIE <= MPIE, MPIE <= 1, MPP <= U, the hart enters S
@@ -125,7 +126,7 @@ main:
   li      t0, -1
   csrw    medeleg, t0
   csrr    t0, medeleg
-  CK      t0, 0x000000000000b3fe, 13
+  CK      t0, 0x000000000008b3fe, 13
   csrw    medeleg, zero
   csrw    mideleg, t0
   csrr    t0, mideleg
@@ -144,14 +145,16 @@ main:
   csrw    scause, zero
   csrw    stval, zero
   csrw    sscratch, zero
-  /* mcounteren/scounteren are legal but have a zero write mask without Zicntr */
+  /* mcounteren/scounteren are WARL 0x7 since Zicntr landed (E2-RV2 increment 4):
+     the mask is Spike's `counteren_mask`, so an all-ones write reads back
+     CY|TM|IR (local://rv10-counter-notes.md §1.1). */
   li      t0, -1
   csrw    mcounteren, t0
   csrr    t0, mcounteren
-  CK      t0, 0, 18
+  CK      t0, 7, 18
   csrw    scounteren, t0
   csrr    t0, scounteren
-  CK      t0, 0, 19
+  CK      t0, 7, 19
 
   /* ---- 4. mip: MTIP pending at reset (CLINT mtime = mtimecmp = 0) ------- */
   csrr    t0, mip

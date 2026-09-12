@@ -133,7 +133,7 @@ debugging.
 ## Golden side: Spike
 
 `--elf ELF` runs Spike as
-`spike --isa=rv64imafdc_zicsr -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
+`spike --isa=rv64imafdc_zicsr_zicntr -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
 Two details matter and are handled for you:
 
 * **A trapping instruction is not committed.** Spike logs the exception
@@ -195,7 +195,7 @@ produce, memory stream included.
 ## Corpus
 
 The corpus grew program by program; the eighteen self-checking bare-metal programs
-below are built the same way (`-march=rv64imafdc_zicsr -mabi=lp64 -nostdlib
+below are built the same way (`-march=rv64imafdc_zicsr_zicntr -mabi=lp64 -nostdlib
 -mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
 `corpus/crt0.S`). The eight this section started with are tabulated here; the ten
 added by later increments each have their own section below (`cor_priv`,
@@ -219,7 +219,7 @@ Spike exit status *and* as a divergent trace. `-mcmodel=medany` is required:
 absolute `lui` addressing cannot materialize `0x8000_xxxx` on RV64, where `lui`
 sign-extends from bit 31.
 
-The corpus is built with `-march=rv64imafdc_zicsr`: the RTL implements `I`, `M`,
+The corpus is built with `-march=rv64imafdc_zicsr_zicntr`: the RTL implements `I`, `M`,
 `A` (lr/sc/amo — `cor_atomic`), `F`/`D` (`cor_fp`, `cor_fptrap`) and `C`, plus
 `wfi`, and `Zicsr` is no longer implied by `I` in binutils (`cor_csr`/`cor_trap`
 need it spelled out). Spike enables `zicsr` for that string by default, so the
@@ -232,7 +232,7 @@ Toolchain note: `riscv64-unknown-elf-gcc 13.2.0` is a full RV64 toolchain
 is **no `rv64imafdc` multilib distinct from `rv64gc`** — C rides along with the
 atomic/FP strings. That does
 not matter here because the corpus is `-nostdlib -nostartfiles -ffreestanding`:
-`-march=rv64imafdc_zicsr -mabi=lp64` compiles and links as-is. If a future corpus program
+`-march=rv64imafdc_zicsr_zicntr -mabi=lp64` compiles and links as-is. If a future corpus program
 needs libc/libgcc, build it for `rv64imac` (or add a multilib) — Spike and the
 harness take the ISA string from `--isa`, so nothing else changes.
 
@@ -426,7 +426,7 @@ rv_difftest.py (--elf ELF | --golden TRACE) --dut SPEC [options]
   --dut SPEC              dump:PATH | model:PATH | callback:MODULE:FUNC
   --dut-path DIR          extra sys.path entry for callback: adapters (repeatable)
   --inject INDEX:FIELD=VALUE   corrupt one DUT commit (pc|rd|value|cycle; repeatable)
-  --isa NAME              Spike --isa string (default rv64imafdc_zicsr)
+  --isa NAME              Spike --isa string (default rv64imafdc_zicsr_zicntr)
   --spike PATH            Spike binary (default: $RV_DIFFTEST_SPIKE, repo build, $PATH)
   --timeout SECONDS       Spike run timeout (default 300)
   --max-commits N         compare only the first N commits
@@ -506,7 +506,7 @@ needs a `Makefile` change.
 
 The RV-B core grows the M/S/U privilege machine and the trap machinery RV-C needs.
 Everything below is DiffTest-verified against the pinned Spike
-(`--isa=rv64imafdc_zicsr`, which enables S and U), not asserted.
+(`--isa=rv64imafdc_zicsr_zicntr`, which enables S, U and Zicntr), not asserted.
 
 **What is implemented**
 
@@ -567,11 +567,9 @@ comparison is silently weakened):
   boundaries the wait has (a pending-but-masked source still ends it; a WFI whose
   boundary already has a deliverable interrupt never commits) and the RTL's stall
   is covered formally (`cover(wfi_wait)`) instead.
-* **Counters**: `cycle`/`time`/`instret` do **not exist** in Spike under
-  `--isa=rv64imafdc_zicsr` (no Zicntr) — the RTL rejects them as illegal too, which is
-  why `mcounteren`/`scounteren` exist with a zero write mask and read 0. Spike's
-  *machine* `mcycle`/`minstret` do exist under that ISA; they are its own
-  step/cycle counters and are not implemented.
+* **Counters**: implemented since E2-RV2 increment 4 — see the "Counters, their
+  enables and the identity/envcfg floor" section below, which also records what
+  about them is and is not comparable.
 * **MEIP** has no source: Spike's default configuration has no PLIC, so the core's
   `meip_i` is tied low and `mip.MEIP` stays 0. The other five sources are all
   exercised.
@@ -762,7 +760,7 @@ python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_wfi --dram
   before an S-mode `wfi`.
 * **U-mode `wfi`** is an illegal instruction in the RTL (the architectural rule once S is
   implemented), while the pinned Spike does not trap it: its check is guarded by
-  `extension_enabled('S')`, and `rv64imafdc_zicsr` does not enable S. The corpus never runs
+  `extension_enabled('S')`, and the ISA string before increment 4 (`rv64imafdc_zicsr`) did not enable S. The corpus never runs
   U-mode `wfi`, and the difference is stated rather than hidden.
 * **`mtime` after a trap** remains the documented boundary from `cor_time`: the corpus only
   ever arms MTIP with 0 (always pending) or all-ones (never pending).
@@ -774,3 +772,98 @@ python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_wfi --dram
 | `--fault 30:value=0xdeadbeef` | `DIVERGENCE (value_mismatch) at commit #30` — the register stream is live on the new program |
 | `--fault 30:mem_wdata=0xdeadbeef` | `DIVERGENCE (mem_addr_mismatch) at commit #30` — the memory stream is live |
 | `--fault 213:mem_wdata=0x1234` | `DIVERGENCE (mem_wdata_mismatch) at commit #213`, pc `0x…34e` — an **AMO's** written value is compared, not just a store's |
+
+## Counters, their enables and the identity/envcfg floor (E2-RV2 increment 4)
+
+`cycle`/`time`/`instret` exist now, with the whole floor firmware needs before an
+S-mode handoff: the two machine counters `mcycle`/`minstret` (writable, WARL-free
+64-bit), the user proxies, the three enable registers (`mcounteren` 0x7,
+`scounteren` 0x7, `mcountinhibit` 0x5 — Spike's `counteren_mask` and the inhibit
+register's "no TM bit"), the identity CSRs (`mvendorid` 0, `marchid` 5, `mimpid`
+0, `mconfigptr` 0, `mhartid` 0), `menvcfg`/`senvcfg` (FIOM-only, mask 0x1) and the
+zero-valued `mhpmcounter3..31` / `mhpmevent3..31` floor (writes dropped). Every
+number and mask was probed on the pinned Spike **before** the RTL was written; the
+probe table is `'/home/polar/.omp/agent/sessions/-Astral_Platform/2026-09-11T03-58-45-190Z_01a08e9e-29c6-75d1-b24f-7a9de22d7187/local/rv10-counter-notes.md'` (golden configuration, masks,
+semantics, permissions, PMP) and `docs/reports/report-E2-RV2-linux-gap-20260912.md`
+is the slice plan.
+
+**The golden ISA string is now `rv64imafdc_zicsr_zicntr`** — the pinned Spike's
+`mcounteren`/`scounteren` are RAZ/WI without `zicntr`, and `cycle`/`time`/
+`instret` do not exist at all, so the whole floor is unobservable under the old
+string. The bump is ISA-visible in two more places, both updated in the same
+change: `medeleg`'s write mask gains bit 19 (Spike adds the hardware-error
+delegation bit exactly when Zicntr is on) and the two counteren masks become 0x7.
+`cor_priv` (mask expectations), `cor_deleg` and `cor_pgfault` (the `medeleg` mask)
+assert those, and were updated — the fixture trap this slice's brief warned about.
+
+**What the counters are compared on.** Both the RTL and Spike count *retired*
+instructions: a trapping instruction is never counted (probed four ways: illegal,
+fetch fault, load access fault, ecall), the writing instruction does not add one
+to the counter it wrote, and `mcountinhibit.CY`/`.IR` stop `mcycle`/`minstret`
+respectively from the instruction *after* the write. The RTL takes each
+instruction's increment decision in EX (so the `csrw mcountinhibit` that closes a
+gate is still counted, exactly as Spike's per-quantum sampling does) and applies
+it at the retirement edge; a reader one stage behind adds the MEM slot's pending
+increment, which makes the committed value the "count of instructions retired
+before this one" Spike reports. Both counters start at Spike's five-instruction
+boot ROM (`COUNTER_PRELOAD`, the same trick `eth_rv_clint` already used for
+`mtime`), so **absolute** `cycle`/`instret` values are comparable, not just deltas.
+
+`time` is not a hart-side counter at all: it is the CLINT's `mtime` register,
+exported beside the interrupt lines and sampled by the reading instruction's EX
+stage. The CSR and a load of `0x200_bff8` are one value function of the
+instruction index — measured over 1300 iterations, they differ only in the single
+instruction a tick lands on.
+
+**Boundaries — what is deliberately NOT compared** (each with its reason):
+
+* **`time` after a trap.** A trap ends Spike's step early (`n = instret`), which
+  shifts the tick phase in a way no hart-side counter reproduces. The staircase
+  loop of `cor_counters` therefore runs *before* the first trap, and every legal
+  counter read *after* a trap reads with `rd = x0` (the access still has to pass
+  the permission check, but no tick-sensitive value is committed). This is not
+  theoretical: the first version of the program read `rdtime` after its
+  permission traps and diverged by exactly two ticks (`golden 0x12c` vs
+  `dut 0x64`) — the boundary is where the RTL and Spike really part company.
+* **The boot sequence.** `COUNTER_PRELOAD` and `eth_rv_clint`'s `STEP_PRELOAD`
+  assume Spike's five-instruction boot ROM before the ELF entry. An SoC whose
+  pre-ELF boot differs must move both together; they are the single place the
+  "counters include the boot ROM" assumption lives.
+* **PMP stays trapping.** `pmpcfg*`/`pmpaddr*` are *not* implemented: the core
+  enforces no PMP, so mirroring Spike's storage (region 0 resets to "allow all",
+  which is why no earlier corpus program noticed) would turn a loud illegal
+  instruction into a silent divergence for firmware that relies on the
+  configuration. A faithful implementation needs the L-bit locking and `mseccfg`
+  (both probed: a `pmpcfg0 = -1` write locks regions 0..7 and a following write is
+  dropped) — a feature slice, not a WARL mask.
+* **`mhpmcounter`/`mhpmevent`** read zero and swallow writes (Spike's
+  `const_csr_t(0)` and zero-mask `mevent_csr_t`). They have no counting behaviour
+  to compare.
+* **The RV32-only halves and the Zihpm proxies stay illegal** on RV64:
+  `mcycleh`, `minstreth`, `mstatush`, `menvcfgh`, `senvcfgh`, `pmpcfg1`,
+  `pmpcfg3`, `hpmcounter3`, `hpmcounter3h` — all pinned by `cor_csrid`.
+
+**Corpus additions** (both self-checking, both `rc = 0` under Spike first):
+
+* `cor_counters` — the enable masks, exact writes while inhibited, deltas, the
+  CY/IR gating, the trap-free `time`+`mtime` staircase (1450 iterations, crossing
+  two ticks), the read-only-proxy rule, the S-mode `mcounteren` gate and four
+  U-mode `scounteren` excursions driven by an `ecall` switch in the M-mode
+  handler. 10928 commits, 24 traps, MATCH on both D-port paths.
+* `cor_csrid` — identity/envcfg/HPM round trips, the illegal-half CSR list, the
+  S-mode view of `senvcfg` vs `menvcfg`. 437 commits, 16 traps, MATCH on both
+  paths.
+
+**Negative controls for this slice** (`--fault`, see the CLI reference):
+
+| control | result |
+|---|---|
+| `--only cor_counters --fault 43:value=0xdeadbeef` | `DIVERGENCE (value_mismatch) at commit #43` — an `mcycle` read is compared |
+| `--only cor_counters --fault 109:value=0x1234` | `DIVERGENCE (value_mismatch) at commit #109` — a `time` (CLINT `mtime`) read is compared |
+| `--only cor_csrid --fault 18:value=0xbad` | `DIVERGENCE (value_mismatch) at commit #18` — an identification read is compared |
+
+The permission gate has a control of its own, observed rather than injected: the
+first RTL revision applied `mcounteren` to M-mode as well, and `cor_counters`
+caught it immediately (`1 traps` instead of 24, `DIVERGENCE (pc_mismatch) at
+commit #48` on the `rdcycle` right after the S-mode handler). No RTL knob was
+added for it — the corpus's own check is the control.

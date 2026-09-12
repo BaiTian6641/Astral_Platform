@@ -19,7 +19,8 @@
  *   * a page fault raised in U-mode is delegated too (SPP = U) and the U-mode
  *     code continues after the `sret`
  *   * a trap raised IN M-mode is never delegated, whatever `medeleg` says
- *   * `medeleg`'s write mask keeps exactly 1..9, 12, 13 and 15
+ *   * `medeleg`'s write mask keeps exactly 1..9, 12, 13, 15 and 19 (the last
+ *     one is Zicntr's hardware-error delegation bit, added by the ISA bump)
  *
  * Registers: the M-mode handler owns t0..t5, s0, s2, s3, s9, s10, s11 and a0;
  * the S-mode handler reads s0/s2/s3/s4/s5 and writes only t0 (so t1/t4 survive it
@@ -118,7 +119,7 @@ main:
   li      t0, -1
   csrw    medeleg, t0
   csrr    t0, medeleg
-  CK      t0, 0x000000000000b3fe, 1
+  CK      t0, 0x000000000008b3fe, 1
   li      t0, 0xb000              /* exactly 12 / 13 / 15 */
   csrw    medeleg, t0
   csrr    t0, medeleg

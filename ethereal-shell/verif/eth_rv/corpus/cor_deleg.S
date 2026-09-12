@@ -65,8 +65,8 @@ main:
   /* ---- 2. ecall from M: cause 11, and bit 11 is not even writable ------ */
   li      t0, -1
   csrw    medeleg, t0
-  csrr    t0, medeleg             /* the full core mask is 0xb3fe */
-  CK      t0, 0x000000000000b3fe, 2
+  csrr    t0, medeleg             /* the full core mask is 0x8b3fe (Zicntr -> bit 19) */
+  CK      t0, 0x000000000008b3fe, 2
   li      t0, 0x80
   csrw    medeleg, t0             /* 0x80 = cause 7 only */
   NEXTM   11, 0, 0x0000000a00001800, 3

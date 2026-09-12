@@ -39,7 +39,7 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_OUT_DIR = REPO_ROOT / "generated" / "rv_difftest" / "corpus"
 
 TOOLCHAIN_PREFIX = "riscv64-unknown-elf-"
-MARCH = "rv64imafdc_zicsr"
+MARCH = "rv64imafdc_zicsr_zicntr"
 """ISA the corpus is built for: RV64IMAFDC + the CSR instructions.
 
 ``I``/``M``/``A``/``F``/``D``/``C`` are what the core implements and advertises in

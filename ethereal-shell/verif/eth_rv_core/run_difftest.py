@@ -123,6 +123,12 @@ CORPUS_PROGRAMS = [
     # extension" and "wfi").
     "cor_atomic",
     "cor_wfi",
+    # E2-RV2 increment 4: Zicntr with the counter enables and the inhibit
+    # register (`cor_counters`: the trap-free `time` staircase, the mcycle/
+    # minstret write and inhibit rules, the deltas, and the S/U permission
+    # chain) plus the identification/envcfg/HPM floor (`cor_csrid`).
+    "cor_counters",
+    "cor_csrid",
 ]
 
 HELLO_STRING = b"hello, eth_rv!\n"

@@ -6,8 +6,12 @@
 //              E2-RV2 increment 2 the MMU is Sv39-only (cor_mmu) and the F/D
 //              floating-point extensions are implemented (cor_fpu), so `misa`
 //              advertises I/M/A/F/D/C, and `wfi` plus the A extension (lr/sc/amo) are implemented
-//              (E2-RV2 increment 3). The M-mode CSR + trap path is the minimal set
-//              of C14 §3. Every
+//              (E2-RV2 increment 3), and Zicntr with the identification/envcfg CSR
+//              floor firmware needs for an S-mode handoff is in place (increment 4:
+//              `cycle`/`time`/`instret` over `mcycle`/`mtime`/`minstret`,
+//              `mcounteren`/`scounteren`/`mcountinhibit`, `mvendorid`/`marchid`/
+//              `mimpid`/`mconfigptr`/`menvcfg`/`senvcfg`). The M-mode CSR + trap path
+//              is the minimal set of C14 §3. Every
 //              pipeline-control field travels as one packed struct (`ctrl_t`) so the
 //              IF->ID->EX->MEM->WB registers stay flat vectors and the core lints
 //              clean under `-Wall`.
@@ -113,6 +117,27 @@ package eth_rv_pkg;
     localparam logic [11:0] CSR_SCAUSE     = 12'h142;
     localparam logic [11:0] CSR_STVAL      = 12'h143;
     localparam logic [11:0] CSR_SIP        = 12'h144;
+    // ------------------------------- Zicntr + the identity/envcfg floor (E2-RV2 inc. 4)
+    // The counters, their enables and the identification / environment-configuration
+    // set. Every value and mask below is the pinned Spike's, measured with
+    // `--isa=rv64imafdc_zicsr_zicntr` (commit 1e05ddac) BEFORE this RTL was
+    // written; the probe table is in `local://rv10-counter-notes.md` and the
+    // README's "Counters and the CSR floor" section. The RV32-only halves
+    // (`mcycleh`/`minstreth`/`mstatush`/`menvcfgh`/`senvcfgh`) are deliberately
+    // absent: on RV64 the golden model traps them, so implementing one would be a
+    // divergence rather than a courtesy.
+    localparam logic [11:0] CSR_MVENDORID     = 12'hf11;
+    localparam logic [11:0] CSR_MARCHID       = 12'hf12;
+    localparam logic [11:0] CSR_MIMPID        = 12'hf13;
+    localparam logic [11:0] CSR_MCONFIGPTR    = 12'hf15;
+    localparam logic [11:0] CSR_MENVCFG       = 12'h30a;
+    localparam logic [11:0] CSR_SENVCFG       = 12'h10a;
+    localparam logic [11:0] CSR_MCOUNTINHIBIT = 12'h320;
+    localparam logic [11:0] CSR_MCYCLE        = 12'hb00;
+    localparam logic [11:0] CSR_MINSTRET      = 12'hb02;
+    localparam logic [11:0] CSR_CYCLE         = 12'hc00;
+    localparam logic [11:0] CSR_TIME          = 12'hc01;
+    localparam logic [11:0] CSR_INSTRET       = 12'hc02;
 
     // ------------------------------------------------------- privilege levels
     // The hart supports U, S and M: `misa` advertises S and U, and the golden
@@ -178,12 +203,45 @@ package eth_rv_pkg;
     localparam logic [63:0] MIP_SW_WMASK  = 64'h0000_0000_0000_0222;  // mip: SSIP|STIP|SEIP
     localparam logic [63:0] MIP_SIP_WMASK = 64'h0000_0000_0000_0002;  // sip: SSIP only
     localparam logic [63:0] MIE_WMASK     = 64'h0000_0000_0000_0aaa;  // SSIE MSIE STIE MTIE SEIE MEIE
-    localparam logic [63:0] MEDELEG_WMASK = 64'h0000_0000_0000_b3fe;  // 1..9, 12, 13, 15
+    // 1..9, 12, 13, 15 and — since the golden ISA string enables Zicntr — bit 19:
+    // Spike adds `1 << CAUSE_HARDWARE_ERROR_FAULT` to medeleg's write mask exactly
+    // when Zicntr is on (csrs.cc `medeleg_csr_t::unlogged_write`). It is WARL
+    // storage here: eth_rv raises no hardware-error fault.
+    localparam logic [63:0] MEDELEG_WMASK = 64'h0000_0000_0008_b3fe;
     localparam logic [63:0] MIDELEG_WMASK = 64'h0000_0000_0000_0222;  // SSI, STI, SEI
     // mtvec/stvec keep MODE bit 0 and clear bit 1 (Spike's tvec_csr_t); mepc/sepc[0]
     // is read-only zero (IALIGN = 16).
     localparam logic [63:0] MEPC_MASK     = 64'hffff_ffff_ffff_fffe;
     localparam logic [63:0] MTVEC_MASK    = 64'hffff_ffff_ffff_fffd;
+    // ------------------------------------------- the Zicntr floor's masks/values
+    // `counteren_mask` in the pinned Spike is `Zicntr ? 0x7 : 0` (it adds
+    // `Zihpm ? 0xffff_fff8 : 0`, and the golden ISA string has no Zihpm), so
+    // mcounteren/scounteren are CY|TM|IR and mcountinhibit is the same mask minus
+    // the timer bit (the inhibit register has no TM bit at all).
+    localparam logic [63:0] MCOUNTEREN_WMASK    = 64'h0000_0000_0000_0007;
+    localparam logic [63:0] SCOUNTEREN_WMASK    = 64'h0000_0000_0000_0007;
+    localparam logic [63:0] MCOUNTINHIBIT_WMASK = 64'h0000_0000_0000_0005;
+    // The user proxies are gated by the bit their own address names (C00/C01/C02 ->
+    // bits 0/1/2 of mcounteren and scounteren, see `csr_counter_bit`), so only the
+    // two inhibit bits mcountinhibit actually has need a name here.
+    localparam int unsigned COUNTER_CY_BIT      = 0;   // mcycle, mcountinhibit.CY
+    localparam int unsigned COUNTER_IR_BIT      = 2;   // minstret, mcountinhibit.IR
+    // menvcfg/senvcfg are FIOM-only: Spike makes FIOM writable exactly when S-mode
+    // and paging both exist, and the other bits belong to extensions this hart
+    // does not have (Zicbom/Zicboz/Svpbmt/Sstc/…). Probe: write -1 reads 0x1.
+    localparam logic [63:0] MENVCFG_WMASK       = 64'h0000_0000_0000_0001;
+    localparam logic [63:0] SENVCFG_WMASK       = 64'h0000_0000_0000_0001;
+    // The identification CSRs are read-only constants; `marchid` is the pinned
+    // Spike's own id (5), not a guess — reading it is a comparable event.
+    localparam logic [63:0] MVENDORID_VALUE     = 64'd0;
+    localparam logic [63:0] MARCHID_VALUE       = 64'd5;
+    localparam logic [63:0] MIMPID_VALUE        = 64'd0;
+    localparam logic [63:0] MCONFIGPTR_VALUE    = 64'd0;
+    // The counters start at the golden model's boot-ROM count, exactly like
+    // `eth_rv_clint`'s STEP_PRELOAD: Spike executes five boot-ROM instructions
+    // before the ELF entry and its mcycle/minstret count them, so a corpus program
+    // that reads `cycle`/`instret` sees the same absolute value on both sides.
+    localparam logic [63:0] COUNTER_PRELOAD     = 64'd5;
 
     // ------------------------------------------------------ exception causes
     // The architectural `mcause` values of the exceptions RV-B can raise
@@ -269,6 +327,25 @@ package eth_rv_pkg;
     // True when `addr` names a CSR this core implements. Anything else is an
     // illegal instruction (C14 §3: unimplemented CSR access NEVER succeeds
     // silently) — matching Spike, which rejects e.g. `mstatush` on RV64.
+
+    // The 29 machine performance counters (0xB03..0xB1F) exist and read zero, with
+    // every write dropped: Spike instantiates each as a `const_csr_t(0)`
+    // (csr_init.cc:88-105). Their *user* proxies (`hpmcounter3`, 0xC03..) are added
+    // only `add_const_ext_csr(EXT_ZIHPM, …)`, and the golden ISA string does not
+    // enable Zihpm — so those stay illegal, a distinction the corpus pins.
+    // Stated as arithmetic ranges rather than 29 `case` items: the yosys frontend
+    // the formal flow reads with handles the comparisons, and the ranges are the
+    // architectural definition anyway.
+    function automatic logic csr_is_mhpmcounter(input logic [11:0] addr);
+        csr_is_mhpmcounter = (addr >= 12'hb03) && (addr <= 12'hb1f);
+    endfunction
+
+    // `mhpmevent3..31` (0x323..0x33F): `mevent_csr_t` with a write mask of 0
+    // (Sscofpmf and Smcntrpmf are both absent), so a write is legal and drops.
+    function automatic logic csr_is_mhpmevent(input logic [11:0] addr);
+        csr_is_mhpmevent = (addr >= 12'h323) && (addr <= 12'h33f);
+    endfunction
+
     // (Members of the package are spelled `eth_rv_pkg::NAME` on purpose: the
     // yosys frontend the formal flow reads with does not resolve a bare
     // package-local name inside a function body, and the qualified form is the
@@ -280,14 +357,43 @@ package eth_rv_pkg;
             eth_rv_pkg::CSR_MCAUSE, eth_rv_pkg::CSR_MTVAL, eth_rv_pkg::CSR_MIP,
             eth_rv_pkg::CSR_MHARTID, eth_rv_pkg::CSR_MEDELEG, eth_rv_pkg::CSR_MIDELEG,
             eth_rv_pkg::CSR_MCOUNTEREN,
+            // E2-RV2 increment 4: the counters, their enables, the inhibit register
+            // and the identification/envcfg floor.
+            eth_rv_pkg::CSR_MVENDORID, eth_rv_pkg::CSR_MARCHID, eth_rv_pkg::CSR_MIMPID,
+            eth_rv_pkg::CSR_MCONFIGPTR, eth_rv_pkg::CSR_MENVCFG,
+            eth_rv_pkg::CSR_SENVCFG, eth_rv_pkg::CSR_MCOUNTINHIBIT,
+            eth_rv_pkg::CSR_MCYCLE, eth_rv_pkg::CSR_MINSTRET,
+            eth_rv_pkg::CSR_CYCLE, eth_rv_pkg::CSR_TIME, eth_rv_pkg::CSR_INSTRET,
             eth_rv_pkg::CSR_FFLAGS, eth_rv_pkg::CSR_FRM, eth_rv_pkg::CSR_FCSR,
             eth_rv_pkg::CSR_SATP,
             eth_rv_pkg::CSR_SSTATUS, eth_rv_pkg::CSR_SIE, eth_rv_pkg::CSR_STVEC,
             eth_rv_pkg::CSR_SCOUNTEREN, eth_rv_pkg::CSR_SSCRATCH, eth_rv_pkg::CSR_SEPC,
             eth_rv_pkg::CSR_SCAUSE, eth_rv_pkg::CSR_STVAL, eth_rv_pkg::CSR_SIP:
                 csr_implemented = 1'b1;
-            default: csr_implemented = 1'b0;
+            // The 29 performance-counter pairs are implemented as zero-valued,
+            // write-dropping registers rather than listed one by one: see the two
+            // range helpers below, which are the architectural definition anyway.
+            default: csr_implemented = eth_rv_pkg::csr_is_mhpmcounter(addr)
+                                       || eth_rv_pkg::csr_is_mhpmevent(addr);
         endcase
+    endfunction
+    // The three user counter proxies: whatever privilege they carry, the golden
+    // model gates them on `mcounteren` (from below M-mode) and, from U-mode, on
+    // `scounteren` as well (counter_proxy_csr_t::verify_permissions).
+    function automatic logic csr_is_counter_proxy(input logic [11:0] addr);
+        csr_is_counter_proxy = (addr == eth_rv_pkg::CSR_CYCLE)
+                               || (addr == eth_rv_pkg::CSR_TIME)
+                               || (addr == eth_rv_pkg::CSR_INSTRET);
+    endfunction
+
+    // Which `mcounteren`/`scounteren`/`mcountinhibit` bit a counter proxy is gated
+    // by: the proxy's low address bits are the counter index (C00/C01/C02 → CY, TM,
+    // IR), exactly the bit `counter_proxy_csr_t::myenable` shifts out. The argument
+    // is those two bits rather than the whole address so the function reads exactly
+    // the bits it uses (a 12-bit argument would leave ten of them unused, which
+    // `-Wall` rejects).
+    function automatic logic [2:0] csr_counter_bit(input logic [1:0] idx);
+        csr_counter_bit = 3'd1 << idx;
     endfunction
 
     // The privilege level a CSR belongs to is address bits [9:8] (00 = U, 01 =
@@ -570,6 +676,15 @@ package eth_rv_pkg;
         amo_op_e   amo_op;       // which amo.* operation the write beat stores
         logic      rd_late;      // see ctrl_t: MEM->EX bypass of a late rd
         logic      is_wfi;       // wfi: MEM holds the instruction until mip & mie
+        // Which machine counters this instruction increments when it retires
+        // (E2-RV2 increment 4): bit 0 = mcycle, bit 1 = minstret. The decision is
+        // made in EX, where `mcountinhibit` still holds the value the instruction
+        // itself was gated by — a `csrw mcountinhibit` must be counted under the
+        // OLD inhibit value, exactly as the golden model samples it at the start
+        // of the quantum it ends. A counter the instruction writes is marked 0
+        // here (the write lands in EX) and a younger reader adds this pending bit
+        // to its own value.
+        logic [1:0] counter_inc;
     } mem_ctrl_t;
 
 endpackage

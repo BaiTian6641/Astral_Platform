@@ -285,6 +285,7 @@ module tb_eth_rv_core;
     logic        msip;
     logic        mtip;
     logic        step_strobe;
+    logic [63:0] clint_mtime;   // the CLINT's mtime register == the `time` CSR
 
     eth_rv_core u_dut (
         .clk_i           (clk),
@@ -306,6 +307,7 @@ module tb_eth_rv_core;
         .msip_i          (msip),
         .mtip_i          (mtip),
         .meip_i          (1'b0),          // no PLIC in the golden model either
+        .mtime_i         (clint_mtime),   // the `time` CSR's source (E2-RV2 inc. 4)
         .rvfi_valid_o    (rvfi_valid),
         .rvfi_order_o    (rvfi_order),
         .rvfi_pc_o       (rvfi_pc),
@@ -366,6 +368,7 @@ module tb_eth_rv_core;
         .uart_overflow_o(uart_overflow),
         .msip_o         (msip),
         .mtip_o         (mtip),
+        .mtime_o        (clint_mtime),
         .step_i         (step_strobe)
     );
 

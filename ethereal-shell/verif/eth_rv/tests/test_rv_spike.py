@@ -146,7 +146,7 @@ def test_wfi_commits_with_no_register_and_no_memory() -> None:
 def test_spike_command_is_pinned_to_the_corpus_flags(tmp_path: Path) -> None:
     argv = build_spike_command("/opt/spike", "prog.elf", isa=DEFAULT_ISA, log_path=tmp_path / "l.log")
     # the ISA whose misa advertises I|M|A|F|D|C|S|U (0x8000_0000_0014_112d)
-    assert DEFAULT_ISA == "rv64imafdc_zicsr"
+    assert DEFAULT_ISA == "rv64imafdc_zicsr_zicntr"
     assert argv[1] == f"--isa={DEFAULT_ISA}"
     assert "--log-commits" in argv
     assert argv[0] == "/opt/spike"
