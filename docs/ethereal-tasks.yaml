@@ -690,7 +690,7 @@ tasks:
     est_days: 10
     deliverable: bmc-fw/migration/
     acceptance: region 间迁移演示通过
-    status: todo
+    status: in_progress   # 2026-09-13 启动: 依赖 E2-FAB3 已完成；基于既有原语（ctx-scan 暂停/READBACK/带锁与 CRC 门的部署/恢复/退役）实现区域间迁移与抢占 + 碎片整理 v1（可检查的碎片度指标 + 违规拒绝路径），并要求迁移后容器可观测行为一致 + 故意故障必须被拒（检查可失败）
 
   - id: E3-SEC2
     title: 安全 v2（虚拟配置静态检查钩子 + 异常功耗/时序监控）
