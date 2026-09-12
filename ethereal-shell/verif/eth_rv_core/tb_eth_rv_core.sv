@@ -572,6 +572,16 @@ module tb_eth_rv_core;
     logic        meip;
     logic        seip;
     logic        step_strobe;
+    // S4/Linux profile: the CLINTs mtime must keep advancing while the hart sits in
+    // `wfi` (an idle CPU retires no instructions), so the tick strobe comes from the
+    // simulation clock rather than from retirements — mtime then advances once per
+    // cycle, which is what a real free-running counter does. The corpus keeps the
+    // retirement strobe so its cadence still matches Spike.
+    `ifdef ETH_RV_CLINT_CYCLE_STEP
+        wire clint_step = 1'b1;
+    `else
+        wire clint_step = step_strobe;
+    `endif
     logic [63:0] clint_mtime;   // the CLINT's mtime register == the `time` CSR
     logic [63:0] rom_entry;     // the payload entry the BootROM will jump to
     logic [13:0] rom_steps;     // the stub's instruction count, from the ROM image
@@ -678,7 +688,7 @@ module tb_eth_rv_core;
         .meip_o         (meip),
         .seip_o         (seip),
         .mtime_o        (clint_mtime),
-        .step_i         (step_strobe),
+        .step_i         (clint_step),
         .rom_entry_o    (rom_entry),
         .rom_steps_o    (rom_steps)
     );

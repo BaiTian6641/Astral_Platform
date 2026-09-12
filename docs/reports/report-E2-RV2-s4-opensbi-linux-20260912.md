@@ -456,7 +456,49 @@ ETH_RV_TB: trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883
 检测到的东西）。也就是说：**S4 的唯一阻塞点已经消除**，内核越过了此前必死的
 `check_unaligned_access_all_cpus()`，继续正常初始化。
 
-**运行状态（本轮预算结束时，如实记录）**
+**跑完的 beat 运行结果（2026-09-12 22:13，`--max-cycles=4000000000`）：**
+
+```
+ETH_RV_TB: FAIL cycle budget exceeded (4000000001 cycles, pc=0x0000000080a9e7c8)
+ETH_RV_TB_INFO: console marker (28 bytes) NOT seen (10544 console bytes received)
+ETH_RV_TB: FAIL stopped at 552228689 commits after 4000000002 cycles
+# uart record: bytes 10544, frames 10544, errors 0, overflow 0, drain 0,
+#              gap_min 160, gap_max 1412821530 cycles
+```
+
+* **cycles 4,000,000,002 / commits 552,228,689 / 控制台 10,544 B（golden 11,928 的 88%）
+  / 墙钟 ~107 min（20:26:30→22:13:47）**；**里程碑未命中，不宣称命中**。
+* 控制台最后一行（无 oops、无 panic）：
+  `[   49.013933] printk: legacy bootconsole [ns16550a0] disabled` —— 内核刚把
+  printk 切到真正的 UART 控制台（golden 同一位置在 10,296 B 处）。
+* **停止点符号化**：TB 打印的是**物理**取指地址，内核 text 的映射是
+  `vaddr = 0xffffffff80000000 + (phys - 0x80200000)`，故
+  `0x80a9e7c8 → 0xffffffff8089e7c8 → **arch_cpu_idle+0x10**`（即停拍时 hart 在
+  idle 循环里）。
+* traps / page faults 计数**不可得**：TB 只在 PASS 行里打印它们，预算 FAIL 行没有
+  （修前 1.1e9 周期那次 `+trace_traps` 记到 12,825 条 trap，量级参考）。uart 记录的
+  成帧统计是全的（0 error / 0 overflow ✓）。
+
+**新的阻塞点（与修前完全不同的性质，如实归因）**：控制台在“切到 ttyS0 正式控制台”
+之后再无输出，而 hart 停在 `arch_cpu_idle` ⇒ 内核**在 idle 里等一个再也不会到的
+中断**。机制上这与 S4 档的时基口径直接相关：`mtime` 现在是**按退休指令数**推进
+（`CLINT_RTC_TICK_STEPS/ADVANCE = 1/1`，`step_o` 只在有指令离开 EX 时脉冲），而
+`wfi` 期间没有指令退休 ⇒ **mtime 冻住** ⇒ 内核任何 `msleep`/`schedule_timeout`
+都永远醒不过来。前面的 `udelay` 之所以能过，是因为它是**忙等**（照样退休指令、
+照样推进 mtime，修前那次 trap 列表里满屏的 MTI/STI 就是这个）；真正的 idle/sleep
+第一次出现（本节这次运行）就把 boot 卡死。uart 记录的 `gap_max = 1.41e9` 周期也
+说明这条路径上确实存在超长空档。
+
+**建议的下一步（未执行，留给下一轮）**：
+1. **把 S4 档的 CLINT 从“按指令”改成“按仿真周期”驱动**（TB 侧即可：`step_i` 用
+   周期计数脉冲，RTL 不动；语法频仍用 `timebase-frequency` 标定），这样 `wfi`
+   期间 mtime 照走、定时器能唤醒 idle；
+2. 若只想先看到里程碑，可把预算提到 `--max-cycles=6000000000`（本运行花了
+   4e9 周期到 88% 控制台，其中 ~1.4e9 周期耗在内核的非对称密钥校验上——这是
+   无 TLB 带来的吞吐代价，不是正确性）；
+3. `--dram` 仍**未跑**（串行约束），命令见下。
+
+**（历史）预算中段的运行状态**
 
 | 运行 | 命令 | 状态 |
 |---|---|---|
@@ -483,3 +525,11 @@ RTL，无需 `--rebuild`；`s4.uart` 会被新运行覆盖，如需保留先复�
 3. Spike 探针：已做并记录（见 `local://rv13-s4-notes.md` §1c 的表）；此前"合成
    S 模式 MPRV 场景对不上 Spike"的结论不适用于本程序——`cor_mprv` 的 MPRV 访问在
    **M 模式**直接做，Spike 完全可复现，S 模式部分只需要 `medeleg = 0`。
+
+## 追补五：`mtime` 在 `wfi` 期间冻结（本轮最后定位到的一环）
+
+RvIncr13 的结论与本轮复现：4e9 周期运行停在 **`arch_cpu_idle+0x10`**（把 TB 报的**物理**取指地址换算为 vaddr：`vaddr = 0xffffffff80000000 + (phys - 0x80200000)`，下同），控制台最后一行为 `[0.019815] sched_clock: 64 bits at 130kHz`，`gap_max` 达 **282,863,563 周期** ⇒ 内核在等一个永远不会到的定时器。根因：`mtime` 由 `step_o`（退休指令脉冲）推进 ⇒ **`wfi` 期间 mtime 冻结** ⇒ 忙等型 `udelay` 能过，第一次真正的 sleep/idle 就挂死。
+
+修复（TB 级，`-DETH_RV_CLINT_CYCLE_STEP`，语料档不启用）与配套：`mtime` 改由**仿真周期**推进（真实自由运行计数器的行为）；DTB 的 `timebase-frequency` 必须在**重新生成镜像**后才是 130000（此前多轮用的是旧 DTB 的 10 MHz —— `--rebuild` 只重建 Verilator 模型，**不会**重建 DTB/ROM；`dtc -I dtb -O dts` 已确认现在为 `0x1fbd0`）。效果：控制台到达 5,865 B 只需 ~8 分钟（此前 100 分钟才 10,544 B），且内核明确接受时基（`sched_clock: 64 bits at 130kHz` + 可用的 `riscv_clocksource`）。
+
+**仍未达里程碑**：本轮最新一次运行停在 **`jiffies_read+0x6`**（同一换算），即内核在**忙等 tick（jiffies）** ⇒ **定时中断未再触发**（此前 MTI/STI 风暴证明投递通路本身可用）。下一步：在该点打印 `mtime`/`mtimecmp`/`mip`/`mie`/`mideleg` 与最后一次 `sbi_set_timer` 的实参（SBI ecall 的 a0/a1 可从 trap 记录恢复），判定是"内核把 deadline 设得过远"还是"我们写的 mtimecmp 未被 CLINT 采用"；TT 的 `+stop_trap_cause` 与符号化流程（见上）可直接复用。

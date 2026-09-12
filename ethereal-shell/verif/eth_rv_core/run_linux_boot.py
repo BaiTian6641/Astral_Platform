@@ -269,6 +269,11 @@ def build_model(out: Path, *, dram: bool, line_beats: int, rebuild: bool) -> Pat
         # timebase, and Spike's 1-tick-per-100-instructions cadence turns every microsecond
         # of udelay into ~100x the instructions (measured: the boot stalls in __delay).
         "-DETH_RV_CLINT_TICK_STEPS=1",
+        # ...and the tick strobe itself comes from the simulation clock, not from
+        # retirements: an idle hart in wfi retires nothing, so a retirement strobe
+        # freezes mtime and the first msleep/idle hangs the boot (measured: the hart
+        # ends in arch_cpu_idle with the console silent).
+        "-DETH_RV_CLINT_CYCLE_STEP",
         "-DETH_RV_CLINT_TICK_ADVANCE=1",
         f"-DETH_RV_ROM_ENTRY_WORD={rv_platform.LINUX_ROM_ENTRY_WORD}",
         f"-DETH_RV_ROM_STUB_WORD={rv_platform.LINUX_ROM_STEP_WORD}",

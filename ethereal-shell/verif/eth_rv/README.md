@@ -1278,16 +1278,28 @@ trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883   # ... and faults agai
   not a correctness one.
 * **`timebase-frequency`/`clock-frequency` remain DiffTest placeholders** (10 MHz), and
   the DT says so. The kernel's BogoMIPS/baud numbers derived from them are fiction.
-* **Current status (2026-09-12, evening):** Phase 1 (Spike → userspace) passes, and the
-  RTL now reaches the same handoff. Two RTL fixes closed the gap, both found through the
-  corpus and both Spike-verified: the CLINT's `mtime` cadence is a per-build choice
-  (`CLINT_RTC_TICK_STEPS/ADVANCE`, 1/1 for S4 — without it every `udelay` cost ~100× the
-  instructions and the boot stalled in `__delay`), and the EX-stage operand latches are
-  refreshed from the write-back while the stage is held ("The stalled-operand hazard,
-  the S4 blocker, and `cor_mprv`" below) — the kernel's `check_unaligned_access_emulated`
-  panic was that hazard, not the MMU. The firmware DiffTest's honest bound is still
-  #714,987 commits (`mtime` is not a comparable quantity, see above); the corpus is now
-  26/26 MATCH on both D-port paths and `eth_rv_core.sby` prove+cover pass. The numbers,
-  the commands and the console evidence are in
-  `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` and
+* **Current status (2026-09-12, night):** Phase 1 (Spike → userspace) passes; the RTL no
+  longer dies where it used to, and the misaligned-access probe the whole blocker was
+  about now succeeds (`…cpuidle: using governor menu` is followed by
+  `cpu0: Ratio of byte access time to unaligned word access is 0.01, unaligned accesses
+  are slow` instead of the old `Kernel panic`). Three RTL fixes got it there, all
+  corpus- or Spike-verified: the CLINT `mtime` cadence is a per-build choice
+  (`CLINT_RTC_TICK_STEPS/ADVANCE`, 1/1 for S4), `mstatus.MPRV` translates M-mode data
+  accesses, and the EX operand latches are refreshed from the write-back while the stage
+  is held ("The stalled-operand hazard, the S4 blocker, and `cor_mprv`" below).
+  **The console marker is still NOT reached**, and the remaining blocker is a
+  *simulation-time* one, in a different class from the old one: `mtime` is advanced by
+  retired instructions (`step_o`), so it freezes during `wfi` — every `udelay` (busy
+  wait) worked, but the first real `msleep`/idle leaves the hart in `arch_cpu_idle`
+  waiting for a timer that can never fire. A 4×10⁹-cycle beat run ends there:
+  4,000,000,002 cycles, 552,228,689 commits, 10,544 console bytes (88% of Spike's
+  11,928), last line `printk: legacy bootconsole [ns16550a0] disabled`, stop pc
+  `arch_cpu_idle+0x10`, no oops. The fix belongs in the S4 build's clock drive (pulse
+  the CLINT from simulation cycles, not retirements — the TB's `step_i`, no RTL change),
+  after which the run should go to the marker (budget ≳6×10⁹ cycles; ~1.4×10⁹ of the
+  first 4×10⁹ went into the kernel's asymmetric-key verification, i.e. the no-TLB
+  throughput cost). `--dram` has not been run yet (the two share `generated/rv_difftest/s4/`
+  and must be serial). Corpus **26/26 MATCH** on both D-port paths, `eth_rv_core.sby`
+  prove+cover PASS, harness pytest 274 passed. Evidence and commands:
+  `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` (`追补四`) and
   `local://rv13-s4-notes.md`.
