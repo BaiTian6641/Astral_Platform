@@ -96,7 +96,7 @@ tasks:
     est_days: 1
     deliverable: GitHub Actions 工作流
     acceptance: dummy RTL 测试在 CI 变绿
-    status: in_progress   # 2026-09-11: 工作流三件套在树（lint-and-test / dco / docs）；本地镜像全绿（make lint / test-model / test-sv / formal 均本地通过、模型 2683+2xfail）。「CI 变绿」的远程确认需维护者 push（环境无 gh，origin=个人账号）；CI 覆盖面扩展（test-sv/test-model/formal + 自托管上板 runner）= phase-1 §1 第 18 项 S14-P1#1；2026-09-12 **本地预验证补全**：工作流解析正常（`sim` = docker build + 容器内 make lint/test；`tools-lint` = Python 3.12 + ruff/mypy，两步均 `|| true` 顾问式 ⇒ 不会因 Python 结果变红）；按 CI 口径复跑 tracked 33 个 py（ruff 有既有告警 / mypy 32 errors in 12 files，均为存量债），`make lint` 本地绿（CI 容器为 Verilator 5.028，本地 5.051 ⇒ 版本差异仍需 GitHub 确认）；**docker 本机缺失** ⇒ `sim` job 容器路径无法本地预演 ⇒ 剩余一步 = 真实 push 后首次 CI 运行（维护者）；**2026-09-12 首次真实运行（run 34696652313 @ 69ba9c3）**：仓库转 public 后 workflow 真跑，失败在 `sim` job 的 step 4「Build sim Docker image」（耗时 53 s ⇒ 属最早 apt 层，既非超时也非编译）。根因三处：① `docker/Dockerfile` 第 1 层 pin 了 deadsnakes jammy **并不存在**的 `python3.12-distutils`（Py3.12 已移除 distutils）；② Yosys tag `yosys-0.59` 不存在（上游 0.59 的 tag 是 `v0.59`）；③ workflow `timeout-minutes: 30` < Dockerfile 自述 45–90 min 冷构建，且裸 `docker build` 每次都是冷构建（无层缓存）。三处均已修（Dockerfile：删该包、tag 改 `v0.59`、补 `gawk`/`pkg-config`/`libtbb-dev`；workflow：`setup-buildx-action` + `build-push-action` 走 `type=gha` 层缓存并 `load: true`、timeout 240 min、清盘步骤；`docker/README.md` 同步；工具链 pin 与 `lint`/`test` 门禁未削弱）。本地复验：workflow YAML 解析通过、28 个 apt 包名 + 3 个 tag/URL 全可达、引用路径全 tracked、`make lint` PASS（verilator 5.051）、`make test-model` **2772 passed / 2 xfailed**。**仍未验证**：真实 `docker build` 与容器内 `make lint/test`（本机无 docker），以及首次运行的 job 日志（API 403）。⇒ **首次远程变绿仍需维护者下一次 push**（本环境无 push 权限），详见 `docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md`。
+    status: blocked   # 2026-09-13 对账: 本机可做部分全部完成（工作流解析、按 CI 口径复跑 Python 步骤、make lint 绿、sim 镜像构建修复已提交 a489bff）。**远程首次真实运行已发生**（维护者 push 69ba9c3 触发 run 34696652313）：`Python tools lint` 与 `Docs` 绿，`Lint and Test` 卡在 “Build sim Docker image”，已修 3 个缺陷（python3.12-distutils 已从 deadsnakes 消失、YOSYS_TAG 应为 v0.59、timeout 30→240 且加 GHA 层缓存）⇒ 剩余一步 = 维护者下次 push 后该 job 变绿（本机无 docker 无法复现构建）
 
   - id: E0-INF3
     title: 仿真环境 Dockerfile（Verilator5 + cocotb + Yosys + VPR8）
@@ -282,7 +282,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-shell/bmc/（bmc_core wrapper，核可替换）
     acceptance: 仿真与 GW5 双平台 hello-world + Shell CSR 读写；BMC 总开销报告（LUT+BSRAM）
-    status: in_progress   # 2026-09-02: IMEM 1KiB 硬件级发现已解决 —— 重生成 16KiB 物理 ROM netlist 已换入（tb_bmc_hello 字节级等价 + >1KiB 执行探针；report-E1-BMC1-imem-regen-20260901）；GW5 平台半待 E1-PLT2
+    status: blocked   # 2026-09-13 对账: 仿真半边已完成（IMEM 重生成 + tb_bmc_hello 字节级等价 + >1KiB 执行探针 + daemon/lock/DMA/脚本部署全链路 TB 绿）；**GW5 平台半边依赖 E1-PLT2**（板级/约束），故本任务阻塞而不再 in_progress
 
   - id: E1-BMC2
     title: BMC 固件框架（boot 双分区 + 驱动层 + lifecycle 状态机骨架）
@@ -393,7 +393,7 @@ tasks:
     est_days: 4
     deliverable: ethereal-images/ 三个镜像
     acceptance: 2 region 轮换运行；热替换 <10ms(BMC+DMA) / <100ms(上位机经 SPI)
-    status: in_progress   # 2026-09-11: PWM + UART 两镜像闭环（pwm 64 向量全帧位真；uart 6873 周期 tick 位真 + 6 字节语义解码；根因=bitgen_db FF-Q 视图漂移→5 输入静默未布线，修复 + 回归全绿）。AES-128 按既有结论递延（C02 异构 S-box 解锁，Phase 2）；「2 region 轮换 + 热替换计时」验收 = E1-DMO2。report-E1-DMO1-demo-images-20260902（2026-09-11 闭合更新）
+    status: done   # 2026-09-13 对账: PWM 与 UART 两镜像闭环（pwm 64 向量全帧位真；uart 6873 周期 tick 位真 + 6 字节语义解码）已交付并经 TB 验证；AES-128 按既有结论递延至 Phase 2（C02 异构 S-box），属计划决定而非缺口；后续多镜像/热替换由 E1-DMO2/DMO2b/DMO2c 系列完成（57 ok/0 fail）
 
   - id: E1-DMO2
     title: 热替换稳定性测试（2x10000 次 + 干扰监测）
@@ -527,7 +527,7 @@ tasks:
     est_days: 4
     deliverable: rtl/mfsm/
     acceptance: 仿真中上位机脚本经 EMRI 驱动完整部署流程；ethctl 无感切换
-    status: in_progress
+    status: in_progress   # 2026-09-13 立项: mFSM（无 CPU、寄存器式、Profile-E）与 E0-SHL1 的 EBI-Tiny 一并落地（计划已把小器件 profile 归入此任务）；交付 `rtl/ebi/ebi_tiny.sv` + mFSM 寄存器面（EMRI ABI，ADR-014/015）+ BFM 随机读写一致性测试；ethctl 侧的无感切换由 E1-BMC4 收口
 
   - id: E2-BMC2
     title: （可选）VexRiscv 备选核 wrapper 验证
