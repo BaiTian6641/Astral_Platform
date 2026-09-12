@@ -672,7 +672,7 @@ tasks:
     est_days: 15
     deliverable: service tiles + 推理 demo
     acceptance: 吞吐/能效报告；多容器分时复用无状态泄漏
-    status: in_progress   # 2026-09-13 启动: 依赖 E2-FAB4 已完成；本轮交付 INT8 8x8 systolic NPU 瓦片 + 金模型逐位比对 + 两区域分时且无状态泄漏（含故意泄漏的负控）+ 用既有综合流报告 LUT/FF/DSP 与 Fmax（LUT 映射与 DSP 强制两档，方法学同 FAB2/FAB2b）+ TinyML 端到端推理；Makefile 由主控接线
+    status: done   # 2026-09-13 收官: NPU-Tiny 服务瓦片。`pe_int8.sv`（INT8 PE：饱和 32 位累加 + ovf + 负控注入钩子）、`npu_arr8.sv`（错拍馈入 + 权重分级 + 8x8 PE 阵列 + 观测总线）、`npu_t.sv`（服务 CSR ABI + IDLE/LOAD_W/RUN/DRAIN/DONE/CLR + C 缓冲 + 会话清零）。验收证据（本人复跑）：`tb_npu_t` **GEMM 逐位等于金模型**（7 例 M=8/3/1、极值、K=16 两段；2304 MAC/211 周期 = 10.91 MAC/cycle）；`tb_npu_tinyml` **两层 INT8 MLP 逐层与金模型一致并分类正确**；`tb_npu_isolation` **4 容器分时会话无跨容器状态泄漏（13 条边界断言）**；**负控 `-DNPU_LEAK_NEGCTL` → TEST FAILED 532 errors**（C 缓冲跨容器可读 + 权重/分级/观测残留）⇒ 检查确实可失败；金模型 15 pytest。实测（综合流 Repro kit 随仓库）：LUT 映射 40,768 LUT4 / **61.70 MHz**；**DSP 强制 14,696 LUT4 / 64 DSP（恰为 64 个 PE）/ 102.16 MHz** ⇒ LUT −64%、Fmax x1.66；峰值 6.4 GOPS @100 MHz，8x8x8 GEMM 实测 **1.55 GOPS**（目标 0.5 的 3.1 倍）。能耗数字**明确标注为估算**（Horowitz ISSCC 2014 基准 + 无功耗工具），实测列为下阶段。`fabric_top` **未接线**（需 TILE_TYPE=3 + 服务窗口 + 观测加宽，属"改变既有 fabric 行为"⇒ 按约束先报告；建议走 EBI 服务接口并与 E3-SVC2 一并做）；Makefile 由主控接线（RTL_CLEAN + deps + 4 正 TB + 1 负控行）
 
   - id: E3-SCH1
     title: 配置调度器（镜像分组 + 预取 + 缓存，BMC 执行）

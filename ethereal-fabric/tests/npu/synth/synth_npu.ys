@@ -1,0 +1,10 @@
+# SCRATCH (E3-SVC1) — LUT-mapped synthesis of the NPU-Tiny tile probe.
+# `synth_gowin -family gw5a` performs NO DSP inference (E2-FAB2 finding), so this
+# run is the LUT-mapped lower bound, exactly as in report-E2-FAB2-fmax.
+read_verilog -sv -DTARGET_GOWIN -I../../ethereal-fabric/rtl/inf -I../../ethereal-fabric/rtl/tile \
+    ../../ethereal-fabric/rtl/tile/pe_int8.sv \
+    ../../ethereal-fabric/rtl/tile/npu_arr8.sv \
+    ../../ethereal-fabric/rtl/tile/npu_t.sv \
+    probe_npu.sv
+synth_gowin -top probe_npu -family gw5a -json probe_npu-synth.json -vout probe_npu-synth.v
+stat

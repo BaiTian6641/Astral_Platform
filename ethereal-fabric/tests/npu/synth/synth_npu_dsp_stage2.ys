@@ -1,0 +1,8 @@
+# SCRATCH (E3-SVC1) — DSP-forced synthesis stage 2: complete the vendor mapping on
+# the pre-mapped RTLIL (E2-FAB2b recipe; re-reading the vendor libs is required
+# because -run map_ram: would skip the library read).
+read_rtlil npu_dsp.il
+read_verilog -specify -lib +/gowin/cells_sim.v
+read_verilog -specify -lib +/gowin/cells_xtra_gw5a.v
+synth_gowin -family gw5a -top probe_npu -json probe_npu_dsp-synth.json -vout probe_npu_dsp-synth.v
+stat

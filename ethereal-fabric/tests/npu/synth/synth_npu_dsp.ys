@@ -1,0 +1,34 @@
+# SCRATCH (E3-SVC1) — DSP-forced synthesis stage 1 (E2-FAB2b recipe).
+# The gw1n/gw2a mul2dsp+dsp_map path has no 27x18 template, and synth_gowin skips
+# DSP inference for gw5a entirely, so the 8x8 signed PE multiplies are forced onto
+# MULTALU27X18 with the scratch template from E2-FAB2b.
+read_verilog -sv -DTARGET_GOWIN -I../../ethereal-fabric/rtl/inf -I../../ethereal-fabric/rtl/tile \
+    ../../ethereal-fabric/rtl/tile/pe_int8.sv \
+    ../../ethereal-fabric/rtl/tile/npu_arr8.sv \
+    ../../ethereal-fabric/rtl/tile/npu_t.sv \
+    probe_npu.sv
+read_verilog -specify -lib +/gowin/cells_sim.v
+read_verilog -specify -lib +/gowin/cells_xtra_gw5a.v
+hierarchy -check -top probe_npu
+proc
+check
+flatten
+tribuf -logic
+deminout
+opt_expr
+check
+opt_clean
+opt -nodffe -nosdff
+fsm
+opt
+wreduce
+peepopt
+opt_clean
+share
+# --- forced DSP inference (gw1n/gw2a rules have no 27x18 entry) ---
+techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=27 -D DSP_B_MAXWIDTH=18 -D DSP_NAME=$__MUL27X18
+chtype -set $mul t:$__soft_mul
+techmap -map dsp_map_27x18.v   # tracked copy of the E2-FAB2b template (see its header)
+# ---
+write_rtlil npu_dsp.il
+select -list t:$__MUL27X18 t:MULTALU27X18 t:$mul
