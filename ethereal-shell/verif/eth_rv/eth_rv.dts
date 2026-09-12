@@ -17,31 +17,32 @@
  *     Spike's `-m0x80000000:1048576` all use (core.yaml ram_window_bytes).
  *   - clint @ 0x0200_0000, 0xc000: eth_rv_clint (msip/mtimecmp/mtime). Base and
  *     size match Spike's CLINT model exactly, so the golden and the DUT decode
- *     the same registers.
+ *     the same registers. It is the hart's M-mode timer/software source; an
+ *     S-mode timer interrupt would have to be delegated and injected by firmware
+ *     (`mideleg.STI` plus a `mip` write), which is why the node declares only
+ *     the two M-mode lines — there is no S-mode timer source in this SoC.
  *   - serial @ 0x1000_0000: eth_rv_uart, register window and byte aliasing
- *     identical to Spike's ns16550 model (reg-shift 0, 1-byte registers).
+ *     identical to Spike's ns16550 model (reg-shift 0, 1-byte registers). Its
+ *     interrupt (source 1, level-triggered) is the PLIC's only connected source.
+ *   - plic @ 0x0c00_0000, 16 MiB: eth_rv_plic (E2-RV2 increment 6), 31 sources,
+ *     4-bit priorities, the `riscv,plic0` register map and Spike's base, size and
+ *     source map. `interrupts-extended` gives each hart its M context (11) and
+ *     then its S context (9), which is Spike's context order — so the S context
+ *     is the hart's `mip.SEIP` and an S-mode kernel takes an external interrupt
+ *     through `mideleg.SEI` with `scause = 9 | (1 << 63)`.
  *   - cpu @ 0: rv64imafdc_zicsr_zicntr (the MISATM value), Sv39, one hart.
  *
- * THE ONE GOLDEN-SIDE EXCEPTION -- the PLIC node below.
- *   The hardware has no PLIC yet (E2-RV2 G7; S5 wires it), and until it does,
- *   the UART is a *polled* console: no interrupt-parent, no interrupt line. But
- *   the pinned Spike build cannot model an ns16550a node without one:
- *   `ns16550_parse_from_fdt` calls `sim_t::get_intctrl()` unconditionally, and
- *   that asserts `plic.get()` (riscv/ns16550.cc, riscv/sim.h). A DTB with a UART
- *   and no interrupt controller therefore aborts Spike before the first
- *   instruction, so `--dtb=eth_rv.dtb` could not be used at all.
- *   The PLIC node is present for that reason only. It is NOT part of the
- *   core.yaml agreement (a test checks the RAM/CPU/CLINT/UART numbers), it is
- *   never touched by the S3/S4 firmware path, and it must be replaced by the
- *   real PLIC description when S5 lands. Treat a DUT access below 0xc000_0000
- *   as a divergence, not as a supported device.
- *
- * WHAT ELSE IS DELIBERATELY ABSENT
+ * WHAT ELSE IS DELIBERATELY ABSENT (a DT that claims more changes what a kernel
+ * is allowed to assume)
  *   - No cache properties, no Svadu/PBMTE, no Zicclsm: the core does not
- *     implement them (E2-RV2 G10/G11) and a DT that claims otherwise changes
- *     what the kernel is allowed to assume.
- *   - No S-mode SWI/timer delegation node: mideleg exists, but the S-mode
- *     interrupt path is not wired (G7).
+ *     implement them (E2-RV2 G10/G11).
+ *   - No `sstc`: the hart has no S-mode timer compare of its own, so a kernel must
+ *     use the SBI timer (firmware writes `mtimecmp` and raises `mip.STIP`).
+ *   - No IMSIC/APLIC nodes: this platform's controller is a PLIC, and Spike's
+ *     AIA path is not enabled here.
+ *   - Timebase and baud are DiffTest placeholders (the boundary below), so a
+ *     kernel's `timebase-frequency`-derived delays and the UART's bit rate are
+ *     out of contract until the board clock exists (E2-RV2 G9).
  *
  * BOUNDARY -- timebase-frequency and clock-frequency are DiffTest placeholders
  *   The CLINT advances mtime from the simulation cadence, not a board
@@ -104,13 +105,14 @@
 			compatible = "riscv,clint0";
 			reg = <0x0 0x2000000 0x0 0xc000>;
 			/* hart 0: MSIP (irq 3) and MTIP (irq 7) of the local interrupt
-			 * controller. No S-mode SWI/timer delegation node yet: mideleg
-			 * exists, but the S-mode interrupt sources are not wired (G7). */
+			 * controller. Both are M-mode lines: the S-mode timer is left to
+			 * firmware (see "WHAT ELSE IS DELIBERATELY ABSENT"). */
 			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
 		};
 
-		/* GOLDEN-SIDE ONLY -- see "THE ONE GOLDEN-SIDE EXCEPTION" above.
-		 * Spike aborts on an ns16550a node with no interrupt controller. */
+		/* E2-RV2 increment 6: real hardware (eth_rv_plic). Its M and S contexts
+		 * are declared per hart in Spike's order, so the S context is the hart's
+		 * `mip.SEIP`; the UART below is source 1 of it. */
 		plic: plic@c000000 {
 			compatible = "riscv,plic0";
 			#address-cells = <0>;
@@ -127,6 +129,8 @@
 			reg = <0x0 0x10000000 0x0 0x100>;
 			reg-shift = <0>;
 			reg-io-width = <1>;
+			/* Source 1, level-triggered (4): the register semantics the RTL
+			 * mirrors are Spike's, and `cor_uart_rx`/`cor_plic` pin them. */
 			interrupt-parent = <&plic>;
 			interrupts = <1 4>;
 		};

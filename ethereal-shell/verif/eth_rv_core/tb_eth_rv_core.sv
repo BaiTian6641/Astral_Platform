@@ -211,6 +211,16 @@ module tb_eth_rv_core;
     localparam int unsigned UART_DIV  = 16;       // cycles per 8N1 bit cell
     localparam int unsigned UART_FRAME_CYCLES = 10 * UART_DIV;
     localparam int unsigned UART_MAX_BYTES = 256; // receiver buffer (overflow = FAIL)
+    // The PLIC of the SoC map (rtl/eth_rv/eth_rv_plic.sv): Spike's window, source
+    // count and priority width — mirrored by ethereal-shell/core.yaml and by
+    // verif/eth_rv/rv_platform.py, and the address the device tree declares.
+    localparam logic [63:0] PLIC_BASE      = 64'h0000_0000_0c00_0000;
+    localparam logic [63:0] PLIC_SIZE      = 64'h0000_0000_0100_0000;
+    localparam int unsigned PLIC_NDEV      = 31;
+    localparam int unsigned PLIC_PRIO_BITS = 4;
+    // How long after reset the RX injection starts: the payload must be running,
+    // and the frames must not collide with the BootROM's own first commits.
+    localparam int unsigned RX_INJ_DELAY   = 256;
 
 `ifndef ETH_RV_LINE_BEATS
 `define ETH_RV_LINE_BEATS 1     // eth_rv_axi_master read line fill (1 = single beat)
@@ -253,6 +263,21 @@ module tb_eth_rv_core;
     int unsigned uart_drain_cycles;
     int          uart_fault_frame;
     int          uart_fault_bit;
+    // ---- console UART RECEIVE line: injection + self-check (E2-RV2 increment 6) --
+    // The receive *register* interface is DiffTested through MCR loopback (Spike's
+    // own byte-injection route — see `cor_uart_rx`), but the serial *receiver* has
+    // no golden model to compare against: Spike's ns16550 takes its bytes from a
+    // terminal a batch run cannot drive (E2-RV2 §3.8). So the testbench drives a
+    // real 8N1 frame onto `uart_rx_i` — `+uart_rx=<hex bytes>`, one 10-cell frame
+    // per byte at the same divisor the transmitter uses — and then checks the bytes
+    // the DUT queued, which makes the deserialiser and the receive queue a
+    // TB-level assertion instead of a DiffTest.
+    // `+uart_rx_fault_frame=N +uart_rx_fault_bit=M` inverts one bit cell of one
+    // injected frame (0 = start, 1..8 = data LSB first, 9 = stop); the self-check
+    // must then FAIL, which is the negative control for the assertion above.
+    string       uart_rx_hex;
+    int          uart_rx_fault_frame;
+    int          uart_rx_fault_bit;
     // Wedge negative control (WEDGE GUARD below): `+starve_dmem=1` makes the
     // memory model answer NOTHING outside the mapped window, which is exactly the
     // old RV-B D-port wedge (the access is never acknowledged). The guard must
@@ -282,6 +307,13 @@ module tb_eth_rv_core;
     // takes (pc, cause, instruction) — the commit trace deliberately has no
     // record for a trap, so this is how a run's trap sequence is read back.
     int unsigned trace_traps;
+    // PLIC negative control (E2-RV2 increment 6): `+plic_swap=1` hands the PLIC's
+    // S-context line to the hart's `meip_i` and its M-context line to `seip_i`, so
+    // a run with it must diverge from Spike exactly where a context's interrupt is
+    // delivered — the control that shows the M/S context split is load-bearing
+    // rather than decorative. Nothing inside the DUT knows about the swap: what the
+    // DiffTest compares is the DUT's committed trace.
+    int unsigned plic_swap;
     // ---- boot-path controls (E2-RV2 increment 5, S3) -----------------------
     // `+rom=<file>`: the BootROM image ($readmemh, 32-bit words — see
     // rtl/eth_rv/rom/boot_rom.hex). It is REQUIRED in practice: without a ROM the
@@ -453,10 +485,13 @@ module tb_eth_rv_core;
     logic [3:0]  core_err_code;
     logic        core_err_irq;
 
-    // CLINT interrupt lines (MSIP/MTIP) and the hart's executed-instruction
-    // strobe that ticks the CLINT's mtime on Spike's cadence.
+    // CLINT interrupt lines (MSIP/MTIP), the PLIC's external-interrupt lines
+    // (MEIP/SEIP) and the hart's executed-instruction strobe that ticks the
+    // CLINT's mtime on Spike's cadence.
     logic        msip;
     logic        mtip;
+    logic        meip;
+    logic        seip;
     logic        step_strobe;
     logic [63:0] clint_mtime;   // the CLINT's mtime register == the `time` CSR
     logic [63:0] rom_entry;     // the payload entry the BootROM will jump to
@@ -481,7 +516,10 @@ module tb_eth_rv_core;
         .dmem_err_i      (core_dmem_err),
         .msip_i          (msip),
         .mtip_i          (mtip),
-        .meip_i          (1'b0),          // no PLIC in the golden model either
+        // The PLIC's two contexts (E2-RV2 increment 6). `+plic_swap=1` crosses
+        // them — the negative control for the context split.
+        .meip_i          (plic_swap != 0 ? seip : meip),
+        .seip_i          (plic_swap != 0 ? meip : seip),
         .mtime_i         (clint_mtime),   // the `time` CSR's source (E2-RV2 inc. 4)
         .rvfi_valid_o    (rvfi_valid),
         .rvfi_order_o    (rvfi_order),
@@ -521,7 +559,11 @@ module tb_eth_rv_core;
         .ROM_BASE       (ROM_BASE),
         .ROM_BYTES      (ROM_BYTES),
         .ROM_ENTRY_WORD (ROM_ENTRY_WORD),
-        .CLINT_STEP_PRELOAD (CLINT_STEP_PRELOAD)
+        .CLINT_STEP_PRELOAD (CLINT_STEP_PRELOAD),
+        .PLIC_BASE      (PLIC_BASE),
+        .PLIC_SIZE      (PLIC_SIZE),
+        .PLIC_NDEV      (PLIC_NDEV),
+        .PLIC_PRIO_BITS (PLIC_PRIO_BITS)
     ) u_mmio (
         .clk_i          (clk),
         .rst_ni         (rst_n),
@@ -542,11 +584,16 @@ module tb_eth_rv_core;
         .mem_ready_i    (dmem_ready),
         .mem_rdata_i    (dmem_rdata),
         .mem_err_i      (dmem_err),
+        .uart_rx_i      (uart_rx_line),
         .uart_tx_o      (uart_tx),
         .uart_busy_o    (uart_busy),
         .uart_overflow_o(uart_overflow),
+        .uart_rx_overflow_o (uart_rx_overflow),
+        .uart_rx_frame_err_o(uart_rx_frame_err),
         .msip_o         (msip),
         .mtip_o         (mtip),
+        .meip_o         (meip),
+        .seip_o         (seip),
         .mtime_o        (clint_mtime),
         .step_i         (step_strobe),
         .rom_entry_o    (rom_entry),
@@ -841,6 +888,97 @@ module tb_eth_rv_core;
     // what the DiffTest compares is the DUT's trace against Spike's, which is
     // exactly the "no silent success" property under test.
     assign dmem_err = dmem_err_raw && (no_dmem_err == 0);
+
+    // ------------------------------------------------------- console UART RX line
+    // The DUT's receiver input. It idles high; `+uart_rx=` serialises the bytes
+    // the self-check below expects to find in the DUT's receive queue.
+    logic        uart_rx_line;
+    logic        uart_rx_overflow;
+    logic        uart_rx_frame_err;
+
+    logic [7:0]  rx_inj_bytes [0:UART_MAX_BYTES-1];
+    int unsigned rx_inj_len;
+    int unsigned rx_inj_idx;
+    logic [3:0]  rx_inj_cell;      // 0 = start, 1..8 = data LSB first, 9 = stop
+    logic [15:0] rx_inj_cnt;       // cycles left in the current cell
+    logic [15:0] rx_inj_wait;      // cycles left before the burst starts
+    logic        rx_inj_start;     // the burst's first cell is being presented
+    logic        rx_inj_finished;  // the burst ran to its last stop cell
+    logic        rx_inj_done;
+    string       rx_self_note;     // the PASS line's RX self-test field
+
+    // `+uart_rx=<hex>`'s two digits per byte. Plain character arithmetic, written
+    // against the ASCII codes rather than the characters so nothing depends on
+    // string-literal typing.
+    function automatic logic [3:0] hex_nib(input byte c);
+        if ((c >= 8'h30) && (c <= 8'h39))      hex_nib = 4'(c - 8'h30);
+        else if ((c >= 8'h61) && (c <= 8'h66)) hex_nib = 4'(c - 8'h61 + 8'd10);
+        else if ((c >= 8'h41) && (c <= 8'h46)) hex_nib = 4'(c - 8'h41 + 8'd10);
+        else                                   hex_nib = 4'd0;
+    endfunction
+
+    // One 10-cell frame per byte at the transmitter's divisor, back to back.
+    // `rx_inj_done` is "there is nothing left to send": no injection at all, or the
+    // burst finished. It cannot be a plain register: the plusarg is decoded before
+    // reset is released, while the register's reset value is evaluated when it is
+    // still 0 — a register would latch "done" for every injection.
+    assign rx_inj_done = (rx_inj_len == 0) || rx_inj_finished;
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_inj_idx      <= 0;
+            rx_inj_cell     <= 4'd0;
+            rx_inj_cnt      <= 16'd0;
+            rx_inj_wait     <= 16'(RX_INJ_DELAY);
+            rx_inj_start    <= 1'b0;
+            rx_inj_finished <= 1'b0;
+        end else if (rx_inj_finished || (rx_inj_len == 0)) begin
+            rx_inj_cnt <= 16'd0;
+        end else if (!rx_inj_start) begin
+            // The delay elapses first; the last cycle of it PRIMES the first cell's
+            // counter, so the start bit is presented for a whole bit cell rather
+            // than the single cycle it would get if the FSM advanced straight into
+            // cell 1 (that one-cycle start bit is invisible to the receiver).
+            if (rx_inj_wait != 16'd0) begin
+                rx_inj_wait <= rx_inj_wait - 16'd1;
+            end else begin
+                rx_inj_start <= 1'b1;
+                rx_inj_cnt   <= 16'(UART_DIV - 1);
+            end
+        end else if (rx_inj_cnt == 16'd0) begin
+            // the current cell is over: step to the next one, or end the burst
+            if ((rx_inj_cell == 4'd9) && ((rx_inj_idx + 1) == rx_inj_len)) begin
+                rx_inj_finished <= 1'b1;
+            end else begin
+                if (rx_inj_cell == 4'd9) begin
+                    rx_inj_idx  <= rx_inj_idx + 1;
+                    rx_inj_cell <= 4'd0;
+                end else begin
+                    rx_inj_cell <= rx_inj_cell + 4'd1;
+                end
+                rx_inj_cnt <= 16'(UART_DIV - 1);
+            end
+        end else begin
+            rx_inj_cnt <= rx_inj_cnt - 16'd1;
+        end
+    end
+
+    // The cell's value, with the one-cell fault the negative control injects.
+    always_comb begin
+        logic bit_val;
+        bit_val = 1'b1;                                            // stop / idle
+        if (rx_inj_cell == 4'd0) begin
+            bit_val = 1'b0;                                        // start
+        end else if (rx_inj_cell <= 4'd8) begin
+            bit_val = rx_inj_bytes[rx_inj_idx][rx_inj_cell[2:0] - 3'd1];  // data, LSB first
+        end
+        if ((uart_rx_fault_frame >= 0) && (int'(rx_inj_idx) == uart_rx_fault_frame)
+            && (int'(rx_inj_cell) == uart_rx_fault_bit)) begin
+            bit_val = ~bit_val;
+        end
+        uart_rx_line = (!rst_n || rx_inj_done || (rx_inj_len == 0)
+                        || (rx_inj_wait != 16'd0)) ? 1'b1 : bit_val;
+    end
 
     // ------------------------------------------------------------------ console
     // Receiver-side model of the SoC UART's serial line (a standard 8N1 mid-bit
@@ -1372,6 +1510,13 @@ module tb_eth_rv_core;
         uart_drain_cycles = 20_000;
         uart_fault_frame  = -1;
         uart_fault_bit    = 0;
+        plic_swap         = 0;
+        uart_rx_hex       = "";
+        rx_inj_len        = 0;
+        // -1 disables the injection fault: a 0 here would invert the start cell of
+        // the first injected frame (which is a real frame error, not a control).
+        uart_rx_fault_frame = -1;
+        uart_rx_fault_bit   = 0;
         starve_dmem       = 0;
         no_dmem_err       = 0;
         dmem_corrupt_addr = 64'd0;
@@ -1401,6 +1546,10 @@ module tb_eth_rv_core;
         void'($value$plusargs("uart_drain=%d", uart_drain_cycles));
         void'($value$plusargs("uart_fault_frame=%d", uart_fault_frame));
         void'($value$plusargs("uart_fault_bit=%d", uart_fault_bit));
+        void'($value$plusargs("plic_swap=%d", plic_swap));
+        void'($value$plusargs("uart_rx=%s", uart_rx_hex));
+        void'($value$plusargs("uart_rx_fault_frame=%d", uart_rx_fault_frame));
+        void'($value$plusargs("uart_rx_fault_bit=%d", uart_rx_fault_bit));
         void'($value$plusargs("starve_dmem=%d", starve_dmem));
         void'($value$plusargs("no_dmem_err=%d", no_dmem_err));
         void'($value$plusargs("rom=%s", rom_path));
@@ -1511,6 +1660,28 @@ module tb_eth_rv_core;
                      dtb_n, DTB_ADDR);
         end
 
+        // ---- UART RX injection: decode `+uart_rx=<hex bytes> -------------------
+        // Two hex digits per byte, e.g. `+uart_rx=414243` for "ABC". The driver
+        // above serialises them; the self-check after the run holds what the DUT
+        // queued against this list.
+        if (uart_rx_hex != "") begin : rx_inj_decode
+            if ((uart_rx_hex.len() % 2) != 0) begin
+                $display("ETH_RV_TB: FAIL +uart_rx wants an even number of hex digits, got '%s'",
+                         uart_rx_hex);
+                $fatal(1);
+            end
+            rx_inj_len = uart_rx_hex.len() / 2;
+            if (rx_inj_len > UART_MAX_BYTES) begin
+                $display("ETH_RV_TB: FAIL +uart_rx has %0d bytes, the receiver holds %0d",
+                         rx_inj_len, UART_MAX_BYTES);
+                $fatal(1);
+            end
+            for (int unsigned bi = 0; bi < rx_inj_len; bi = bi + 1) begin
+                rx_inj_bytes[bi] = {hex_nib(uart_rx_hex.getc(2 * bi)),
+                                    hex_nib(uart_rx_hex.getc(2 * bi + 1))};
+            end
+        end
+
         if (trace_path == "") begin
             $display("ETH_RV_TB: FAIL no +trace=<file> given");
             $fatal(1);
@@ -1575,6 +1746,53 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the console UART receiver buffer overflowed");
             $fatal(1);
         end
+
+        // ------------------------------------------------------ console UART RX --
+        // The DUT's *receiver* has no golden model to compare against (Spike's
+        // ns16550 is fed by a terminal a batch run cannot drive), so this half of
+        // the receive path is a testbench assertion: the frames above are driven
+        // onto `uart_rx_i` and the bytes the DUT queued are held against them.
+        // `+uart_rx_fault_frame/bit` breaks one cell, and the check below MUST then
+        // fail — that is its negative control.
+        if (rx_inj_len != 0) begin : rx_self_check
+            int unsigned rx_guard;
+            int unsigned rx_queued;
+            rx_guard = 0;
+            while (!rx_inj_done && (rx_guard < (100 * UART_FRAME_CYCLES * rx_inj_len))) begin
+                @(posedge clk);
+                rx_guard = rx_guard + 1;
+            end
+            if (!rx_inj_done) begin
+                $display("ETH_RV_TB: FAIL the injected RX burst never finished (%0d of %0d bytes sent)",
+                         rx_inj_idx, rx_inj_len);
+                $fatal(1);
+            end
+            rx_queued = 32'(u_mmio.u_uart.rx_count_r);
+            if (rx_queued != rx_inj_len) begin
+                $display("ETH_RV_TB: FAIL the UART receiver queued %0d byte(s), expected %0d (injected %0d frames)",
+                         rx_queued, rx_inj_len, rx_inj_len);
+                $fatal(1);
+            end
+            for (int unsigned bi = 0; bi < rx_inj_len; bi = bi + 1) begin
+                if (u_mmio.u_uart.rx_fifo_r[bi] !== rx_inj_bytes[bi]) begin
+                    $display("ETH_RV_TB: FAIL the UART received 0x%02x at queue position %0d, injected 0x%02x",
+                             u_mmio.u_uart.rx_fifo_r[bi], bi, rx_inj_bytes[bi]);
+                    $fatal(1);
+                end
+            end
+            if (uart_rx_overflow) begin
+                $display("ETH_RV_TB: FAIL the UART receiver dropped an injected byte (queue full)");
+                $fatal(1);
+            end
+            if (uart_rx_frame_err) begin
+                $display("ETH_RV_TB: FAIL the UART receiver saw a framing error on an injected frame");
+                $fatal(1);
+            end
+            $display("ETH_RV_TB_INFO: UART RX self-check: %0d byte(s) injected on uart_rx_i, %0d queued and byte-exact",
+                     rx_inj_len, rx_queued);
+            rx_self_note = "RX inject "; // (the byte count is appended below)
+            rx_self_note = $sformatf("RX inject %0d bytes OK", rx_inj_len);
+        end
         if (uart_path != "") begin
             uart_fd = $fopen(uart_path, "w");
             if (uart_fd == 0) begin
@@ -1605,20 +1823,20 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response that never became an access fault");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles), %s",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_mem_paddr, last_store_data, last_insn,
                  MEM_BYTES / 1024, entry_addr,
                  n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
-                 rx_nbytes, rx_nframes, rx_errors, drain_used);
+                 rx_nbytes, rx_nframes, rx_errors, drain_used, rx_self_note);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles), %s",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_mem_paddr, last_store_data, last_insn,
                  MEM_BYTES / 1024, entry_addr,
-                 rx_nbytes, rx_nframes, rx_errors, drain_used);
+                 rx_nbytes, rx_nframes, rx_errors, drain_used, rx_self_note);
 `endif
         $finish;
     end

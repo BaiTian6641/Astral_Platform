@@ -32,6 +32,15 @@ uart_reg_bytes: 256
 clint_base: 0x2000000
 clint_bytes: 49152
 
+# PLIC (E2-RV2 increment 6): Spike's window and source map. `uart_irq` is the
+# console UART's source id, and the S context of the PLIC is what gives the hart
+# a hardware `mip.SEIP` (mideleg.SEI) for a kernel's driver to attach to.
+plic_base: 0xc000000
+plic_bytes: 16777216
+plic_ndev: 31
+plic_prio_bits: 4
+uart_irq: 1
+
 # Clock / timebase. Both are DiffTest placeholders, not board numbers:
 # the CLINT advances mtime on the instruction cadence (CLOCK_HZ / 100, Spike's
 # INSNS_PER_RTC_TICK), so timebase-frequency is only meaningful while both sides

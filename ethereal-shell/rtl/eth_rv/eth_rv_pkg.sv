@@ -210,6 +210,10 @@ package eth_rv_pkg;
     localparam logic [63:0] MIP_MSIP      = 64'h0000_0000_0000_0008;
     localparam logic [63:0] MIP_MTIP      = 64'h0000_0000_0000_0080;
     localparam logic [63:0] MIP_MEIP      = 64'h0000_0000_0000_0800;
+    // SEIP (bit 9) has a hardware source since E2-RV2 increment 6: the PLIC's S
+    // context drives `seip_i`, and the bit is ORed with the software-writable
+    // pending bit (Spike keeps the software bit in `mvip` and composes the read).
+    localparam logic [63:0] MIP_SEIP      = 64'h0000_0000_0000_0200;
     localparam logic [63:0] MIP_SW_WMASK  = 64'h0000_0000_0000_0222;  // mip: SSIP|STIP|SEIP
     localparam logic [63:0] MIP_SIP_WMASK = 64'h0000_0000_0000_0002;  // sip: SSIP only
     localparam logic [63:0] MIE_WMASK     = 64'h0000_0000_0000_0aaa;  // SSIE MSIE STIE MTIE SEIE MEIE

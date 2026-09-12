@@ -26,6 +26,15 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 RUNNER_PATH = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv_core" / "run_difftest.py"
 HELLO_SOURCE = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv" / "corpus" / "cor_hello.S"
+RX_SOURCE = (
+    REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv" / "corpus" / "cor_uart_rx.S"
+)
+"""The receive-path corpus program (E2-RV2 increment 6).
+
+It drives the receive register interface through MCR loopback — no transmit — except
+for one check that turns loopback off and puts a single byte on the line, which is
+why it is the second program with a console payload.
+"""
 
 
 def _load_runner() -> ModuleType:
@@ -88,12 +97,25 @@ def test_the_program_drives_the_mapped_uart_page() -> None:
     assert ".equ UART_LSR_OFF,  5" in source
 
 
-def test_only_hello_has_a_console_payload() -> None:
+def test_only_the_transmitting_programs_have_a_console_payload() -> None:
     """Every other corpus program must leave the serial line idle."""
-    assert runner.EXPECTED_UART == {"cor_hello": HELLO}
-    assert "cor_hello" in runner.CORPUS_PROGRAMS
+    assert runner.EXPECTED_UART == {"cor_hello": HELLO, "cor_uart_rx": b"Z"}
+    for name in ("cor_hello", "cor_uart_rx"):
+        assert name in runner.CORPUS_PROGRAMS
     for name in runner.EXPECTED_UART:
         assert name in runner.CORPUS_PROGRAMS
+
+
+def test_the_receive_program_transmits_exactly_one_byte() -> None:
+    """`cor_uart_rx`'s console payload is re-read from its own source.
+
+    The program stores every byte with the loopback on (so nothing reaches the line)
+    except one: the `0x5a` it sends with `MCR.LOOP` cleared. The expected payload and
+    the program must agree, exactly as `HELLO_STRING` and `cor_hello.S` do.
+    """
+    source = RX_SOURCE.read_text(encoding="utf-8")
+    assert "li      t0, 0x5a\n  sb      t0, 0(s0)               /* the one byte" in source
+    assert runner.EXPECTED_UART["cor_uart_rx"] == b"\x5a"
 
 
 def test_runner_builds_the_uart_decoding_sources() -> None:
@@ -101,6 +123,8 @@ def test_runner_builds_the_uart_decoding_sources() -> None:
     names = [path.name for path in runner.RTL_SOURCES]
     assert "eth_rv_uart.sv" in names
     assert "eth_rv_mmio_mux.sv" in names
+    # ... and the interrupt controller the UART's line hangs off (E2-RV2 increment 6)
+    assert "eth_rv_plic.sv" in names
 
 
 # --- the record parser -------------------------------------------------------------

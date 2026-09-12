@@ -1002,3 +1002,45 @@ first RTL revision applied `mcounteren` to M-mode as well, and `cor_counters`
 caught it immediately (`1 traps` instead of 24, `DIVERGENCE (pc_mismatch) at
 commit #48` on the `rdcycle` right after the S-mode handler). No RTL knob was
 added for it — the corpus's own check is the control.
+
+## PLIC and the UART receive path (E2-RV2 increment 6 / gap-closure S5)
+
+Two devices a *usable* Linux needs, both mirrored from the pinned Spike where Spike can
+oracle them (`riscv/plic.cc` and `ns16550.cc` are the models of record, exactly as the TX
+constants were derived):
+
+* **`eth_rv_plic`** — the standard map at `0x0C00_0000` (priority / pending / enable /
+  threshold / claim / complete), with the console UART (source 1, level-triggered) as the
+  only device and `riscv,ndev = 31` in the DT. The hart gained an **`seip_i`** input, so an
+  S-mode context output can actually drive `mip.SEIP` — before this slice SEIP was
+  software-writable only, which is why the DT's PLIC node was marked "golden-side only" and
+  an undecoded access at `0xC000_0000` would have wedged the D port.
+* **UART receive** — receiver + queue behind the same 16550 subset: `LSR.DR`, `RBR`, the
+  FCR bits Spike models, and the RX interrupt (IIR) wired to the PLIC. **Every receive
+  register behaviour that Spike models is oracled in `cor_uart_rx`/`cor_plic`.**
+
+### Boundaries (stated, not hidden)
+
+* Spike's UART is terminal-driven, so **the serial line itself is TB-self-checked**, not
+  diffed: `+uart_rx=<hex bytes>` injects byte-exactly and `+uart_rx_fault_frame/_bit`
+  corrupts a chosen cell as the negative control (the frame-timing assertion is the TX-side
+  precedent). Physical baud/bit timing stays a TB assertion — `LCR`/`DLL`/`DLM` are stored,
+  read back and ignored, as in Spike.
+* `FCR.ENABLE_FIFO` does not gate the line receiver (Spike gates only its undrivable
+  terminal poll; a real 16550 receives with FIFOs off).
+* Framing/overrun are verification-status ports (`rx_frame_err_o`/`rx_overflow_o`), not LSR
+  bits — Spike's model has no such bits.
+* Cross-id PLIC priority ordering is not Spike-oracled (only source 1 has a device); the
+  threshold rule, the pending-priority latch and the tie-break-by-id chain shape are.
+* A bug in the core was found and fixed here too: `S`-eligibility was missing the M-mode
+  clause, so a pending+enabled **S-delegated** interrupt was taken in M-mode through
+  `mtvec` with a bogus cause (this slice is the first that can reach it, now that SEIP has
+  a hardware source). It now follows Spike's `hs_enabled` rule.
+
+### Kernel-facing gaps that remain
+
+No `sstc` and no S-mode timer source (use the SBI timer path — `mip.STIP` writes and
+`mideleg` do work, which is exactly OpenSBI's non-`sstc` route); only source 1 is wired with
+`riscv,ndev = 31`; no IMSIC/APLIC; no hardware A/D update; no PBMTE/Svadu/Zicclsm
+declarations. `timebase-frequency` in the DT is still a DiffTest placeholder, not a real
+timebase.

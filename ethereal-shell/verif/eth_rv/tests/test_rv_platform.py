@@ -70,6 +70,11 @@ def test_core_yaml_matches_the_platform_module() -> None:
         "uart_reg_bytes": rv_platform.UART_REG_BYTES,
         "clint_base": rv_platform.CLINT_BASE,
         "clint_bytes": rv_platform.CLINT_BYTES,
+        "plic_base": rv_platform.PLIC_BASE,
+        "plic_bytes": rv_platform.PLIC_BYTES,
+        "plic_ndev": rv_platform.PLIC_NDEV,
+        "plic_prio_bits": rv_platform.PLIC_PRIO_BITS,
+        "uart_irq": rv_platform.UART_IRQ,
         "clock_hz": rv_platform.CLOCK_HZ,
         "timebase_frequency": rv_platform.TIMEBASE_FREQUENCY,
     }
@@ -116,6 +121,32 @@ def test_device_tree_declares_the_same_uart_and_clint() -> None:
     text = _dts_text()
     assert _reg(r"serial@[0-9a-f]+", text) == (rv_platform.UART_BASE, rv_platform.UART_REG_BYTES)
     assert _reg(r"clint@[0-9a-f]+", text) == (rv_platform.CLINT_BASE, rv_platform.CLINT_BYTES)
+
+
+def test_device_tree_declares_the_plic_and_the_uart_source() -> None:
+    """The PLIC node is real hardware since E2-RV2 increment 6, not a placeholder.
+
+    Its window, source count and priority width are the contract's, its
+    ``interrupts-extended`` names each hart's M context (11) and then its S
+    context (9) — Spike's order, which is what makes the second one the hart's
+    ``mip.SEIP`` — and the UART node hangs off it as source ``UART_IRQ`` with a
+    level trigger.
+    """
+    text = _dts_text()
+    assert _reg(r"plic@[0-9a-f]+", text) == (rv_platform.PLIC_BASE, rv_platform.PLIC_BYTES)
+    assert f"riscv,ndev = <{rv_platform.PLIC_NDEV}>" in text
+    assert f"riscv,max-priority = <{(1 << rv_platform.PLIC_PRIO_BITS) - 1}>" in text
+    assert 'compatible = "riscv,plic0"' in text
+    contexts = re.search(r"plic@[0-9a-f]+\s*\{[^}]*?interrupts-extended = <([^>]*)>;", text)
+    assert contexts is not None, "the PLIC node has no interrupts-extended"
+    assert [int(cell.split()[-1]) for cell in contexts.group(1).split("&cpu0_intc")[1:]] == [
+        11,  # the hart's M context: meip_i
+        9,   # ... and its S context: seip_i
+    ]
+    uart = re.search(r"serial@[0-9a-f]+\s*\{[^}]*\}", text)
+    assert uart is not None
+    assert "interrupt-parent = <&plic>;" in uart.group(0)
+    assert f"interrupts = <{rv_platform.UART_IRQ} 4>;" in uart.group(0)
 
 
 def test_device_tree_declares_the_pinned_cpu() -> None:

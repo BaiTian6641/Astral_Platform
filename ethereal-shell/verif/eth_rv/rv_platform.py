@@ -121,6 +121,34 @@ CLINT_BASE = 0x0200_0000
 CLINT_BYTES = 0xC000
 """CLINT window size (``mtimecmp``/``mtime`` + ``msip``)."""
 
+PLIC_BASE = 0x0C00_0000
+"""PLIC base (``eth_rv_plic``; matches Spike's default ``PLIC_BASE``).
+
+E2-RV2 increment 6 (S5) turned the device-tree node below from a golden-side
+placeholder into real hardware: the SoC's external-interrupt controller, with the
+console UART as its source ``UART_IRQ`` and two contexts — context 0 feeding the
+hart's ``meip_i`` and context 1 its ``seip_i`` (the S-mode path ``mideleg.SEI``
+needs). A kernel attaches the UART's driver to the S context.
+"""
+
+PLIC_BYTES = 0x0100_0000
+"""PLIC window size — Spike's ``PLIC_SIZE``; the node's ``reg`` says the same."""
+
+PLIC_NDEV = 31
+"""Interrupt sources the configuration has (Spike's ``PLIC_NDEV``; ``riscv,ndev``).
+
+Source ids run 1..31 and source 0 does not exist; only source ``UART_IRQ`` is wired.
+"""
+
+PLIC_PRIO_BITS = 4
+"""Priority width in bits — Spike's ``PLIC_PRIO_BITS``; ``riscv,max-priority`` is 2**4-1."""
+
+UART_IRQ = 1
+"""The console UART's PLIC source id (Spike's ``NS16550_INTERRUPT_ID``).
+
+The device tree states it as the UART node's first ``interrupts`` cell.
+"""
+
 # --- cadence placeholder ----------------------------------------------------------
 
 CLOCK_HZ = 1_000_000_000

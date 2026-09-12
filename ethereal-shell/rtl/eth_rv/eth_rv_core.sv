@@ -52,8 +52,9 @@
 //                * CSRs: mstatus/misa/mie/mip/mtvec/mepc/mcause/mtval/mscratch/
 //                  mhartid. The read-only values (`misa`, `mip`, `mhartid`, the
 //                  mstatus XL fields) are chosen to match the Spike golden model
-//                  bit for bit; `mip` has no interrupt source yet (no CLINT), so
-//                  it reads zero. `mstatus`/`mie`/`mtvec`/`mepc` implement the
+//                  bit for bit; `mip`'s pending bits are the CLINT/PLIC lines ORed
+//                  with the software-writable ones. `mstatus`/`mie`/`mtvec`/`mepc`
+//                  implement the
 //                  architectural write masks (WARL), and an access to any CSR
 //                  number outside the set is an illegal instruction.
 //                * Traps: illegal instruction, ebreak, ecall, load/store address
@@ -143,6 +144,8 @@
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
 // Modified:    2026-09-12 - E2-RV1 increment 5: D/I-port error responses (access faults)
+//              2026-09-12 - E2-RV2 increment 6 (S5): `seip_i`, the PLIC's S-context
+//              external interrupt, ORed into `mip.SEIP` (E2-RV2 G7)
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §3 (5-stage pipeline, forwarding,
 //              static prediction), §4 (I/D/RVFI port contract), §5 (DiffTest integration)
@@ -175,10 +178,17 @@ module eth_rv_core (
     input  logic [63:0] dmem_rdata_i,
     input  logic        dmem_err_i,      // with dmem_ready_i: this access faulted
 
-    // ---- interrupt lines (C14 §3; the CLINT in eth_rv_mmio_mux drives them) ----
+    // ---- interrupt lines (C14 §3; the CLINT/PLIC in eth_rv_mmio_mux drive them) ----
     input  logic        msip_i,          // machine software interrupt (CLINT msip[0])
     input  logic        mtip_i,          // machine timer interrupt (mtime >= mtimecmp)
-    input  logic        meip_i,          // machine external interrupt (no PLIC: tied 0)
+    input  logic        meip_i,          // machine external interrupt (PLIC M context)
+    // Supervisor external interrupt (E2-RV2 increment 6, G7): the PLIC's S context.
+    // Spike composes `mip.SEIP` as "the software bit (its `mvip`) OR the interrupt
+    // controller's line", and the two are not the same storage: a software write of
+    // SEIP survives the PLIC dropping its level (probed — see
+    // local://rv11-plic-notes.md §1.1). `mip_eff` below ORs the two, which is
+    // exactly that composition.
+    input  logic        seip_i,
     // ---- the hart's mtime (the `time` CSR's source) ----
     // `time` is not a hart-side counter: the golden model's `time` is a proxy of
     // its CLINT's `mtime` register (`clint.cc:116` syncs the hart's shadow on every
@@ -746,15 +756,31 @@ module eth_rv_core (
     // can be taken (in any mode below M, or in M with mstatus.MIE); S-eligible =
     // pending & mideleg while an S interrupt can be taken (below S, or in S with
     // sstatus.SIE). The M set wins wholesale, and within a set Spike's priority
-    // is MEI, MSI, MTI, SEI, SSI, STI. MEIP has no source in this platform (there
-    // is no PLIC), so it stays 0 — exactly like the golden model's default.
+    // is MEI, MSI, MTI, SEI, SSI, STI.
+    //
+    // MEIP and SEIP are the PLIC's two context outputs (E2-RV2 increment 6); before
+    // that they were tied low and `mip` could only be moved by software. Both are
+    // ORed with the software-writable pending bits because that is how Spike reads
+    // `mip` back (`mip_csr_t::read()` ORs `mvip.SEIP` into the register the PLIC
+    // writes with its backdoor). An S-mode kernel therefore sees a real external
+    // interrupt through `mideleg.SEI`, with `scause = 9 | (1 << 63)`.
     assign mip_eff = csr_mip_r
                      | (msip_i ? eth_rv_pkg::MIP_MSIP : 64'd0)
                      | (mtip_i ? eth_rv_pkg::MIP_MTIP : 64'd0)
-                     | (meip_i ? eth_rv_pkg::MIP_MEIP : 64'd0);
+                     | (meip_i ? eth_rv_pkg::MIP_MEIP : 64'd0)
+                     | (seip_i ? eth_rv_pkg::MIP_SEIP : 64'd0);
     assign irq_pending   = mip_eff[11:0] & csr_mie_r[11:0];
     assign irq_m_enabled = (csr_priv_r != eth_rv_pkg::PRV_M) || csr_mstatus_r[3];
-    assign irq_s_enabled = (csr_priv_r != eth_rv_pkg::PRV_S) || csr_mstatus_r[1];
+    // An S-eligible interrupt is deliverable below S-mode always, in S-mode only
+    // with sstatus.SIE, and NEVER in M-mode: Spike's `hs_enabled` is
+    // `prv < PRV_S || (prv == PRV_S && sie)` (processor.cc, take_interrupt), and
+    // its delegation guard is `prv <= PRV_S` as well. Without the M-mode clause a
+    // delegated source that is pending and enabled while the hart is in M-mode was
+    // taken as a bogus interrupt of cause `mideleg`'s bit through `mtvec` — a
+    // divergence this slice's S-mode SEI path is the first to be able to reach
+    // (before it, SEIP had no hardware source).
+    assign irq_s_enabled = (csr_priv_r != eth_rv_pkg::PRV_M)
+                           && ((csr_priv_r != eth_rv_pkg::PRV_S) || csr_mstatus_r[1]);
 
     always_comb begin
         logic [11:0] m_elig;
@@ -2630,6 +2656,13 @@ module eth_rv_core (
             cover(mem_ctrl_r.is_lr && (mem_phase_r == MEM_ACC) && dmem_ready_i);
             cover(mem_ctrl_r.is_sc && (mem_phase_r == MEM_ACC) && !mem_beat_off);
             cover(mem_ctrl_r.is_sc && mem_beat_off);
+            // PLIC (E2-RV2 increment 6): the hardware external-interrupt lines move
+            // `mip` on their own — the M context's MEIP and, for the S-mode path this
+            // slice exists for, the S context's SEIP reaching `mip.SEIP` with no
+            // software write of the bit at all. The two are separate witnesses: the
+            // line high while the software-writable bit is clear.
+            cover(seip_i && mip_eff[eth_rv_pkg::IRQ_SEI] && !csr_mip_r[eth_rv_pkg::IRQ_SEI]);
+            cover(meip_i && mip_eff[eth_rv_pkg::IRQ_MEI]);
         end
     end
 `endif

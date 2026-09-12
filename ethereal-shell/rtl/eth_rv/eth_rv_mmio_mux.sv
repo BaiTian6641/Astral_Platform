@@ -7,14 +7,14 @@
 //              经 D 端口地址译码") and every downstream path (the behavioral beat
 //              memory of the v0 testbench, `eth_rv_axi_master` -> `eth_dram_ctrl`)
 //              stays unchanged.
-// Details:     SoC DATA MAP (increment 6: CLINT added):
+// Details:     SoC DATA MAP (E2-RV2 increment 6: the PLIC joins it):
 //
 //                0x0000_0000_0000_1000  BootROM (eth_rv_boot_rom, 4 KiB, read-only)
 //                  -> reset PC: the M-mode stub sets a0/a1 and jumps to the payload
 //                0x0000_0000_8000_0000  system memory (DRAM socket / eth_dram_ctrl)
 //                0x0000_0000_1000_0000  console UART (eth_rv_uart, 4 KiB page)
 //                0x0000_0000_0200_0000  CLINT (eth_rv_clint, 0xc000 window)
-//                PLIC                   not implemented (no external source: MEIP = 0)
+//                0x0000_0000_0c00_0000  PLIC (eth_rv_plic, 16 MiB; Spike's base)
 //
 //              DECODE: an access is inside the console page when
 //              `addr[63:12] == UART_BASE[63:12]` — the same 4 KiB granularity as
@@ -90,8 +90,24 @@
 //              still a documented DiffTest boundary (Spike's step accounting
 //              diverges after a trap).
 //
-//              MEIP has no source: the golden model's default configuration has
-//              no PLIC, so `meip_i` on the core is tied low here and stays 0.
+//              THE PLIC (E2-RV2 increment 6, S5): `eth_rv_plic` answers Spike's
+//              window at `0x0c00_0000` (size 16 MiB, 31 sources, 4 priority bits —
+//              the same layout and the same register semantics as `riscv/plic.cc`,
+//              see that file's header for the probe table). It is decoded exactly
+//              like the CLINT: FIRST, and kept out of the memory path. Its source
+//              1 is the console UART's interrupt line, wired here with the UART's
+//              own `irq_upd_o` strobe — Spike's `set_interrupt_level` is called at
+//              the END of a UART register access and re-latches the source's
+//              pending priority on every call, so a store to IER (or a loopback
+//              byte) has to reach the PLIC in the cycle it is accepted, and every
+//              later UART access has to re-latch it.
+//
+//              The PLIC's two contexts leave as the hart's external-interrupt
+//              lines: context 0 (M) drives `meip_o` and context 1 (S) drives
+//              `seip_o`, so an S-mode kernel can take an external interrupt through
+//              `mideleg.SEI` with `scause = 9 | (1 << 63)`. That is the whole
+//              reason this device exists here: without it `mip.SEIP` could only be
+//              set by software (E2-RV2 G7) and no driver could attach to the UART.
 //
 //              BOOTROM (E2-RV2 increment 5, S3): the 4 KiB read-only region at
 //              0x0000_1000 holds the reset stub the core executes first
@@ -118,6 +134,9 @@
 //              reset PC) in front of the D port; the DRAM window size is a parameter
 //              2026-09-12 - E2-RV2 increment 5 (S3) follow-up: the CLINT's mtime
 //              cadence counts the GOLDEN's pre-program instructions (CLINT_STEP_PRELOAD)
+//              2026-09-12 - E2-RV2 increment 6 (S5): PLIC at 0x0c00_0000 with the
+//              console UART as source 1, its M/S contexts leaving as meip_o/seip_o;
+//              the UART's receive line and its verification status pass through
 //              and swallows this SoC's BootROM stub pulses (derived from the ROM image),
 //              so `time` matches Spike again now that a ROM runs before the payload
 // Tags:        RTL, SYNTH
@@ -149,7 +168,15 @@ module eth_rv_mmio_mux #(
     parameter logic [63:0] ROM_BASE        = 64'h0000_0000_0000_1000,  // BootROM region (S3 contract)
     parameter int unsigned ROM_BYTES       = 4096,                     // 4 KiB
     parameter int unsigned ROM_ENTRY_WORD  = 8,                        // offset 32: the payload entry
-    parameter int unsigned ROM_STUB_WORD   = 7                         // offset 28: the stub's step count
+    parameter int unsigned ROM_STUB_WORD   = 7,                        // offset 28: the stub's step count
+    // PLIC (E2-RV2 increment 6): Spike's window, source count and priority width,
+    // and the id of the console UART in its source map (Spike's
+    // NS16550_INTERRUPT_ID = 1). NDEV must be >= 1: source 1 is the UART.
+    parameter logic [63:0] PLIC_BASE       = 64'h0000_0000_0c00_0000,
+    parameter logic [63:0] PLIC_SIZE       = 64'h0000_0000_0100_0000,
+    parameter int unsigned PLIC_NDEV       = 31,
+    parameter int unsigned PLIC_PRIO_BITS  = 4,
+    parameter int unsigned PLIC_UART_ID    = 1
 ) (
     input  logic        clk_i,
     input  logic        rst_ni,
@@ -176,13 +203,20 @@ module eth_rv_mmio_mux #(
     input  logic        mem_err_i,  // with mem_ready_i: the memory side faulted
 
     // ---- console UART line + verification status ----
+    input  logic        uart_rx_i,         // serial input (idle high); the receiver
     output logic        uart_tx_o,
     output logic        uart_busy_o,
     output logic        uart_overflow_o,
+    output logic        uart_rx_overflow_o,   // sticky: a received byte was dropped
+    output logic        uart_rx_frame_err_o,  // sticky: a start/stop bit was violated
 
     // ---- CLINT: interrupt lines to the hart + the hart's step strobe ----
     output logic        msip_o,     // machine software interrupt pending
     output logic        mtip_o,     // machine timer interrupt pending
+
+    // ---- PLIC: the hart's external-interrupt lines ----
+    output logic        meip_o,     // PLIC M context (Spike: MIP_MEIP)
+    output logic        seip_o,     // PLIC S context (Spike: MIP_SEIP)
     output logic [63:0] mtime_o,    // the CLINT's mtime register: the `time` CSR
     input  logic        step_i,     // one pulse per instruction that left EX
 
@@ -208,6 +242,14 @@ module eth_rv_mmio_mux #(
     logic [7:0] uart_rdata;
     logic       clint_sel;  // access inside the CLINT window
     logic [63:0] clint_rdata;
+    logic       plic_sel;   // access inside the PLIC window
+    logic       plic_err;   // ... answered by the PLIC as an ERROR response
+    logic [63:0] plic_rdata;
+    logic [1:0]  plic_irq;  // per-context lines: bit 0 = M (MEIP), bit 1 = S (SEIP)
+    logic       uart_irq;      // the UART's raw interrupt line (Spike's rule)
+    logic       uart_irq_upd;  // ... and "a UART access re-evaluated it" strobe
+    logic [PLIC_NDEV:0] plic_src_level;
+    logic [PLIC_NDEV:0] plic_src_upd;
     logic       rom_hit;    // addr_i is inside the BootROM region (read port)
     logic       rom_sel;    // ... and this request targets it
     logic [63:0] rom_rdata; // the eight ROM bytes at the aligned beat
@@ -232,17 +274,23 @@ module eth_rv_mmio_mux #(
     // rejection turned into the architectural access fault. The CLINT answers
     // combinationally in the same cycle for every access it claims, so it can
     // never wedge either.
+    // The PLIC answers combinationally in the same cycle too, and reports its own
+    // rejections (a subword access, a context the configuration does not have, a
+    // reserved context offset's store) as the access error.
     assign ready_o = rom_sel   ? 1'b1
                     : page_sel ? (page_byte ? uart_ready : 1'b1)
-                    : clint_sel ? 1'b1 : mem_ready_i;
+                    : clint_sel ? 1'b1
+                    : plic_sel ? 1'b1 : mem_ready_i;
     assign rdata_o = rom_sel   ? rom_rdata
                     : uart_sel ? {8{uart_rdata}}
-                    : clint_sel ? clint_rdata : mem_rdata_i;
-    assign err_o   = (rom_sel && we_i) || (page_sel && !page_byte) || (mem_req_o && mem_err_i);
+                    : clint_sel ? clint_rdata
+                    : plic_sel ? plic_rdata : mem_rdata_i;
+    assign err_o   = (rom_sel && we_i) || (page_sel && !page_byte) || plic_err
+                     || (mem_req_o && mem_err_i);
 
     // The memory path sees the core's request verbatim, except that a device
     // access never reaches it (see why in the header).
-    assign mem_req_o   = req_i && !page_sel && !clint_sel && !rom_sel;
+    assign mem_req_o   = req_i && !page_sel && !clint_sel && !rom_sel && !plic_sel;
     assign mem_we_o    = we_i;
     assign mem_addr_o  = addr_i;
     assign mem_wdata_o = wdata_i;
@@ -289,18 +337,56 @@ module eth_rv_mmio_mux #(
         .BIT_CYCLES (UART_BIT_CYCLES),
         .FIFO_DEPTH (UART_FIFO_DEPTH)
     ) u_uart (
-        .clk_i        (clk_i),
-        .rst_ni       (rst_ni),
-        .req_i        (uart_sel),
-        .we_i         (we_i),
-        .off_i        (reg_off),
-        .wdata_i      (wdata_i[{reg_off, 3'b000} +: 8]),
-        .ready_o      (uart_ready),
-        .rdata_o      (uart_rdata),
-        .uart_tx_o    (uart_tx_o),
-        .tx_busy_o    (uart_busy_o),
-        .tx_overflow_o(uart_overflow_o)
+        .clk_i            (clk_i),
+        .rst_ni           (rst_ni),
+        .req_i            (uart_sel),
+        .we_i             (we_i),
+        .off_i            (reg_off),
+        .wdata_i          (wdata_i[{reg_off, 3'b000} +: 8]),
+        .ready_o          (uart_ready),
+        .rdata_o          (uart_rdata),
+        .uart_rx_i        (uart_rx_i),
+        .uart_tx_o        (uart_tx_o),
+        .tx_busy_o        (uart_busy_o),
+        .tx_overflow_o    (uart_overflow_o),
+        .rx_overflow_o    (uart_rx_overflow_o),
+        .rx_frame_err_o   (uart_rx_frame_err_o),
+        .irq_o            (uart_irq),
+        .irq_upd_o        (uart_irq_upd)
     );
+
+    // The UART is PLIC source 1 (Spike's NS16550_INTERRUPT_ID); every other source
+    // is tied low in this SoC.
+    always_comb begin
+        plic_src_level     = '0;
+        plic_src_level[PLIC_UART_ID] = uart_irq;
+        plic_src_upd       = '0;
+        plic_src_upd[PLIC_UART_ID]   = uart_irq_upd;
+    end
+
+    eth_rv_plic #(
+        .BASE      (PLIC_BASE),
+        .PLIC_SIZE (PLIC_SIZE),
+        .NDEV      (PLIC_NDEV),
+        .PRIO_BITS (PLIC_PRIO_BITS)
+    ) u_plic (
+        .clk_i       (clk_i),
+        .rst_ni      (rst_ni),
+        .req_i       (req_i),
+        .we_i        (we_i),
+        .addr_i      (addr_i),
+        .wdata_i     (wdata_i),
+        .size_i      (size_i),
+        .sel_o       (plic_sel),
+        .rdata_o     (plic_rdata),
+        .err_o       (plic_err),
+        .src_level_i (plic_src_level),
+        .src_upd_i   (plic_src_upd),
+        .ctx_irq_o   (plic_irq)
+    );
+
+    assign meip_o = plic_irq[0];   // context 0 = M
+    assign seip_o = plic_irq[1];   // context 1 = S
 
 endmodule
 

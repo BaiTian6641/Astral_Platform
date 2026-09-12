@@ -92,6 +92,9 @@ RTL_SOURCES = [
     # The BootROM (E2-RV2 increment 5, S3): the 4 KiB region at 0x1000 the core
     # resets into; `eth_rv_mmio_mux` instantiates it, so it is part of every build.
     RTL_DIR / "eth_rv_boot_rom.sv",
+    # The PLIC (E2-RV2 increment 6, S5): the interrupt controller whose M/S
+    # contexts drive the hart's meip_i/seip_i, also instantiated by the MMIO mux.
+    RTL_DIR / "eth_rv_plic.sv",
     RTL_DIR / "eth_rv_mmio_mux.sv",
 ]
 
@@ -145,6 +148,11 @@ CORPUS_PROGRAMS = [
     # the one corpus program whose whole point is that the image loader and the
     # testbench must not assume entry == window base.
     "cor_boot",
+    # E2-RV2 increment 6 (S5): the devices a usable Linux needs — the PLIC with
+    # its S-mode external-interrupt path, and the console UART's receive path
+    # (RBR/LSR.DR/FCR/loopback/IIR and the RX interrupt as PLIC source 1).
+    "cor_plic",
+    "cor_uart_rx",
 ]
 
 BOOT_PROGRAM = "cor_boot"
@@ -161,7 +169,14 @@ what it received to ``+uart=<file>``; every program is then held to its expected
 payload below. `test_rv_uart.py` re-reads this constant against `cor_hello.S`,
 so the program and the assertion cannot drift apart."""
 
-EXPECTED_UART: dict[str, bytes] = {"cor_hello": HELLO_STRING}
+EXPECTED_UART: dict[str, bytes] = {
+    "cor_hello": HELLO_STRING,
+    # `cor_uart_rx` drives the receive register interface through MCR loopback (no
+    # transmit) except for its last check, which turns loopback off and puts
+    # exactly one byte on the line — the transmit-path assertion this program's
+    # `EXPECTED_UART` payload pins.
+    "cor_uart_rx": b"Z",
+}
 """Expected console output per corpus program: only `hello` uses the UART, and
 the other programs must leave the line completely idle (a stray device access
 would show up here as bytes nobody asked for). `cor_fault` writes a byte to the
