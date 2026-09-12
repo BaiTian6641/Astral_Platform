@@ -188,6 +188,11 @@ module eth_rv_core (
     output logic        rvfi_rd_we_o,
     output logic [4:0]  rvfi_rd_addr_o,
     output logic [63:0] rvfi_rd_wdata_o,
+    output logic        rvfi_rd_fp_o,      // the record writes an FP register (F/D)
+    output logic        rvfi_fflags_we_o,  // this commit wrote `fflags`
+    output logic [4:0]  rvfi_fflags_o,
+    output logic        rvfi_frm_we_o,     // this commit wrote `frm`
+    output logic [2:0]  rvfi_frm_o,
     output logic        rvfi_mem_valid_o,
     output logic [63:0] rvfi_mem_addr_o,
     output logic [63:0] rvfi_mem_wdata_o,
@@ -284,10 +289,11 @@ module eth_rv_core (
     logic        walk_done_fetch;
     assign walk_done_fetch = mmu_done && walk_is_fetch_r;
 
-    ctrl_t       dec_ctrl;
+     ctrl_t       dec_ctrl;
     logic [4:0]  dec_rd;
     logic [4:0]  dec_rs1;
     logic [4:0]  dec_rs2;
+    logic [4:0]  dec_rs3;
     logic [63:0] dec_imm;
 
     logic        dec_pred_taken;
@@ -295,9 +301,10 @@ module eth_rv_core (
         .is_c_i    (fetch_is_c),
         .insn_i    (fetch_insn),
         .ctrl_o    (dec_ctrl),
-        .rd_addr_o (dec_rd),
+         .rd_addr_o (dec_rd),
         .rs1_addr_o(dec_rs1),
         .rs2_addr_o(dec_rs2),
+        .rs3_addr_o(dec_rs3),
         .imm_o     (dec_imm),
         .pred_taken_o(dec_pred_taken)
     );
@@ -323,16 +330,20 @@ module eth_rv_core (
     logic [63:0] id_pred_r;
     logic [3:0]  id_fault_r;    // this instruction's fetch faulted (0 = it did not)
     ctrl_t       id_ctrl_r;
-    logic [4:0]  id_rd_r;
+     logic [4:0]  id_rd_r;
     logic [4:0]  id_rs1_r;
     logic [4:0]  id_rs2_r;
+    logic [4:0]  id_rs3_r;
     logic [63:0] id_imm_r;
 
     // =====================================================================
     // ID: register file read (combinational, no bypass)
     // =====================================================================
-    logic [63:0] id_rs1_val;
+     logic [63:0] id_rs1_val;
     logic [63:0] id_rs2_val;
+    logic [63:0] id_fp_rs1_val;
+    logic [63:0] id_fp_rs2_val;
+    logic [63:0] id_fp_rs3_val;
 
     // =====================================================================
     // ID/EX register
@@ -344,11 +355,15 @@ module eth_rv_core (
     logic [63:0] ex_pred_r;
     logic [3:0]  ex_fault_r;    // this instruction's fetch fault (0 = it did not)
     ctrl_t       ex_ctrl_r;
-    logic [4:0]  ex_rd_r;
+     logic [4:0]  ex_rd_r;
     logic [4:0]  ex_rs1_r;
     logic [4:0]  ex_rs2_r;
+    logic [4:0]  ex_rs3_r;
     logic [63:0] ex_rs1_val_r;
     logic [63:0] ex_rs2_val_r;
+    logic [63:0] ex_fp_rs1_val_r;
+    logic [63:0] ex_fp_rs2_val_r;
+    logic [63:0] ex_fp_rs3_val_r;
     logic [63:0] ex_imm_r;
 
     // =====================================================================
@@ -362,6 +377,10 @@ module eth_rv_core (
     logic [63:0] mem_wb_pre_r;      // result before the memory access (ALU / muldiv / link)
     logic [63:0] mem_addr_r;
     logic [63:0] mem_store_data_r;
+    logic        mem_fflags_we_r;
+    logic [4:0]  mem_fflags_val_r;
+    logic        mem_frm_we_r;
+    logic [2:0]  mem_frm_val_r;
 
     // =====================================================================
     // MEM/WB register (WB stage == commit stage)
@@ -378,6 +397,11 @@ module eth_rv_core (
     logic [7:0]  wb_wmask_r;
     logic [7:0]  wb_rmask_r;
     logic [63:0] order_r;
+    // the FP CSRs whose write a commit reports (the trace's `fflags=`/`frm=`)
+    logic        wb_fflags_we_r;
+    logic [4:0]  wb_fflags_r;
+    logic        wb_frm_we_r;
+    logic [2:0]  wb_frm_r;
 
     // =====================================================================
     // Control: stalls, flushes, hazard detection, trap detection
@@ -394,6 +418,23 @@ module eth_rv_core (
     logic        md_valid;
     logic [63:0] md_result;
     logic        md_started_r;
+    // ---- F/D (E2-RV2 increment 2) ----
+    logic        fp_start;        // launch the FPU this cycle
+    logic        fp_wait;         // EX holds an FP op whose result is not ready
+    logic        fp_valid;        // the FPU's result strobe
+    logic [63:0] fp_result;
+    logic [4:0]  fp_fflags;       // flags this FP operation raised
+    logic        fp_started_r;    // the launch pulse has been issued
+    logic [2:0]  ex_fp_rm_eff;    // rm after the dynamic (frm) substitution
+    logic        ex_fp_needs_fpu; // FP op that runs on the FPU (not a load/store)
+    logic        ex_fp_illegal;   // an FP instruction while mstatus.FS is Off
+    logic        ex_fp_rm_illegal;// a reserved rounding mode
+    logic        ex_fp_csr_off;   // fcsr/fflags/frm access while FS is Off
+    logic        ex_fs_dirty;     // this instruction sets mstatus.FS to Dirty
+    logic        ex_fpu_ff_we;    // this instruction raises fflags bits
+    logic [4:0]  ex_fpu_ff;       // ... and the bits it raises
+    logic        ex_fp_csr_we;    // this instruction writes an FP CSR
+    logic [63:0] ex_op1, ex_op2, ex_op3;  // class-resolved operands for the FPU
 
     logic        ex_redirect;
     logic [63:0] ex_next_pc;
@@ -476,6 +517,13 @@ module eth_rv_core (
     logic        ex_irq;         // ... and it is taken for the instruction in EX
 
     assign md_wait  = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv && !md_valid;
+    // The FPU handshake mirrors the M extension's: the launch is a one-cycle pulse
+    // (`fp_started_r` keeps it from re-issuing while the unit runs) and EX holds the
+    // instruction until `fp_valid`. FP loads and stores never enter the FPU — they
+    // are ordinary memory accesses whose destination happens to be a F register.
+     assign ex_fp_needs_fpu = ex_ctrl_r.is_fp && !ex_ctrl_r.is_load && !ex_ctrl_r.is_store
+                             && !ex_fp_illegal && !ex_fp_rm_illegal;
+    assign fp_wait  = ex_valid_r && !ex_ctrl_r.illegal && ex_fp_needs_fpu && !fp_valid;
     // The MEM stage holds its instruction until the access is done, which now
     // takes three steps: walk (if translation is on), drive, accept. A
     // misaligned access is a trap, not a stall: it never enters that sequence,
@@ -493,9 +541,19 @@ module eth_rv_core (
                              && !walk_is_fetch_r && (mmu_fault != 4'd0);
     assign mem_access_err = (mem_phase_r == MEM_ACC) && mem_is_access
                             && dmem_ready_i && dmem_err_i;
-    assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_load
-                      && (ex_rd_r != 5'd0) && id_valid_r
-                      && ((ex_rd_r == id_rs1_r) || (ex_rd_r == id_rs2_r));
+    // An FP load's destination is an FP register, `f0` included, so the hazard
+    // rule differs per class: the integer side keeps the x0 exclusion and matches
+    // only integer operands, the FP side matches FP operands (including `f0`) and
+    // the fused forms' third source.
+    assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_load && id_valid_r
+                      && (ex_ctrl_r.fp_we
+                          ? (((ex_rd_r == id_rs1_r) && id_ctrl_r.fp_rs1_fp)
+                             || ((ex_rd_r == id_rs2_r) && id_ctrl_r.fp_rs2_fp)
+                             || ((ex_rd_r == id_rs3_r)
+                                 && eth_rv_pkg::fp_op_is_fma(id_ctrl_r.fp_op)))
+                          : ((ex_rd_r != 5'd0)
+                             && (((ex_rd_r == id_rs1_r) && !id_ctrl_r.fp_rs1_fp)
+                                 || ((ex_rd_r == id_rs2_r) && !id_ctrl_r.fp_rs2_fp))));
     assign mem_misaligned = mem_valid_r && !mem_ctrl_r.illegal
                             && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && lsu_misaligned;
 
@@ -526,6 +584,22 @@ module eth_rv_core (
                                 || ((ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_SATP)
                                     && (csr_priv_r == eth_rv_pkg::PRV_S)
                                     && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_TVM) != 64'd0)));
+    // ---- F/D legality (Spike's `require_fp`, `validate_rm`, float_csr_t) ------
+    // While `mstatus.FS` is Off every FP instruction — arithmetic, load/store,
+    // move, compare, classify — is an illegal instruction, and so is any access to
+    // `fflags`/`frm`/`fcsr`. A rounding-mode field of 5..7 (after the `frm`
+    // substitution for the dynamic form) is illegal too; the compare/min/max/sgnj/
+    // class/move forms carry no rm field and are exempt, exactly like Spike.
+    assign ex_fp_rm_eff     = (ex_ctrl_r.fp_rm == 3'b111) ? csr_frm_r : ex_ctrl_r.fp_rm;
+    assign ex_fp_illegal    = ex_ctrl_r.is_fp
+                              && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_FS)
+                                  == eth_rv_pkg::MSTATUS_FS_OFF);
+    assign ex_fp_rm_illegal = ex_ctrl_r.is_fp && ex_ctrl_r.fp_rm_used
+                              && (ex_fp_rm_eff > 3'd4);
+    assign ex_fp_csr_off    = ex_ctrl_r.is_csr
+                              && eth_rv_pkg::csr_is_fp(ex_ctrl_r.csr_addr)
+                              && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_FS)
+                                  == eth_rv_pkg::MSTATUS_FS_OFF);
     assign ex_mret_illegal = ex_ctrl_r.is_mret && (csr_priv_r != eth_rv_pkg::PRV_M);
     // TSR (mstatus bit 22): when set, sret is an M-only instruction. TVM
     // (bit 20) is what makes `sfence.vma` and `satp` M-only in S-mode
@@ -604,12 +678,14 @@ module eth_rv_core (
     // check. A MEM-side trap outranks everything (its instruction is older).
     assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal
                                   && (ex_fault_r == 4'd0) && ex_next_pc[0];
-    assign ex_trap = ex_valid_r && !ex_stall
+     assign ex_trap = ex_valid_r && !ex_stall
                      && ((ex_fault_r != 4'd0) || ex_ctrl_r.illegal || ex_ctrl_r.is_ecall
                          || ex_ctrl_r.is_ebreak || ex_target_misaligned
                          || ex_csr_illegal || ex_mret_illegal || ex_sret_illegal
-                         || ex_sfence_illegal);
-    assign ex_irq = ex_valid_r && (ex_fault_r == 4'd0) && !md_started_r && !mem_trap && irq_take;
+                         || ex_sfence_illegal || ex_fp_illegal || ex_fp_rm_illegal
+                         || ex_fp_csr_off);
+     assign ex_irq = ex_valid_r && (ex_fault_r == 4'd0) && !md_started_r
+                    && !fp_started_r && !mem_trap && irq_take;
     assign mem_trap = mem_misaligned || mem_xlate_fault || mem_access_err;
     assign trap_is_irq = !mem_trap && ex_irq;
     assign trap_hit = mem_trap || ex_irq || ex_trap;
@@ -691,7 +767,7 @@ module eth_rv_core (
                          + ((trap_is_irq && (trap_to_s ? csr_stvec_r[0] : csr_mtvec_r[0]))
                             ? {58'd0, trap_cause, 2'b00} : 64'd0);
 
-    assign ex_stall    = md_wait || mem_wait;
+     assign ex_stall    = md_wait || mem_wait || fp_wait;
     assign front_stall = ex_stall || load_use;
     assign flush_all   = ex_redirect || trap_hit;
     assign id_consumed = id_valid_r && !front_stall && !flush_all;
@@ -793,8 +869,10 @@ module eth_rv_core (
                          && !ex_target_misaligned && (ex_next_pc != ex_pred_r);
 
     // ---- writeback value before the memory access ----
-    always_comb begin
-        if (ex_ctrl_r.is_muldiv) begin
+     always_comb begin
+        if (ex_fp_needs_fpu) begin
+            ex_wb_pre = fp_result;         // FPU: arithmetic, compare, convert, move
+        end else if (ex_ctrl_r.is_muldiv) begin
             ex_wb_pre = md_result;
         end else if (ex_ctrl_r.wb_sel == WB_LINK) begin
             ex_wb_pre = ex_pc_r + ex_len;
@@ -831,6 +909,11 @@ module eth_rv_core (
     logic [63:0] csr_scause_r;
     logic [63:0] csr_stval_r;
     logic [63:0] csr_sscratch_r;
+    // F extension: `fflags` and `frm` are independent registers (Spike's
+    // float_csr_t over two sub-CSRs) and `fcsr` is a VIEW of both, so a write
+    // through `fcsr` and a read through `fflags` + `frm` can never disagree.
+    logic [4:0]  csr_fflags_r;
+    logic [2:0]  csr_frm_r;
 
     logic [63:0] csr_rdata;
     logic [63:0] csr_wdata;
@@ -879,6 +962,9 @@ module eth_rv_core (
             eth_rv_pkg::CSR_MTVAL:     csr_rdata = csr_mtval_r;
             eth_rv_pkg::CSR_STVAL:     csr_rdata = csr_stval_r;
             eth_rv_pkg::CSR_MHARTID:   csr_rdata = eth_rv_pkg::MHARTID_VALUE;
+            eth_rv_pkg::CSR_FFLAGS:    csr_rdata = {59'd0, csr_fflags_r};
+            eth_rv_pkg::CSR_FRM:       csr_rdata = {61'd0, csr_frm_r};
+            eth_rv_pkg::CSR_FCSR:      csr_rdata = {56'd0, csr_frm_r, csr_fflags_r};
             default:                   csr_rdata = 64'd0;
         endcase
     end
@@ -893,8 +979,9 @@ module eth_rv_core (
     // instruction LEAVES EX: `!ex_stall` keeps a frozen stage from writing twice,
     // and `!trap_hit` keeps a younger instruction from writing when an older one
     // (or an interrupt) traps.
-    assign ex_csr_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_csr
+     assign ex_csr_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_csr
                        && ((ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) || (ex_csr_src != 64'd0));
+    assign ex_fp_csr_we = ex_csr_we && eth_rv_pkg::csr_is_fp(ex_ctrl_r.csr_addr);
     // `sfence.vma`: no translation state is cached (see cor_mmu), so the
     // instruction has nothing to invalidate beyond its privilege check. It
     // writes no register, so it must not execute as a CSR write either.
@@ -902,6 +989,51 @@ module eth_rv_core (
     assign csr_wdata = (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) ? ex_csr_src
                        : (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RS) ? (csr_rdata | ex_csr_src)
                                                                   : (csr_rdata & ~ex_csr_src);
+    // The FP CSRs' write values: `fcsr` splits into frm[7:5] and fflags[4:0],
+    // exactly Spike's composite_csr_t over the two sub-CSRs.
+    logic [4:0] csr_wdata_fflags;
+    logic [2:0] csr_wdata_frm;
+    assign csr_wdata_fflags = csr_wdata[4:0] & eth_rv_pkg::FFLAGS_MASK;
+    assign csr_wdata_frm    = ((ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_FCSR)
+                               ? csr_wdata[7:5] : csr_wdata[2:0])
+                              & eth_rv_pkg::FRM_MASK;
+    // The FPU's own fflags accrual: an FP operation writes fflags only when it
+    // RAISED a flag (SoftFloat's `raise_fp_exceptions` is `if (flags) write(...)`),
+    // and a trap outranks it exactly like every other EX-side CSR write. The FPU
+    // raises its flags on the cycle it completes, which is the cycle the
+    // instruction leaves EX — so the register is read by the NEXT instruction.
+    assign ex_fpu_ff_we = fp_valid && ex_valid_r && !trap_hit && (fp_fflags != 5'd0);
+    assign ex_fpu_ff    = fp_fflags;
+    // An instruction that writes an FP REGISTER sets mstatus.FS to Dirty — Spike
+    // reaches it through `WRITE_FRD`, so it covers arithmetic, conversions, moves
+    // and FP LAODS, but not FP stores or the integer-producing compares/fclass.
+    // The FP CSR writes set it from their own write branch below.
+    assign ex_fs_dirty = ex_valid_r && !ex_stall && !trap_hit
+                         && ex_ctrl_r.is_fp && ex_ctrl_r.fp_we;
+
+    // What this instruction reports to the commit trace as an `fflags`/`frm`
+    // update: the new register value, or "no write". It is written here (EX) and
+    // carried to the commit stage, so the trace record and the architectural
+    // update are the same event.
+    logic        ex_fflags_wr_we;
+    logic [4:0]  ex_fflags_wr_val;
+    logic        ex_frm_wr_we;
+    logic [2:0]  ex_frm_wr_val;
+
+    always_comb begin
+        ex_fflags_wr_we  = ex_fpu_ff_we;
+        ex_fflags_wr_val = csr_fflags_r | ex_fpu_ff;
+        ex_frm_wr_we     = 1'b0;
+        ex_frm_wr_val    = csr_frm_r;
+        if (ex_fp_csr_we) begin
+            ex_fflags_wr_we  = (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_FFLAGS)
+                               || (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_FCSR);
+            ex_fflags_wr_val = csr_wdata_fflags;
+            ex_frm_wr_we     = (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_FRM)
+                               || (ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_FCSR);
+            ex_frm_wr_val    = csr_wdata_frm;
+        end
+    end
 
     // mstatus write value: the WARL mask, with MPP legalized (Spike's
     // legalize_privilege(): 2'b10 is not a mode this hart has, so it becomes U).
@@ -928,8 +1060,10 @@ module eth_rv_core (
     // starts, so it must also suppress the mul/div launch: Spike checks for
     // pending interrupts before executing, and a live multiplier would otherwise
     // finish work the golden model never started.
-    assign md_start = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv
+     assign md_start = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv
                       && !md_started_r && !ex_irq;
+    assign fp_start = ex_valid_r && !ex_ctrl_r.illegal && ex_fp_needs_fpu
+                      && !fp_started_r && !ex_irq;
 
     // =====================================================================
     // Sv39 walker: shared by the fetch path and the MEM stage
@@ -994,6 +1128,79 @@ module eth_rv_core (
         .result_o(md_result),
         .valid_o (md_valid)
     );
+    // =====================================================================
+    // F/D: the FP register file, its forwarding network and the FPU
+    // =====================================================================
+    // The FP registers are a SEPARATE 32-entry file with its own write port and its
+    // own forwarding network: an FP producer must never forward into an integer
+    // operand (or the other way round), which the `fp_we` class bit of each
+    // pipeline stage selects. `f0` is an ordinary register, so there is no
+    // hard-wired-zero rule on either the write or the bypass.
+    logic [63:0] ex_fwd_a_fp;
+    logic [63:0] ex_fwd_b_fp;
+    logic [63:0] ex_fwd_c_fp;
+
+    always_comb begin
+        ex_fwd_a_fp = ex_fp_rs1_val_r;
+        if (wb_valid_r && wb_ctrl_r.fp_we && (wb_rd_r == ex_rs1_r)) begin
+            ex_fwd_a_fp = wb_data_r;
+        end
+        if (mem_valid_r && mem_ctrl_r.fp_we && !mem_ctrl_r.is_load
+            && (mem_rd_r == ex_rs1_r)) begin
+            ex_fwd_a_fp = mem_wb_pre_r;      // the younger producer wins
+        end
+    end
+
+    always_comb begin
+        ex_fwd_b_fp = ex_fp_rs2_val_r;
+        if (wb_valid_r && wb_ctrl_r.fp_we && (wb_rd_r == ex_rs2_r)) begin
+            ex_fwd_b_fp = wb_data_r;
+        end
+        if (mem_valid_r && mem_ctrl_r.fp_we && !mem_ctrl_r.is_load
+            && (mem_rd_r == ex_rs2_r)) begin
+            ex_fwd_b_fp = mem_wb_pre_r;
+        end
+    end
+
+    always_comb begin
+        ex_fwd_c_fp = ex_fp_rs3_val_r;
+        if (wb_valid_r && wb_ctrl_r.fp_we && (wb_rd_r == ex_rs3_r)) begin
+            ex_fwd_c_fp = wb_data_r;
+        end
+        if (mem_valid_r && mem_ctrl_r.fp_we && !mem_ctrl_r.is_load
+            && (mem_rd_r == ex_rs3_r)) begin
+            ex_fwd_c_fp = mem_wb_pre_r;
+        end
+    end
+
+    // the operand's class is a property of the ENCODING (fcvt.d.w reads an integer
+    // register, fcvt.w.d an FP one), so the mux is driven by the decode bits
+    assign ex_op1 = ex_ctrl_r.fp_rs1_fp ? ex_fwd_a_fp : ex_fwd_a;
+    assign ex_op2 = ex_ctrl_r.fp_rs2_fp ? ex_fwd_b_fp : ex_fwd_b;
+    assign ex_op3 = ex_fwd_c_fp;
+    // The FPU's third operand port is the ADDEND: rs3 for the fused forms, and the
+    // second source for add/subtract (whose encode has no rs3 field at all — the
+    // fused `b` port is the unit multiplier there).
+    logic [63:0] fp_opc;
+    assign fp_opc = ((ex_ctrl_r.fp_op == eth_rv_pkg::FP_ADD)
+                     || (ex_ctrl_r.fp_op == eth_rv_pkg::FP_SUB)) ? ex_op2 : ex_op3;
+
+    cor_fpu u_fpu (
+        .clk_i        (clk_i),
+        .rst_ni       (rst_ni),
+        .start_i      (fp_start),
+        .op_i         (ex_ctrl_r.fp_op),
+        .single_i     (ex_ctrl_r.fp_single),
+        .src_single_i (ex_ctrl_r.fp_src_single),
+        .iw_i         (ex_ctrl_r.fp_iw),
+        .rm_i         (ex_fp_rm_eff),
+        .a_i          (ex_op1),
+        .b_i          (ex_op2),
+        .c_i          (fp_opc),
+        .result_o     (fp_result),
+        .fflags_o     (fp_fflags),
+        .valid_o      (fp_valid)
+    );
 
     // =====================================================================
     // MEM stage
@@ -1003,6 +1210,14 @@ module eth_rv_core (
     logic [7:0]  lsu_wstrb;
     logic [7:0]  lsu_rmask;
     logic        lsu_misaligned;
+    logic [63:0] mem_load_data;   // after the FLW NaN-box
+
+    // FLW loads a binary32 into an F register, and every single-precision value in
+    // an F register is NaN-boxed: the upper 32 bits are all ones (Spike's
+    // `WRITE_FRD(f32(MMU.load<uint32_t>(…)))`). FLD needs no such step.
+    assign mem_load_data = (mem_ctrl_r.fp_we && (mem_ctrl_r.mem_size == eth_rv_pkg::SZ_WORD))
+                           ? {32'hffff_ffff, lsu_load_data[31:0]}
+                           : lsu_load_data;
 
     cor_lsu u_lsu (
         .signed_i    (mem_ctrl_r.mem_signed),
@@ -1052,8 +1267,12 @@ module eth_rv_core (
     // WB stage / commit + trace
     // =====================================================================
     logic wb_we;
+    logic wb_fp_we;
 
     assign wb_we = wb_valid_r && wb_ctrl_r.rf_we && !wb_ctrl_r.illegal && (wb_rd_r != 5'd0);
+    // ... and the FP half of the commit: `f0` is a real register, so the only guard
+    // is "it was not rejected as illegal".
+    assign wb_fp_we = wb_valid_r && wb_ctrl_r.fp_we && !wb_ctrl_r.illegal;
 
     cor_regfile u_regfile (
         .clk_i    (clk_i),
@@ -1066,13 +1285,33 @@ module eth_rv_core (
         .rdata_a_o(id_rs1_val),
         .rdata_b_o(id_rs2_val)
     );
+    cor_fp_regfile u_fp_regfile (
+        .clk_i    (clk_i),
+        .rst_ni   (rst_ni),
+        .we_i     (wb_fp_we),
+        .waddr_i  (wb_rd_r),
+        .wdata_i  (wb_data_r),
+        .raddr_a_i(id_rs1_r),
+        .raddr_b_i(id_rs2_r),
+        .raddr_c_i(id_rs3_r),
+        .rdata_a_o(id_fp_rs1_val),
+        .rdata_b_o(id_fp_rs2_val),
+        .rdata_c_o(id_fp_rs3_val)
+    );
 
-    assign rvfi_valid_o     = wb_valid_r;
+     assign rvfi_valid_o     = wb_valid_r;
     assign rvfi_order_o     = order_r;
     assign rvfi_pc_o        = wb_pc_r;
     assign rvfi_insn_o      = wb_insn_r;
-    assign rvfi_rd_we_o     = wb_valid_r && wb_ctrl_r.rf_we && !wb_ctrl_r.illegal
-                              && (wb_rd_r != 5'd0);
+    assign rvfi_rd_we_o     = wb_we || wb_fp_we;
+    assign rvfi_rd_fp_o     = wb_fp_we;
+    // ... and the FP state a commit reports: gated on the record being a real
+    // commit, because the MEM/WB pipeline register keeps its old `we` while a
+    // bubble passes through it.
+    assign rvfi_fflags_we_o = wb_valid_r && wb_fflags_we_r;
+    assign rvfi_fflags_o    = wb_fflags_r;
+    assign rvfi_frm_we_o    = wb_valid_r && wb_frm_we_r;
+    assign rvfi_frm_o       = wb_frm_r;
     assign rvfi_rd_addr_o   = wb_rd_r;
     assign rvfi_rd_wdata_o  = wb_data_r;
     assign rvfi_mem_valid_o = wb_valid_r && !wb_ctrl_r.illegal
@@ -1156,8 +1395,10 @@ module eth_rv_core (
             csr_sepc_r     <= 64'd0;
             csr_scause_r   <= 64'd0;
             csr_stval_r    <= 64'd0;
-            csr_sscratch_r <= 64'd0;
+             csr_sscratch_r <= 64'd0;
             csr_satp_r     <= 64'd0;
+            csr_fflags_r   <= 5'd0;
+            csr_frm_r      <= 3'd0;
         end else if (trap_hit) begin
             if (trap_to_s) begin
                 // Delegated trap: the S-mode stack. SPIE <= SIE, SPP <= the mode
@@ -1258,14 +1499,38 @@ module eth_rv_core (
                         csr_satp_r <= csr_wdata;
                     end
                 end
-                eth_rv_pkg::CSR_SSCRATCH: begin
+                 eth_rv_pkg::CSR_SSCRATCH: begin
                     csr_sscratch_r <= csr_wdata;
                 end
-                // misa is WARL read-only in practice, mcounteren/scounteren have a
+                // The F-extension CSRs: `fflags` and `frm` are independent
+                // registers, `fcsr` writes both halves. A write to any of them
+                // also sets `mstatus.FS` to Dirty (float_csr_t::unlogged_write),
+                // which the shared FS-dirty term below carries.
+                eth_rv_pkg::CSR_FFLAGS: begin
+                    csr_fflags_r <= csr_wdata_fflags;
+                end
+                eth_rv_pkg::CSR_FRM: begin
+                    csr_frm_r <= csr_wdata_frm;
+                end
+                eth_rv_pkg::CSR_FCSR: begin
+                    csr_fflags_r <= csr_wdata_fflags;
+                    csr_frm_r    <= csr_wdata_frm;
+                end
+                 // misa is WARL read-only in practice, mcounteren/scounteren have a
                 // zero write mask without Zicntr, and a write to the read-only
                 // mhartid never gets here (it traps as an illegal instruction).
                 default: ;
             endcase
+        end else if (ex_fpu_ff_we) begin
+            // an FP operation accrued flags: fflags |= raised (SoftFloat's
+            // `raise_fp_exceptions`)
+            csr_fflags_r <= csr_fflags_r | ex_fpu_ff;
+        end else if (ex_fs_dirty) begin
+            // any instruction that WRITES an FP register — arithmetic, conversion,
+            // move, or an FP load — sets FS to Dirty (Spike's `dirty_fp_state`,
+            // reached through `WRITE_FRD`). An FP STORE does not: Spike's
+            // fsd/fsw only read the register.
+            csr_mstatus_r <= csr_mstatus_r | eth_rv_pkg::MSTATUS_FS;
         end else if (ex_mret_we) begin
             // xRET: MIE <= MPIE, MPIE <= 1, MPP <= U (the least-privileged mode),
             // MPRV cleared unless the restored mode is M, and the hart returns to
@@ -1381,9 +1646,10 @@ module eth_rv_core (
             id_pred_r  <= 64'd0;
             id_fault_r <= 4'd0;
             id_ctrl_r  <= '0;
-            id_rd_r    <= 5'd0;
+             id_rd_r    <= 5'd0;
             id_rs1_r   <= 5'd0;
             id_rs2_r   <= 5'd0;
+            id_rs3_r   <= 5'd0;
             id_imm_r   <= 64'd0;
         end else if (flush_all) begin
             id_valid_r <= 1'b0;
@@ -1400,9 +1666,10 @@ module eth_rv_core (
                 // a faulted fetch has no encoding to decode: the control word is
                 // zeroed so the fault marker alone decides what happens in EX
                 id_ctrl_r  <= (fetch_fault_cause != 4'd0) ? '0 : dec_ctrl;
-                id_rd_r    <= dec_rd;
+                 id_rd_r    <= dec_rd;
                 id_rs1_r   <= dec_rs1;
                 id_rs2_r   <= dec_rs2;
+                id_rs3_r   <= dec_rs3;
                 id_imm_r   <= dec_imm;
             end
         end
@@ -1418,18 +1685,29 @@ module eth_rv_core (
             ex_pred_r     <= 64'd0;
             ex_fault_r    <= 4'd0;
             ex_ctrl_r     <= '0;
-            ex_rd_r       <= 5'd0;
+             ex_rd_r       <= 5'd0;
             ex_rs1_r      <= 5'd0;
             ex_rs2_r      <= 5'd0;
+            ex_rs3_r      <= 5'd0;
             ex_rs1_val_r  <= 64'd0;
             ex_rs2_val_r  <= 64'd0;
+            ex_fp_rs1_val_r <= 64'd0;
+            ex_fp_rs2_val_r <= 64'd0;
+            ex_fp_rs3_val_r <= 64'd0;
             ex_imm_r      <= 64'd0;
             md_started_r  <= 1'b0;
+            fp_started_r  <= 1'b0;
         end else begin
-            if (md_start) begin
+             if (md_start) begin
                 md_started_r <= 1'b1;
             end else if (!ex_stall) begin
                 md_started_r <= 1'b0;
+            end
+            // the FPU's launch pulse is a one-shot too
+            if (fp_start) begin
+                fp_started_r <= 1'b1;
+            end else if (!ex_stall || trap_hit) begin
+                fp_started_r <= 1'b0;
             end
             // A trap outranks the stall: an interrupt is taken in the EX slot's
             // first cycle (before the instruction starts), even while `ex_stall`
@@ -1452,11 +1730,15 @@ module eth_rv_core (
                     ex_pred_r    <= id_pred_r;
                     ex_fault_r   <= id_fault_r;
                     ex_ctrl_r    <= id_ctrl_r;
-                    ex_rd_r      <= id_rd_r;
+                     ex_rd_r      <= id_rd_r;
                     ex_rs1_r     <= id_rs1_r;
                     ex_rs2_r     <= id_rs2_r;
+                    ex_rs3_r     <= id_rs3_r;
                     ex_rs1_val_r <= id_rs1_val;
                     ex_rs2_val_r <= id_rs2_val;
+                    ex_fp_rs1_val_r <= id_fp_rs1_val;
+                    ex_fp_rs2_val_r <= id_fp_rs2_val;
+                    ex_fp_rs3_val_r <= id_fp_rs3_val;
                     ex_imm_r     <= id_imm_r;
                 end
             end
@@ -1473,7 +1755,11 @@ module eth_rv_core (
             mem_rd_r         <= 5'd0;
             mem_wb_pre_r     <= 64'd0;
             mem_addr_r       <= 64'd0;
-            mem_store_data_r <= 64'd0;
+             mem_store_data_r <= 64'd0;
+            mem_fflags_we_r  <= 1'b0;
+            mem_fflags_val_r <= 5'd0;
+            mem_frm_we_r     <= 1'b0;
+            mem_frm_val_r    <= 3'd0;
         end else if (trap_hit) begin
             // the trapping instruction (or the younger one behind a MEM trap) must
             // not enter MEM: neither may perform a memory access or commit. This
@@ -1494,11 +1780,16 @@ module eth_rv_core (
                 mem_ctrl_r.is_load    <= ex_ctrl_r.is_load;
                 mem_ctrl_r.is_store   <= ex_ctrl_r.is_store;
                 mem_ctrl_r.mem_size   <= ex_ctrl_r.mem_size;
-                mem_ctrl_r.mem_signed <= ex_ctrl_r.mem_signed;
+                 mem_ctrl_r.mem_signed <= ex_ctrl_r.mem_signed;
+                mem_ctrl_r.fp_we      <= ex_ctrl_r.fp_we;
                 mem_rd_r         <= ex_rd_r;
                 mem_wb_pre_r     <= ex_wb_pre;
                 mem_addr_r       <= ex_alu_res;      // load/store address
-                mem_store_data_r <= ex_fwd_b;        // store data (rs2)
+                 mem_store_data_r <= ex_op2;          // store data (rs2, FP-aware)
+                mem_fflags_we_r  <= ex_fflags_wr_we;
+                mem_fflags_val_r <= ex_fflags_wr_val;
+                mem_frm_we_r     <= ex_frm_wr_we;
+                mem_frm_val_r    <= ex_frm_wr_val;
             end
         end
     end
@@ -1516,8 +1807,12 @@ module eth_rv_core (
             wb_paddr_r      <= 64'd0;
             wb_store_data_r <= 64'd0;
             wb_wmask_r      <= 8'd0;
-            wb_rmask_r      <= 8'd0;
+             wb_rmask_r      <= 8'd0;
             order_r         <= 64'd1;
+            wb_fflags_we_r  <= 1'b0;
+            wb_fflags_r     <= 5'd0;
+            wb_frm_we_r     <= 1'b0;
+            wb_frm_r        <= 3'd0;
         end else begin
             // a trapping MEM instruction must not reach WB: no commit record, no
             // register write and (for a store) no bus transaction
@@ -1528,17 +1823,22 @@ module eth_rv_core (
                 wb_ctrl_r.illegal  <= mem_ctrl_r.illegal;
                 wb_ctrl_r.rf_we    <= mem_ctrl_r.rf_we;
                 wb_ctrl_r.is_load  <= mem_ctrl_r.is_load;
-                wb_ctrl_r.is_store <= mem_ctrl_r.is_store;
+                 wb_ctrl_r.is_store <= mem_ctrl_r.is_store;
+                wb_ctrl_r.fp_we    <= mem_ctrl_r.fp_we;
                 wb_rd_r         <= mem_rd_r;
-                wb_data_r       <= mem_ctrl_r.is_load ? lsu_load_data : mem_wb_pre_r;
+                 wb_data_r       <= mem_ctrl_r.is_load ? mem_load_data : mem_wb_pre_r;
                 wb_addr_r       <= mem_addr_r;
                 wb_paddr_r      <= mem_paddr_r;
                 // Spike logs the stored data truncated to the access size, so the
                 // trace carries exactly that (see the RVFI block above)
                 wb_store_data_r <= eth_rv_pkg::store_wdata(mem_store_data_r,
                                                            mem_ctrl_r.mem_size);
-                wb_wmask_r      <= mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
+                 wb_wmask_r      <= mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
                 wb_rmask_r      <= mem_ctrl_r.is_load  ? lsu_rmask : 8'd0;
+                wb_fflags_we_r  <= mem_fflags_we_r;
+                wb_fflags_r     <= mem_fflags_val_r;
+                wb_frm_we_r     <= mem_frm_we_r;
+                wb_frm_r        <= mem_frm_val_r;
             end
             if (wb_valid_r) begin
                 order_r <= order_r + 64'd1;
@@ -1817,8 +2117,19 @@ module eth_rv_core (
                 assert(dmem_we_o || (dmem_wstrb_o == 8'd0));             // a read never writes
             end
 
-            // ---- P7: a record never reports a write to x0 --------------------
-            assert(!rvfi_rd_we_o || (rvfi_valid_o && (rvfi_rd_addr_o != 5'd0)));
+            // ---- P7: a record never reports an INTEGER write to x0 -----------
+            // x0 is hard-wired zero, so an integer record never names it. `f0` is
+            // an ORDINARY register (F/D, E2-RV2 increment 2), so the rule is
+            // class-dependent: a record may write f0.
+            assert(!rvfi_rd_we_o || (rvfi_valid_o
+                                     && (rvfi_rd_fp_o || (rvfi_rd_addr_o != 5'd0))));
+            assert(!rvfi_rd_fp_o || rvfi_rd_we_o);   // the class bit implies a write
+
+            // ---- P11: the FP record only ever accompanies a commit ------------
+            // `fflags`/`frm` are reported by the instruction that wrote them, so a
+            // report on a bubble (or in a record that does not exist) is a bug.
+            assert(!rvfi_fflags_we_o || rvfi_valid_o);
+            assert(!rvfi_frm_we_o || rvfi_valid_o);
 
             // ---- P9: the D port has exactly one client ------------------------
             // The walker's PTE read and the MEM stage's access are mutually
@@ -1881,6 +2192,12 @@ module eth_rv_core (
             cover(rvfi_valid_o);
             cover(rvfi_valid_o && rvfi_rd_we_o);
             cover(rvfi_valid_o && !rvfi_rd_we_o);
+            // F/D (E2-RV2 increment 2): the FP record classes
+            cover(rvfi_valid_o && rvfi_rd_fp_o);
+            cover(rvfi_valid_o && rvfi_rd_fp_o && (rvfi_rd_addr_o == 5'd0));
+            cover(rvfi_valid_o && rvfi_fflags_we_o);
+            cover(rvfi_valid_o && rvfi_frm_we_o);
+            cover(rvfi_valid_o && rvfi_fflags_we_o && rvfi_frm_we_o);
             cover(rvfi_valid_o && rvfi_mem_valid_o && wb_ctrl_r.is_load);
             cover(rvfi_valid_o && rvfi_mem_valid_o && wb_ctrl_r.is_store);
             cover(rvfi_valid_o && rvfi_mem_valid_o && (rvfi_mem_wmask_o == 8'hff));

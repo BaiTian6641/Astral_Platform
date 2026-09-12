@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from rv_dut import (
+    INJECTION_FIELDS,
     DutSpecError,
     InjectedDUT,
     Injection,
@@ -115,6 +116,8 @@ def test_bad_dut_specs_are_rejected(spec: str) -> None:
         ("12:rd=a0", "rd", 10),
         ("12:cycle=99", "cycle", 99),
         ("12:value=42", "value", 42),
+        ("12:fflags=0x1f", "fflags", 31),
+        ("12:frm=7", "frm", 7),
     ],
 )
 def test_injection_specs_parse(spec: str, field: str, value: int) -> None:
@@ -124,7 +127,19 @@ def test_injection_specs_parse(spec: str, field: str, value: int) -> None:
 
 @pytest.mark.parametrize(
     "spec",
-    ["12", "12:value", "12:nope=1", "x:value=1", "-1:value=1", "12:value=zz", "12:rd=-", "12:rd=x99"],
+    [
+        "12",
+        "12:value",
+        "12:nope=1",
+        "x:value=1",
+        "-1:value=1",
+        "12:value=zz",
+        "12:rd=-",
+        "12:rd=x99",
+        "12:fflags=32",
+        "12:fflags=-1",
+        "12:frm=8",
+    ],
 )
 def test_bad_injection_specs_are_rejected(spec: str) -> None:
     with pytest.raises(DutSpecError):
@@ -165,3 +180,40 @@ def test_injected_dut_wraps_another_source(tmp_path: Path) -> None:
     assert commits[0].cycle == 42
     assert commits[1:] == _commits()[1:]
     assert "+inject[0:cycle=0x2a]" in dut.describe()
+
+
+# --- FP-record injection (RV-C) ----------------------------------------------------
+
+
+def test_injection_fields_cover_the_fp_record() -> None:
+    assert {"fflags", "frm"} <= set(INJECTION_FIELDS)
+
+
+def test_fp_injections_replace_the_control_state() -> None:
+    """Injecting ``fflags``/``frm`` corrupts the keyed FP record and nothing else."""
+    commit = Commit(
+        cycle=3,
+        pc=0x8000_0008,
+        rd=4,
+        value=0x7FF8_0000_0000_0000,
+        rd_is_fp=True,
+        fflags=0x10,
+    )
+    injected = apply_injection(commit, Injection.parse("3:fflags=0x1f"))
+    assert (injected.fflags, injected.rd, injected.rd_is_fp, injected.value) == (
+        0x1F,
+        4,
+        True,
+        0x7FF8_0000_0000_0000,
+    )
+    assert injected.mem_addr is None  # an FP injection never invents a memory access
+    assert commit.fflags == 0x10  # the original is untouched
+    # a commit that reported no frm gets one, so the comparator can report it
+    assert apply_injection(commit, Injection.parse("3:frm=1")).frm == 1
+
+
+def test_value_injection_corrupts_the_raw_fp_value() -> None:
+    """The FP value rides in ``value``, so no FP-specific field is needed for it."""
+    commit = Commit(cycle=1, pc=0x8000_0000, rd=1, value=0x3FF0_0000_0000_0000, rd_is_fp=True)
+    injected = apply_injection(commit, Injection.parse("0:value=0xdeadbeef"))
+    assert (injected.value, injected.rd, injected.rd_is_fp) == (0xDEAD_BEEF, 1, True)

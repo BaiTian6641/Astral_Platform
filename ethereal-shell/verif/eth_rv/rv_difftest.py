@@ -39,13 +39,20 @@ from pathlib import Path
 
 from rv_dut import CommitSource, DutSpecError, InjectedDUT, Injection, load_dut
 from rv_image import ImageError, load_elf_image
-from rv_spike import SpikeError, is_spike_log, normalize_spike_log, run_spike
+from rv_spike import (
+    DEFAULT_ISA,
+    SpikeError,
+    is_spike_log,
+    normalize_spike_log,
+    run_spike,
+)
 from rv_trace import (
     Commit,
     TraceFormatError,
     format_reg,
     is_canonical_trace,
     parse_trace,
+    stream_has_fp_info,
     stream_has_mem_info,
 )
 
@@ -60,6 +67,9 @@ KIND_CYCLE = "cycle_mismatch"
 KIND_MEM_ADDR = "mem_addr_mismatch"
 KIND_MEM_WDATA = "mem_wdata_mismatch"
 KIND_MEM_MASK = "mem_mask_mismatch"
+KIND_FP_CLASS = "fp_class_mismatch"
+KIND_FFLAGS = "fflags_mismatch"
+KIND_FRM = "frm_mismatch"
 KIND_TRUNCATED = "dut_trace_truncated"
 KIND_EXTRA = "dut_trace_extra_commits"
 
@@ -80,9 +90,14 @@ class Divergence:
 
     def lines(self, *, golden_label: str, dut_label: str) -> list[str]:
         """Human-readable report: pc, register and cycle of the first divergence."""
+        # the register class is part of the register name (x7 vs f7): report the
+        # class the comparison knew about, so an FP commit never prints as ``x<d>``
+        is_fp = (self.dut is not None and self.dut.rd_is_fp) or (
+            self.golden is not None and self.golden.rd_is_fp
+        )
         header = (
             f"DIVERGENCE ({self.kind}) at commit #{self.index} (cycle {self.cycle}): "
-            f"pc=0x{self.pc:016x} rd={format_reg(self.rd)}"
+            f"pc=0x{self.pc:016x} rd={format_reg(self.rd, is_fp=is_fp)}"
         )
         report = [header]
         report.append(f"  golden [{golden_label}]: {_render(self.golden)}")
@@ -217,26 +232,79 @@ def _mask_divergence(index: int, golden: Commit, dut: Commit) -> Divergence | No
     return None
 
 
+def _reg_class_text(commit: Commit) -> str:
+    """The register a commit writes, with its class (``f7`` / ``x7`` / ``-``)."""
+    return format_reg(commit.rd, is_fp=commit.rd_is_fp)
+
+
+def _fp_state_text(value: int | None) -> str:
+    """One FP control field for a divergence report (``None`` = the CSR was not written)."""
+    return "not written" if value is None else f"0x{value:02x}"
+
+
+def _fp_divergence(index: int, golden: Commit, dut: Commit) -> Divergence | None:
+    """The first FP-control-state divergence between two commits, or ``None``.
+
+    Called only when both streams are FP-aware (``stream_has_fp_info``); the
+    register *class* is checked with the register number in
+    :func:`first_divergence`. ``fflags``/``frm`` are compared value by value —
+    ``None`` means the instruction wrote neither CSR, so a side that reports an
+    update where the other reports none is a divergence, not "not provided".
+    """
+    if golden.fflags != dut.fflags:
+        return Divergence(
+            index=index,
+            kind=KIND_FFLAGS,
+            cycle=dut.cycle,
+            pc=dut.pc,
+            rd=dut.rd,
+            golden=golden,
+            dut=dut,
+            detail=(
+                "fflags mismatch: golden "
+                f"{_fp_state_text(golden.fflags)} != dut {_fp_state_text(dut.fflags)}"
+            ),
+        )
+    if golden.frm != dut.frm:
+        return Divergence(
+            index=index,
+            kind=KIND_FRM,
+            cycle=dut.cycle,
+            pc=dut.pc,
+            rd=dut.rd,
+            golden=golden,
+            dut=dut,
+            detail=(
+                f"frm mismatch: golden {_fp_state_text(golden.frm)} != "
+                f"dut {_fp_state_text(dut.frm)}"
+            ),
+        )
+    return None
+
+
 def first_divergence(
     golden: Iterable[Commit],
     dut: Iterable[Commit],
     *,
     check_cycle: bool = True,
     check_mem: bool = True,
+    check_fp: bool = True,
     max_commits: int | None = None,
 ) -> Divergence | None:
     """The first differing commit, or ``None`` when the streams are identical.
 
     Order of checks per commit: cycle (optional), pc, register number, register
-    value, then the optional memory stream (C14 §5.2) — address, store data and
-    the DUT's byte-lane masks. ``max_commits`` stops the comparison after N
-    commits (a prefix check for long programs); the streams must still have the
-    same length otherwise.
+    class (``rd_is_fp``, optional), register value, the optional memory stream
+    (C14 §5.2) — address, store data and the DUT's byte-lane masks — and finally
+    the optional FP control state (``fflags``/``frm``). ``max_commits`` stops the
+    comparison after N commits (a prefix check for long programs); the streams
+    must still have the same length otherwise.
 
-    ``check_mem`` must only be set when *both* streams report their memory
-    accesses (``rv_trace.stream_has_mem_info``); the CLI decides that once for
-    the whole run so a 4-field DUT dump is compared on pc/rd/value alone and the
-    memory stream is reported as not provided rather than silently passing.
+    ``check_mem``/``check_fp`` must only be set when *both* streams report the
+    corresponding record (``rv_trace.stream_has_mem_info`` /
+    ``stream_has_fp_info``); the CLI decides that once for the whole run so a DUT
+    dump that carries neither is compared on pc/rd/value alone and the missing
+    streams are reported as not provided rather than silently passing.
     """
     golden_iter = iter(golden)
     dut_iter = iter(dut)
@@ -303,6 +371,20 @@ def first_divergence(
                     " (divergent control flow)"
                 ),
             )
+        if check_fp and golden_commit.rd_is_fp != dut_commit.rd_is_fp:
+            return Divergence(
+                index=index,
+                kind=KIND_FP_CLASS,
+                cycle=dut_commit.cycle,
+                pc=dut_commit.pc,
+                rd=dut_commit.rd,
+                golden=golden_commit,
+                dut=dut_commit,
+                detail=(
+                    f"register class mismatch at pc 0x{dut_commit.pc:016x}: golden writes "
+                    f"{_reg_class_text(golden_commit)}, dut writes {_reg_class_text(dut_commit)}"
+                ),
+            )
         if golden_commit.rd != dut_commit.rd:
             return Divergence(
                 index=index,
@@ -335,6 +417,10 @@ def first_divergence(
             mem_divergence = _mem_divergence(index, golden_commit, dut_commit)
             if mem_divergence is not None:
                 return mem_divergence
+        if check_fp:
+            fp_divergence = _fp_divergence(index, golden_commit, dut_commit)
+            if fp_divergence is not None:
+                return fp_divergence
         index += 1
     return None
 
@@ -363,7 +449,7 @@ def load_golden(text: str, *, source: str, elf: Path | None = None) -> list[Comm
         image = load_elf_image(elf)
         return normalize_spike_log(text, source=source, tohost=image.tohost, entry=image.entry)
     raise TraceFormatError(
-        "neither a canonical trace (# rv_difftest trace v1) nor a Spike commit log",
+        "neither a canonical trace (# rv_difftest trace v1/v2) nor a Spike commit log",
         source=source,
     )
 
@@ -405,7 +491,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dut", required=True, help="dump:PATH | model:PATH | callback:MODULE:FUNC")
     parser.add_argument("--dut-path", type=Path, action="append", default=[], help="extra sys.path entry")
     parser.add_argument("--inject", action="append", default=[], help="INDEX:FIELD=VALUE fault injection")
-    parser.add_argument("--isa", default="rv64imc", help="Spike --isa string (default: rv64imc)")
+    parser.add_argument(
+        "--isa", default=DEFAULT_ISA, help=f"Spike --isa string (default: {DEFAULT_ISA})"
+    )
     parser.add_argument("--spike", type=Path, default=None, help="spike binary to use")
     parser.add_argument("--timeout", type=float, default=300.0, help="spike timeout in seconds")
     parser.add_argument("--max-commits", type=int, default=None, help="compare only the first N commits")
@@ -444,11 +532,15 @@ def main(argv: list[str] | None = None) -> int:
     golden_aware = stream_has_mem_info(golden_commits)
     dut_aware = stream_has_mem_info(dut_commits)
     check_mem = golden_aware and dut_aware
+    golden_fp = stream_has_fp_info(golden_commits)
+    dut_fp = stream_has_fp_info(dut_commits)
+    check_fp = golden_fp and dut_fp
     divergence = first_divergence(
         golden_commits,
         dut_commits,
         check_cycle=not args.no_cycle_check,
         check_mem=check_mem,
+        check_fp=check_fp,
         max_commits=args.max_commits,
     )
     print(f"[rv_difftest] golden = {golden_label} ({len(golden_commits)} commits)")
@@ -476,6 +568,25 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"[rv_difftest] memory: not provided — no mem fields in the {missing} stream "
                 "(compared pc, rd and value only)"
+            )
+        if check_fp:
+            fp_writes = sum(1 for commit in golden_commits[:compared] if commit.rd_is_fp)
+            keyed = sum(
+                1
+                for commit in golden_commits[:compared]
+                if commit.fflags is not None or commit.frm is not None
+            )
+            print(
+                f"[rv_difftest] fp: active — {fp_writes} FP register write(s) and "
+                f"{keyed} fflags/frm update(s) compared (raw 64-bit FP values)"
+            )
+        else:
+            fp_missing = ", ".join(
+                name for name, aware in (("golden", golden_fp), ("dut", dut_fp)) if not aware
+            )
+            print(
+                f"[rv_difftest] fp: not provided — no FP fields in the {fp_missing} stream "
+                "(FP state not compared)"
             )
         return EXIT_MATCH
     for line in divergence.lines(golden_label=golden_label, dut_label=dut.describe()):

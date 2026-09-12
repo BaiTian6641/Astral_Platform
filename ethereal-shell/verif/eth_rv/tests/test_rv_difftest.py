@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,9 @@ from rv_difftest import (
     EXIT_MATCH,
     KIND_CYCLE,
     KIND_EXTRA,
+    KIND_FFLAGS,
+    KIND_FP_CLASS,
+    KIND_FRM,
     KIND_MEM_ADDR,
     KIND_MEM_MASK,
     KIND_MEM_WDATA,
@@ -211,6 +215,97 @@ def test_memory_report_shows_both_sides() -> None:
     assert "golden [spike]: 2 0x0000000080000004 - - 0x0000000080001003" in report
     assert "dut    [rtl]: 2 0x0000000080000004 - - 0x000000008000dead" in report
     assert "memory address mismatch" in report
+
+
+# --- the FP record (RV-C) ----------------------------------------------------------
+
+
+def _fp_commits() -> list[Commit]:
+    """A stream with FP writes, a keyed update on one, and a CSR-only commit."""
+    return [
+        Commit(cycle=1, pc=0x8000_0000, rd=1, value=0x3FF0_0000_0000_0000, rd_is_fp=True),
+        Commit(
+            cycle=2,
+            pc=0x8000_0004,
+            rd=4,
+            value=0x7FF8_0000_0000_0000,
+            rd_is_fp=True,
+            fflags=0x10,
+        ),
+        Commit(cycle=3, pc=0x8000_0008, fflags=0x00, frm=0x01),
+    ]
+
+
+def test_fp_stream_matches_through_the_comparator() -> None:
+    assert first_divergence(_fp_commits(), _fp_commits()) is None
+
+
+@pytest.mark.parametrize(
+    ("index", "mutate", "kind"),
+    [
+        (0, "class", KIND_FP_CLASS),
+        (0, "invent_fflags", KIND_FFLAGS),
+        (1, "fflags", KIND_FFLAGS),
+        (1, "drop_fflags", KIND_FFLAGS),
+        (2, "frm", KIND_FRM),
+        (2, "drop_frm", KIND_FRM),
+    ],
+)
+def test_first_fp_divergence_reports_exact_position(
+    index: int, mutate: str, kind: str
+) -> None:
+    golden = _fp_commits()
+    dut = list(golden)
+    commit = golden[index]
+    if mutate == "class":  # the same number, but in the other register file
+        dut[index] = Commit(cycle=commit.cycle, pc=commit.pc, rd=commit.rd, value=commit.value)
+    elif mutate == "invent_fflags":
+        dut[index] = replace(commit, fflags=0x01)
+    elif mutate == "fflags":
+        dut[index] = replace(commit, fflags=0x1F)
+    elif mutate == "drop_fflags":
+        dut[index] = Commit(
+            cycle=commit.cycle, pc=commit.pc, rd=commit.rd, value=commit.value, rd_is_fp=True
+        )
+    elif mutate == "frm":
+        dut[index] = replace(commit, frm=0x07)
+    else:  # drop_frm: the CSR-only commit no longer reports its frm write
+        dut[index] = Commit(cycle=commit.cycle, pc=commit.pc, fflags=commit.fflags)
+    divergence = first_divergence(golden, dut)
+    assert divergence is not None
+    assert (divergence.index, divergence.kind, divergence.cycle) == (index, kind, commit.cycle)
+    assert divergence.golden == commit
+
+
+def test_fp_check_can_be_disabled() -> None:
+    """A DUT that reports no FP state at all must still compare on pc/rd/value."""
+    golden = _fp_commits()
+    dut = [Commit(cycle=c.cycle, pc=c.pc, rd=c.rd, value=c.value) for c in golden]
+    assert first_divergence(golden, dut) is not None
+    assert first_divergence(golden, dut, check_fp=False) is None
+
+
+def test_fp_class_divergence_names_both_registers() -> None:
+    golden = _fp_commits()
+    dut = [Commit(cycle=1, pc=0x8000_0000, rd=1, value=0x3FF0_0000_0000_0000), *golden[1:]]
+    divergence = first_divergence(golden, dut)
+    assert divergence is not None
+    assert divergence.kind == KIND_FP_CLASS
+    assert "golden writes f1" in divergence.detail
+    assert "dut writes x1" in divergence.detail
+
+
+def test_fp_divergence_report_shows_both_sides() -> None:
+    golden = _fp_commits()
+    dut = [golden[0], replace(golden[1], fflags=0x1F), golden[2]]
+    divergence = first_divergence(golden, dut)
+    assert divergence is not None
+    report = "\n".join(divergence.lines(golden_label="spike", dut_label="rtl"))
+    assert "DIVERGENCE (fflags_mismatch) at commit #1 (cycle 2): " in report
+    assert "rd=f4" in report  # the header names the FP register, not x4
+    assert "golden [spike]: 2 0x0000000080000004 f4 0x7ff8000000000000 fflags=0x10" in report
+    assert "dut    [rtl]: 2 0x0000000080000004 f4 0x7ff8000000000000 fflags=0x1f" in report
+    assert "fflags mismatch: golden 0x10 != dut 0x1f" in report
 
 
 # --- golden loading ----------------------------------------------------------------
@@ -468,3 +563,115 @@ def test_cli_spike_end_to_end_catches_a_wrong_dut(
     )
     assert result.returncode == EXIT_DIVERGED
     assert f"DIVERGENCE (value_mismatch) at commit #{index}" in result.stdout
+
+
+# --- the FP stream through the CLI -------------------------------------------------
+
+
+def _write_fp_trace(path: Path, commits: list[Commit]) -> Path:
+    """Write a canonical (v2) trace built from ``commits`` and return its path."""
+    path.write_text(format_trace(commits, generator="unit-test"), encoding="utf-8")
+    return path
+
+
+def test_cli_reports_an_active_fp_stream(cli_path: Path, tmp_path: Path) -> None:
+    trace = _write_fp_trace(tmp_path / "fp.trace", _fp_commits())
+    result = _run_cli(cli_path, "--golden", str(trace), "--dut", f"dump:{trace}")
+    assert result.returncode == EXIT_MATCH
+    assert (
+        "fp: active — 2 FP register write(s) and 2 fflags/frm update(s) compared"
+        in result.stdout
+    )
+
+
+def test_cli_catches_a_corrupted_fp_record(cli_path: Path, tmp_path: Path) -> None:
+    golden = _write_fp_trace(tmp_path / "fp.trace", _fp_commits())
+    corrupted = [
+        *_fp_commits()[:1],
+        replace(_fp_commits()[1], fflags=0x1F),
+        _fp_commits()[2],
+    ]
+    bad = _write_fp_trace(tmp_path / "fp_bad.dump", corrupted)
+    result = _run_cli(cli_path, "--golden", str(golden), "--dut", f"dump:{bad}")
+    assert result.returncode == EXIT_DIVERGED
+    assert "DIVERGENCE (fflags_mismatch) at commit #1 (cycle 2)" in result.stdout
+
+
+def test_cli_fp_injection_is_caught(cli_path: Path, tmp_path: Path) -> None:
+    trace = _write_fp_trace(tmp_path / "fp.trace", _fp_commits())
+    result = _run_cli(
+        cli_path, "--golden", str(trace), "--dut", f"dump:{trace}", "--inject", "2:frm=0x7"
+    )
+    assert result.returncode == EXIT_DIVERGED
+    assert "DIVERGENCE (frm_mismatch) at commit #2" in result.stdout
+
+
+def test_cli_fp_injection_leaves_the_memory_stream_alone(
+    cli_path: Path, tmp_path: Path
+) -> None:
+    """Injecting an FP field must be reported as an FP divergence, not a memory one.
+
+    The injected commit performs no memory access while the stream does, so a
+    phantom access invented by the injection path would surface as
+    ``mem_addr_mismatch`` instead of the FP divergence the control is after.
+    """
+    commits = [
+        Commit(cycle=1, pc=0x8000_0000, rd=1, value=0x3FF0_0000_0000_0000, rd_is_fp=True),
+        Commit(
+            cycle=2,
+            pc=0x8000_0004,
+            rd=18,
+            value=0x4008_0000_0000_0000,
+            rd_is_fp=True,
+            mem_addr=0x8000_00A8,
+        ),
+        Commit(
+            cycle=3,
+            pc=0x8000_0008,
+            fflags=0x10,
+            mem_addr=0x8000_00B0,
+            mem_wdata=0x2A,
+            mem_wmask=0x08,
+        ),
+    ]
+    trace = _write_fp_trace(tmp_path / "fp_mem.trace", commits)
+    result = _run_cli(
+        cli_path, "--golden", str(trace), "--dut", f"dump:{trace}", "--inject", "0:fflags=0x1f"
+    )
+    assert result.returncode == EXIT_DIVERGED
+    assert "DIVERGENCE (fflags_mismatch) at commit #0" in result.stdout
+
+
+def test_cli_value_injection_corrupts_an_fp_value(cli_path: Path, tmp_path: Path) -> None:
+    trace = _write_fp_trace(tmp_path / "fp.trace", _fp_commits())
+    result = _run_cli(
+        cli_path, "--golden", str(trace), "--dut", f"dump:{trace}", "--inject", "0:value=0x0"
+    )
+    assert result.returncode == EXIT_DIVERGED
+    assert "DIVERGENCE (value_mismatch) at commit #0" in result.stdout
+    assert "f1" in result.stdout
+
+
+def test_cli_fp_not_provided_is_reported_not_claimed(
+    cli_path: Path, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    """A stream without FP fields must be reported, never counted as an FP match."""
+    golden = _write_fp_trace(tmp_path / "fp.trace", _fp_commits())
+    stripped = _write_fp_trace(
+        tmp_path / "no_fp.dump",
+        [Commit(cycle=c.cycle, pc=c.pc, rd=c.rd, value=c.value) for c in _fp_commits()],
+    )
+    result = _run_cli(cli_path, "--golden", str(golden), "--dut", f"dump:{stripped}")
+    assert result.returncode == EXIT_MATCH
+    assert "fp: not provided — no FP fields in the dut stream" in result.stdout
+
+    # and a golden with no FP record at all is reported the same way
+    result = _run_cli(
+        cli_path,
+        "--golden",
+        str(fixtures_dir / "cor_model.trace"),
+        "--dut",
+        f"dump:{fixtures_dir / 'cor_model.trace'}",
+    )
+    assert result.returncode == EXIT_MATCH
+    assert "fp: not provided" in result.stdout

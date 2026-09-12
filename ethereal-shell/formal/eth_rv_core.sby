@@ -94,6 +94,10 @@ read -formal cor_lsu.sv
 read -formal cor_regfile.sv
 read -formal cor_decoder.sv
 read -formal cor_mmu.sv
+# F/D (E2-RV2 increment 2): the FP register file and the FPU the core now
+# instantiates — without them the design cannot elaborate.
+read -formal cor_fp_regfile.sv
+read -formal cor_fpu.sv
 read -formal eth_rv_core.sv
 prep -top eth_rv_core
 
@@ -105,4 +109,6 @@ ethereal-shell/rtl/eth_rv/cor_lsu.sv
 ethereal-shell/rtl/eth_rv/cor_regfile.sv
 ethereal-shell/rtl/eth_rv/cor_decoder.sv
 ethereal-shell/rtl/eth_rv/cor_mmu.sv
+ethereal-shell/rtl/eth_rv/cor_fp_regfile.sv
+ethereal-shell/rtl/eth_rv/cor_fpu.sv
 ethereal-shell/rtl/eth_rv/eth_rv_core.sv

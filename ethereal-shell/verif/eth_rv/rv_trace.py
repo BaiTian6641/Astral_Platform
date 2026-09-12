@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 """Canonical commit-trace format for the ``eth_rv`` DiffTest harness (S15 §2.2).
 
-    # rv_difftest trace v1
-    # generator: spike 1e05ddac (rv64imc)
-    # fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]
+    # rv_difftest trace v2
+    # generator: spike 1e05ddac (rv64imfdc_zicsr)
+    # fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] [fflags=0x.. frm=0x..]
     1 0x0000000080000000 x02 0x0000000080001000
     2 0x0000000080000004 - -
-    3 0x0000000080000008 x10 0x0000000000000013 0x0000000080001ff8 0x000000000000002a 0x00 0x08
+    3 0x0000000080000008 f1 0x3ff0000000000000 fflags=0x10
+    4 0x000000008000000c x10 0x0000000000000013 0x0000000080001ff8 0x000000000000002a 0x00 0x08
 
 Field semantics
   * ``cycle`` — commit ordinal of this instruction. Spike is not cycle-accurate,
@@ -15,11 +16,14 @@ Field semantics
     comparator will check them (``--no-cycle-check`` to relax).
   * ``pc``    — 64-bit program counter of the retired instruction.
   * ``rd``    — ``x0``..``x31`` (or an ABI name: ``a0``, ``sp`` …) when the
-    instruction writes an architectural register, ``-`` when it does not
-    (stores, branches, ``jal x0`` …).  Writes to ``x0`` are dropped — x0 is
-    hard-wired zero in RISC-V, so logging them is meaningless, and Spike does
-    not log them either.
-  * ``value`` — 64-bit value written to ``rd``; ``-`` when ``rd`` is ``-``.
+    instruction writes an integer architectural register, ``f0``..``f31`` when it
+    writes a floating-point one, ``-`` when it does not (stores, branches,
+    ``jal x0`` …).  Writes to ``x0`` are dropped — x0 is hard-wired zero in
+    RISC-V, so logging them is meaningless, and Spike does not log them either.
+    ``f0`` is a real register, so an FP write to index 0 is **kept** (only ``x0``
+    is dropped).
+  * ``value`` — 64-bit value written to ``rd`` (for an FP write: the raw,
+    already NaN-boxed register value); ``-`` when ``rd`` is ``-``.
   * ``mem_addr`` / ``mem_wdata`` — the memory access of the retired
     instruction, in the golden model's own convention (Spike's
     ``--log-commits`` ``mem <addr> [<data>]`` field, C14 §5.2): the exact byte
@@ -43,6 +47,17 @@ has no memory access", which is different from a 4-field line only at the
 stream level (a *producer* that knows about memory vs one that does not) — see
 :func:`stream_has_mem_info`.
 
+The FP record is **optional and keyed**: an FP register write uses the ``f<d>``
+``rd`` class, and the FP control state an instruction wrote is appended *after*
+the positional fields as ``fflags=0x..`` (5 bits) then ``frm=0x..`` (3 bits). A
+``csrw fflags`` writes no register, so a keyed field may appear on a ``- -``
+commit. Keyed tokens are the only place a line contains ``=``, so the parser
+splits every ``=``-bearing token out of the line first and the positional
+3/4/6/8-field grammar is untouched. The header is ``v2`` once a stream carries FP
+state and ``v1`` otherwise; both count as canonical
+(:func:`is_canonical_trace`), and a v1 stream simply has no FP record (see
+:func:`stream_has_fp_info`).
+
 A *lenient* 3-field line (``pc rd value``) is also accepted on the DUT side, with
 ``cycle`` taken from the line ordinal. That is the shape a hand-written Verilator
 testbench ``$fwrite`` naturally produces (see ``--dut dump:``). Lines are
@@ -57,11 +72,26 @@ from pathlib import Path
 TRACE_HEADER_PREFIX = "# rv_difftest trace v1"
 """First line of a canonical (normalized) trace file."""
 
+TRACE_HEADER_V2 = "# rv_difftest trace v2"
+"""Canonical header of a stream that carries FP state (``f<d>`` rd or keyed tokens)."""
+
+TRACE_HEADERS = (TRACE_HEADER_PREFIX, TRACE_HEADER_V2)
+"""Headers :func:`is_canonical_trace` accepts (a v1 stream simply has no FP record)."""
+
 XLEN = 64
 """Trace values are 64-bit (RV64)."""
 
 REG_BITS = 5
-"""There are 32 integer registers."""
+"""Register index width: 32 integer registers and 32 floating-point registers."""
+
+FFLAGS_BITS = 5
+"""``fflags`` carries 5 exception-flag bits (NV DZ OF UF NX)."""
+
+FRM_BITS = 3
+"""``frm`` carries 3 rounding-mode bits."""
+
+_KEYED_BITS: dict[str, int] = {"fflags": FFLAGS_BITS, "frm": FRM_BITS}
+"""Keyed (``name=value``) trace tokens and the width of the field each one carries."""
 
 _ABI_NAMES: dict[str, int] = {
     "zero": 0,
@@ -134,6 +164,14 @@ class Commit:
     ``mem_addr`` is the exact byte address; ``mem_wdata`` the store data in the
     golden convention (low ``size`` bytes, unshifted); the masks are byte lanes of
     the window at ``mem_addr & ~7``.
+
+    ``rd_is_fp`` selects the register class ``rd`` names (``f<rd>`` instead of
+    ``x<rd>``); an FP write to index 0 is a real update (``f0``), so only ``x0`` is
+    dropped. ``fflags``/``frm`` are the FP control state the instruction wrote
+    (the new full value of the CSR, 5 and 3 bits), or ``None`` when it wrote
+    neither — they are the keyed ``fflags=0x..``/``frm=0x..`` trace tokens, and
+    like the memory suffix they make FP awareness a *stream* property
+    (:func:`stream_has_fp_info`).
     """
 
     cycle: int
@@ -145,6 +183,9 @@ class Commit:
     mem_wdata: int | None = None
     mem_rmask: int | None = None
     mem_wmask: int | None = None
+    rd_is_fp: bool = False
+    fflags: int | None = None
+    frm: int | None = None
 
     def __post_init__(self) -> None:
         if self.cycle < 1:
@@ -158,15 +199,20 @@ class Commit:
         else:
             if not 0 <= self.rd < (1 << REG_BITS):
                 raise ValueError(f"register index out of range: {self.rd}")
-            if self.rd == 0:
+            if self.rd == 0 and not self.rd_is_fp:
                 # x0 is hard-wired zero: a logged x0 write is not a register
                 # update. Drop it here so no producer can inject a phantom diff.
+                # f0 is a real register, so an FP write to index 0 is kept.
                 object.__setattr__(self, "rd", None)
                 object.__setattr__(self, "value", None)
             elif self.value is None:
                 raise ValueError("commit that writes a register must carry a value")
             else:
                 _check_word(self.value, "value")
+        if self.fflags is not None:
+            _check_word(self.fflags, "fflags", bits=FFLAGS_BITS)
+        if self.frm is not None:
+            _check_word(self.frm, "frm", bits=FRM_BITS)
         if self.mem_addr is None:
             for name in ("mem_wdata", "mem_rmask", "mem_wmask"):
                 if getattr(self, name) is not None:
@@ -201,14 +247,19 @@ class Commit:
         return self.mem_rmask is not None or self.mem_wmask is not None
 
     @property
+    def has_fp_info(self) -> bool:
+        """True when this commit carries FP state (an FP write or a keyed CSR update)."""
+        return self.rd_is_fp or self.fflags is not None or self.frm is not None
+
+    @property
     def writes_register(self) -> bool:
         """True when this commit updates an architectural register (rd != x0)."""
         return self.rd is not None
 
     @property
     def reg_name(self) -> str:
-        """``rd`` as ``x<i>`` text, or :data:`NO_WRITE`."""
-        return format_reg(self.rd)
+        """``rd`` as ``x<i>``/``f<i>`` text, or :data:`NO_WRITE`."""
+        return format_reg(self.rd, is_fp=self.rd_is_fp)
 
     @property
     def value_text(self) -> str:
@@ -220,11 +271,17 @@ class Commit:
 
         The memory suffix is omitted entirely for a commit without memory
         information, so a producer that knows nothing about memory keeps
-        emitting the 4-field line.
+        emitting the 4-field line; the keyed FP control state is appended after
+        the memory suffix (``fflags`` before ``frm``).
         """
-        core = f"{self.cycle} 0x{self.pc:016x} {self.reg_name} {self.value_text}"
+        fields = [f"{self.cycle} 0x{self.pc:016x} {self.reg_name} {self.value_text}"]
         mem = self._mem_text()
-        return core if mem is None else f"{core} {mem}"
+        if mem is not None:
+            fields.append(mem)
+        keyed = self._keyed_text()
+        if keyed is not None:
+            fields.append(keyed)
+        return " ".join(fields)
 
     def _mem_text(self) -> str | None:
         """The memory suffix of a trace line, or ``None`` when there is none."""
@@ -237,6 +294,15 @@ class Commit:
         rmask = NO_WRITE if self.mem_rmask is None else f"0x{self.mem_rmask:02x}"
         wmask = NO_WRITE if self.mem_wmask is None else f"0x{self.mem_wmask:02x}"
         return f"{addr} {wdata} {rmask} {wmask}"
+
+    def _keyed_text(self) -> str | None:
+        """The ``fflags=0x..``/``frm=0x..`` keyed tokens of a trace line, or ``None``."""
+        tokens = []
+        if self.fflags is not None:
+            tokens.append(f"fflags=0x{self.fflags:02x}")
+        if self.frm is not None:
+            tokens.append(f"frm=0x{self.frm:02x}")
+        return None if not tokens else " ".join(tokens)
 
     def with_value(self, value: int) -> Commit:
         """A copy of this commit whose register value is ``value``."""
@@ -256,7 +322,9 @@ class Commit:
         register-number divergence, which is what a fault injection is after.
         """
         if rd == 0:
-            return replace(self, rd=None, value=None)
+            # x0 is dropped again, so the commit is back to no architectural
+            # write — and therefore not an FP write either (class included).
+            return replace(self, rd=None, value=None, rd_is_fp=False)
         value = 0 if self.value is None else self.value
         return replace(self, rd=rd, value=value)
 
@@ -298,36 +366,50 @@ def _check_word(value: int, what: str, *, bits: int = XLEN) -> None:
         raise ValueError(f"{what} does not fit in {bits} bits: {value!r}")
 
 
-def format_reg(rd: int | None) -> str:
-    """Render a register index as trace text (``x7``), or ``-`` for no write."""
-    return NO_WRITE if rd is None else f"x{rd}"
+def format_reg(rd: int | None, *, is_fp: bool = False) -> str:
+    """Render a register index as trace text (``x7``/``f7``), or ``-`` for no write."""
+    if rd is None:
+        return NO_WRITE
+    return f"{'f' if is_fp else 'x'}{rd}"
 
 
-def parse_reg(token: str) -> int | None:
-    """Parse a register field: ``x7``, ``x 7``, ``a0``/``sp``… or ``-``.
+def parse_reg_field(token: str) -> tuple[int | None, bool]:
+    """Parse a register field into ``(index, is_fp)``.
 
-    Returns ``None`` for :data:`NO_WRITE`. Raises :class:`ValueError` for garbage
-    (callers wrap it with source/line context).
+    ``x7``/``x 7``/``a0``/``sp``… -> ``(7, False)``, ``f7``/``f 7`` -> ``(7, True)``,
+    ``-`` -> ``(None, False)``. Raises :class:`ValueError` for garbage (callers
+    wrap it with source/line context).
     """
     text = token.strip().lower()
     if text == NO_WRITE:
-        return None
+        return None, False
     if text in _ABI_NAMES:
-        return _ABI_NAMES[text]
-    if text.startswith("x"):
+        return _ABI_NAMES[text], False
+    for prefix, is_fp in (("x", False), ("f", True)):
+        if not text.startswith(prefix):
+            continue
         digits = text[1:].strip()
         if digits.isdigit():
             index = int(digits)
             if 0 <= index < (1 << REG_BITS):
-                return index
+                return index, is_fp
             raise ValueError(f"register index out of range: {token!r}")
     raise ValueError(f"not a register: {token!r}")
+
+
+def parse_reg(token: str) -> int | None:
+    """Parse a register field: ``x7``, ``f7``, ``x 7``, ``a0``/``sp``… or ``-``.
+
+    Returns ``None`` for :data:`NO_WRITE`. The register *class* is not part of the
+    return value; :func:`parse_reg_field` is the parser the trace itself uses.
+    """
+    return parse_reg_field(token)[0]
 
 
 def is_reg_token(token: str) -> bool:
     """True when ``token`` is a syntactically valid register field."""
     try:
-        parse_reg(token)
+        parse_reg_field(token)
     except ValueError:
         return False
     return True
@@ -362,6 +444,10 @@ def parse_trace(
     access, a ``-`` data field is a load, and ``-`` masks mean the producer does
     not report them. The memory suffix always requires an explicit cycle — a
     lenient (cycle-implicit) line is exactly 3 fields.
+
+    Keyed tokens (``fflags=0x..`` / ``frm=0x..``) are split out of the line before
+    the positional parse, so the field-count grammar above is unchanged; an
+    ``f<d>`` ``rd`` field marks a floating-point register write.
     """
     commits: list[Commit] = []
     last_cycle = 0
@@ -369,7 +455,9 @@ def parse_trace(
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        fields = line.split()
+        tokens = line.split()
+        keyed = [token for token in tokens if "=" in token]
+        fields = [token for token in tokens if "=" not in token]
         if len(fields) not in (3, 4, 6, 8):
             raise TraceFormatError(
                 "expected 3 (<pc> <rd> <value>), 4 (<cycle> <pc> <rd> <value>), "
@@ -412,9 +500,10 @@ def parse_trace(
         mem_tokens = fields[4:] if len(fields) >= 6 else []
         try:
             pc = parse_word(pc_token, bits=XLEN)
-            rd = parse_reg(rd_token)
+            rd, rd_is_fp = parse_reg_field(rd_token)
             value = None if value_token.strip() == NO_WRITE else parse_word(value_token)
             mem_addr, mem_wdata, mem_rmask, mem_wmask = _mem_fields(mem_tokens)
+            fflags, frm = _keyed_fields(keyed)
         except ValueError as exc:
             raise TraceFormatError(str(exc), source=source, line=lineno) from None
         if rd is None and value is not None:
@@ -434,6 +523,9 @@ def parse_trace(
                     mem_wdata=mem_wdata,
                     mem_rmask=mem_rmask,
                     mem_wmask=mem_wmask,
+                    rd_is_fp=rd_is_fp,
+                    fflags=fflags,
+                    frm=frm,
                 )
             )
         except ValueError as exc:  # pragma: no cover - defensive; fields are checked above
@@ -466,24 +558,58 @@ def format_trace(
 ) -> str:
     """Serialize commits as a canonical trace file (header + one line each).
 
-    Commits that carry no memory information stay 4-field lines; a memory access
-    adds ``mem_addr mem_wdata`` and, when the masks are known, ``mem_rmask
-    mem_wmask``.
+    The header is v2 once any commit carries FP state and v1 otherwise (a v1
+    stream has no FP record by definition). Commits that carry no memory
+    information stay 4-field lines; a memory access adds ``mem_addr mem_wdata``
+    and, when the masks are known, ``mem_rmask mem_wmask``; the FP control state
+    an instruction wrote is appended as the keyed ``fflags=0x.. frm=0x..`` tokens.
     """
-    header = [TRACE_HEADER_PREFIX]
+    stream = list(commits)
+    header = [TRACE_HEADER_V2 if stream_has_fp_info(stream) else TRACE_HEADER_PREFIX]
     if generator is not None:
         header.append(f"# generator: {generator}")
-    header.append("# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]")
-    header.append(f'# {NO_WRITE} in rd = retired without an architectural register write')
+    header.append(
+        "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] "
+        "[fflags=0x.. frm=0x..]"
+    )
+    header.append(
+        f"# {NO_WRITE} in rd = retired without an architectural register write; "
+        "f<d> = a floating-point register write (f0 included)"
+    )
     header.append(
         f"# {NO_WRITE} in mem_addr = no memory access; {NO_WRITE} in mem_wdata = a load; "
         f"{NO_WRITE} masks = the producer does not report byte lanes"
     )
+    header.append(
+        "# keyed fflags=/frm= (after the memory suffix) = the FP control state this "
+        "instruction wrote (5 / 3 bits)"
+    )
     if note is not None:
         for line in note.splitlines():
             header.append(f"# {line}")
-    body = [commit.format_line() for commit in commits]
+    body = [commit.format_line() for commit in stream]
     return "\n".join([*header, *body]) + "\n"
+
+
+def _keyed_fields(tokens: list[str]) -> tuple[int | None, int | None]:
+    """Parse a trace line's keyed tokens into ``(fflags, frm)``.
+
+    ``[]`` -> ``(None, None)``; ``fflags=0x..`` / ``frm=0x..`` -> the value of the
+    matching field (each parsed at its own width). Raises :class:`ValueError` for
+    an unknown key, a repeated key or garbage; the caller adds the source/line
+    context.
+    """
+    found: dict[str, int] = {}
+    for token in tokens:
+        name, _, text = token.partition("=")
+        key = name.strip().lower()
+        bits = _KEYED_BITS.get(key)
+        if bits is None:
+            raise ValueError(f"unknown keyed field: {token!r}")
+        if key in found:
+            raise ValueError(f"keyed field {key!r} given more than once")
+        found[key] = parse_word(text, bits=bits)
+    return found.get("fflags"), found.get("frm")
 
 
 def _mem_fields(
@@ -528,10 +654,22 @@ def stream_has_mem_info(commits: Iterable[Commit]) -> bool:
     return any(commit.has_mem_access for commit in commits)
 
 
+def stream_has_fp_info(commits: Iterable[Commit]) -> bool:
+    """True when a commit stream reports FP state (an FP write or a keyed update).
+
+    Mirrors :func:`stream_has_mem_info` (the FP record is keyed and optional, so a
+    stream that never carries it is indistinguishable from a pre-FP producer at
+    the commit level). A stream without any FP record yields ``False`` and the
+    comparator reports the FP record as *not provided* instead of silently passing
+    it; only two FP-aware streams are compared field by field.
+    """
+    return any(commit.has_fp_info for commit in commits)
+
+
 def is_canonical_trace(text: str) -> bool:
-    """True when ``text`` starts with the canonical trace header."""
+    """True when ``text`` starts with a canonical trace header (v1 or v2)."""
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        return raw.startswith(TRACE_HEADER_PREFIX)
+        return raw.startswith(TRACE_HEADERS)
     return False

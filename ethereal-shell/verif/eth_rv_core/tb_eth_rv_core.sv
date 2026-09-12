@@ -59,7 +59,7 @@
 //              the corpus exercises them on purpose — but a trap loop must not
 //              run forever).
 //
-//              `+fault_index=N +fault_field=<pc|rd|value|mem_addr|mem_wdata>`
+//              `+fault_index=N +fault_field=<pc|rd|value|mem_addr|mem_wdata|fflags|frm>`
 //              `+fault_value=<hex>` deliberately corrupts one emitted trace
 //              record, where N is a 0-based commit index (the same convention as
 //              the harness's own `--inject INDEX:FIELD=VALUE`). That is the
@@ -262,6 +262,11 @@ module tb_eth_rv_core;
     logic        rvfi_rd_we;
     logic [4:0]  rvfi_rd_addr;
     logic [63:0] rvfi_rd_wdata;
+    logic        rvfi_rd_fp;
+    logic        rvfi_fflags_we;
+    logic [4:0]  rvfi_fflags;
+    logic        rvfi_frm_we;
+    logic [2:0]  rvfi_frm;
     logic        rvfi_mem_valid;
     logic [63:0] rvfi_mem_addr;
     logic [63:0] rvfi_mem_wdata;
@@ -308,6 +313,11 @@ module tb_eth_rv_core;
         .rvfi_rd_we_o    (rvfi_rd_we),
         .rvfi_rd_addr_o  (rvfi_rd_addr),
         .rvfi_rd_wdata_o (rvfi_rd_wdata),
+        .rvfi_rd_fp_o    (rvfi_rd_fp),
+        .rvfi_fflags_we_o(rvfi_fflags_we),
+        .rvfi_fflags_o   (rvfi_fflags),
+        .rvfi_frm_we_o   (rvfi_frm_we),
+        .rvfi_frm_o      (rvfi_frm),
         .rvfi_mem_valid_o(rvfi_mem_valid),
         .rvfi_mem_addr_o (rvfi_mem_addr),
         .rvfi_mem_wdata_o(rvfi_mem_wdata),
@@ -798,6 +808,11 @@ module tb_eth_rv_core;
     logic        f_mem_valid;
     logic [7:0]  f_mem_rmask;
     logic [7:0]  f_mem_wmask;
+    logic        f_rd_fp;
+    logic        f_fflags_we;
+    logic [4:0]  f_fflags;
+    logic        f_frm_we;
+    logic [2:0]  f_frm;
 
     always_comb begin
         f_we        = rvfi_rd_we;
@@ -809,6 +824,11 @@ module tb_eth_rv_core;
         f_mem_wdata = rvfi_mem_wdata;
         f_mem_rmask = rvfi_mem_rmask;
         f_mem_wmask = rvfi_mem_wmask;
+        f_rd_fp     = rvfi_rd_fp;
+        f_fflags_we = rvfi_fflags_we;
+        f_fflags    = rvfi_fflags;
+        f_frm_we    = rvfi_frm_we;
+        f_frm       = rvfi_frm;
         if (commits == fault_index) begin
             if (fault_field == "pc") begin
                 f_pc = fault_value;
@@ -820,6 +840,18 @@ module tb_eth_rv_core;
                 f_we    = 1'b1;
                 f_rd    = fault_value[4:0];
                 f_value = rvfi_rd_we ? rvfi_rd_wdata : 64'd0;
+            end
+            // The FP-record negative controls (E2-RV2 increment 2): corrupt the
+            // fflags accrual or the frm value of one commit. Both INVENT the update
+            // when the commit has none, so any commit index is a valid injection
+            // point — the point is that the harness's FP comparison must fire.
+            if (fault_field == "fflags") begin
+                f_fflags_we = 1'b1;
+                f_fflags    = fault_value[4:0];
+            end
+            if (fault_field == "frm") begin
+                f_frm_we = 1'b1;
+                f_frm    = fault_value[2:0];
             end
             // The memory-stream negative control: corrupt the address or the store
             // data this commit reports. A fault on a commit without an access
@@ -906,23 +938,37 @@ module tb_eth_rv_core;
                 // (`-` address) and which bytes it read/wrote (masks `-` is
                 // reserved for "not reported", which this testbench never needs).
                 if (f_we) begin
-                    $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x ", rvfi_order,
-                            f_pc, f_rd, f_value);
+                    if (f_rd_fp) begin
+                        $fwrite(trace_fd, "%0d 0x%016x f%0d 0x%016x ", rvfi_order,
+                                f_pc, f_rd, f_value);
+                    end else begin
+                        $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x ", rvfi_order,
+                                f_pc, f_rd, f_value);
+                    end
                 end else begin
                     $fwrite(trace_fd, "%0d 0x%016x - - ", rvfi_order,
                             f_pc);
                 end
                 if (f_mem_valid) begin
                     if (f_mem_wmask != 8'd0) begin
-                        $fwrite(trace_fd, "0x%016x 0x%016x - 0x%02x\n",
+                        $fwrite(trace_fd, "0x%016x 0x%016x - 0x%02x",
                                 f_mem_addr, f_mem_wdata, f_mem_wmask);
                     end else begin
-                        $fwrite(trace_fd, "0x%016x - 0x%02x -\n",
+                        $fwrite(trace_fd, "0x%016x - 0x%02x -",
                                 f_mem_addr, f_mem_rmask);
                     end
                 end else begin
-                    $fwrite(trace_fd, "- - - -\n");
+                    $fwrite(trace_fd, "- - - -");
                 end
+                // ... and the FP record: the keyed tokens of trace v2, present
+                // only in the commit that wrote the CSR (E2-RV2 increment 2)
+                if (f_fflags_we) begin
+                    $fwrite(trace_fd, " fflags=0x%02x", {3'd0, f_fflags});
+                end
+                if (f_frm_we) begin
+                    $fwrite(trace_fd, " frm=0x%02x", {5'd0, f_frm});
+                end
+                $fwrite(trace_fd, "\n");
 
                 // HTIF exit: the store that covers `tohost` is the last commit
                 if ((rvfi_mem_wmask != 8'd0) && (rvfi_mem_addr[63:3] == tohost_addr[63:3])
@@ -1048,9 +1094,9 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL cannot open trace file '%s'", trace_path);
             $fatal(1);
         end
-        $fwrite(trace_fd, "# rv_difftest trace v1\n");
-        $fwrite(trace_fd, "# generator: eth_rv_core rtl (eth_rv_core.sv RV-B v0)\n");
-        $fwrite(trace_fd, "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]\n");
+        $fwrite(trace_fd, "# rv_difftest trace v2\n");
+        $fwrite(trace_fd, "# generator: eth_rv_core rtl (eth_rv_core.sv RV-C)\n");
+        $fwrite(trace_fd, "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] [fflags=.. frm=..]\n");
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;

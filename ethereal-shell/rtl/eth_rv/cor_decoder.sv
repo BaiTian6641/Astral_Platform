@@ -43,6 +43,7 @@ module cor_decoder (
     output logic [4:0]          rd_addr_o,
     output logic [4:0]          rs1_addr_o,
     output logic [4:0]          rs2_addr_o,
+    output logic [4:0]          rs3_addr_o,
     output logic [eth_rv_pkg::XLEN-1:0] imm_o,
     output logic                pred_taken_o   // static prediction (IF only: backward branch)
 );
@@ -61,6 +62,14 @@ module cor_decoder (
     localparam logic [6:0] OP_REG32   = 7'h3b;
     localparam logic [6:0] OP_MISC    = 7'h0f;
     localparam logic [6:0] OP_SYSTEM  = 7'h73;
+    // floating point (E2-RV2 increment 2): the F/D opcodes
+    localparam logic [6:0] OP_LOADFP  = 7'h07;   // flw / fld
+    localparam logic [6:0] OP_STOREFP = 7'h27;   // fsw / fsd
+    localparam logic [6:0] OP_FP      = 7'h53;   // the OP-FP group
+    localparam logic [6:0] OP_FMADD   = 7'h43;
+    localparam logic [6:0] OP_FMSUB   = 7'h47;
+    localparam logic [6:0] OP_FNMSUB  = 7'h4b;
+    localparam logic [6:0] OP_FNMADD  = 7'h4f;
 
     // ------------------------------------------------------- fields
     logic [6:0] opcode;
@@ -156,6 +165,7 @@ module cor_decoder (
         rd_addr_o = 5'd0;
         rs1_addr_o = 5'd0;
         rs2_addr_o = 5'd0;
+        rs3_addr_o = 5'd0;
         imm_o     = 64'd0;
 
         if (!is_c_i) begin
@@ -379,6 +389,178 @@ module cor_decoder (
                     ctrl_o.alu_a = eth_rv_pkg::OP_A_ZERO;
                     ctrl_o.alu_b = eth_rv_pkg::OP_B_IMM;
                 end
+                // ---- FP loads / stores (F/D) --------------------------------
+                // The base register is an INTEGER register, the data register an
+                // FP one; `mem_signed` is irrelevant (the load zero-extends into
+                // the format and FLW NaN-boxes in the MEM stage).
+                OP_LOADFP: begin
+                    if (funct3 == 3'b010 || funct3 == 3'b011) begin
+                        ctrl_o.is_fp       = 1'b1;
+                        ctrl_o.fp_we       = 1'b1;
+                        ctrl_o.fp_single   = (funct3 == 3'b010);
+                        ctrl_o.wb_sel      = eth_rv_pkg::WB_MEM;
+                        ctrl_o.is_load     = 1'b1;
+                        ctrl_o.mem_size    = (funct3 == 3'b010) ? eth_rv_pkg::SZ_WORD
+                                                                : eth_rv_pkg::SZ_DWRD;
+                        ctrl_o.alu_op      = eth_rv_pkg::ALU_ADD;
+                        ctrl_o.alu_a       = eth_rv_pkg::OP_A_RS1;
+                        ctrl_o.alu_b       = eth_rv_pkg::OP_B_IMM;
+                        rd_addr_o          = rd;
+                        rs1_addr_o         = rs1;
+                        imm_o              = i_imm;
+                    end else begin
+                        ctrl_o.illegal = 1'b1;
+                    end
+                end
+                OP_STOREFP: begin
+                    if (funct3 == 3'b010 || funct3 == 3'b011) begin
+                        ctrl_o.is_fp     = 1'b1;
+                        ctrl_o.fp_single = (funct3 == 3'b010);
+                        ctrl_o.fp_rs2_fp = 1'b1;
+                        ctrl_o.is_store  = 1'b1;
+                        ctrl_o.mem_size  = (funct3 == 3'b010) ? eth_rv_pkg::SZ_WORD
+                                                              : eth_rv_pkg::SZ_DWRD;
+                        ctrl_o.alu_op    = eth_rv_pkg::ALU_ADD;
+                        ctrl_o.alu_a     = eth_rv_pkg::OP_A_RS1;
+                        ctrl_o.alu_b     = eth_rv_pkg::OP_B_IMM;
+                        rs1_addr_o       = rs1;
+                        rs2_addr_o       = rs2;
+                        imm_o            = s_imm;
+                    end else begin
+                        ctrl_o.illegal = 1'b1;
+                    end
+                end
+                // ---- OP-FP: arithmetic, compare, convert, move --------------
+                OP_FP: begin
+                    if (funct7[1:0] == 2'b10 || funct7[1:0] == 2'b11) begin
+                        ctrl_o.illegal = 1'b1;   // no half / quad precision
+                    end else begin
+                         ctrl_o.is_fp     = 1'b1;
+                        ctrl_o.fp_single = (funct7[1:0] == 2'b00);
+                        ctrl_o.fp_rs1_fp = 1'b1;
+                        ctrl_o.fp_rs2_fp = 1'b1;
+                        // every OP-FP form writes an FP register unless the case
+                        // below overrides it (the compares and the FP->int converts
+                        // write an integer register instead)
+                        ctrl_o.fp_we     = 1'b1;
+                        rd_addr_o        = rd;
+                        rs1_addr_o       = rs1;
+                        rs2_addr_o       = rs2;
+                        unique case (funct7[6:2])
+                            5'b00000: begin ctrl_o.fp_op = eth_rv_pkg::FP_ADD; end
+                            5'b00001: begin ctrl_o.fp_op = eth_rv_pkg::FP_SUB; end
+                            5'b00010: begin ctrl_o.fp_op = eth_rv_pkg::FP_MUL; end
+                            5'b00011: begin ctrl_o.fp_op = eth_rv_pkg::FP_DIV; end
+                            5'b01011: begin ctrl_o.fp_op = eth_rv_pkg::FP_SQRT; end
+                            5'b00100: begin
+                                unique case (funct3)
+                                    3'b000: ctrl_o.fp_op = eth_rv_pkg::FP_SGNJ;
+                                    3'b001: ctrl_o.fp_op = eth_rv_pkg::FP_SGNJN;
+                                    3'b010: ctrl_o.fp_op = eth_rv_pkg::FP_SGNJX;
+                                    default: ctrl_o.illegal = 1'b1;
+                                endcase
+                            end
+                            5'b00101: begin
+                                unique case (funct3)
+                                    3'b000: ctrl_o.fp_op = eth_rv_pkg::FP_MIN;
+                                    3'b001: ctrl_o.fp_op = eth_rv_pkg::FP_MAX;
+                                    default: ctrl_o.illegal = 1'b1;
+                                endcase
+                            end
+                            // fsgnj*/fmin/fmax write an FP register and read no rm
+                            // 01000: fcvt.s.d / fcvt.d.s (rs2 selects the source)
+                            5'b01000: begin
+                                ctrl_o.fp_op        = eth_rv_pkg::FP_CVT_FP_FP;
+                                ctrl_o.fp_src_single = (rs2 == 5'd0);
+                                if (rs2 > 5'd1) begin
+                                    ctrl_o.illegal = 1'b1;
+                                end
+                            end
+                            // 10100: the comparisons (integer destination)
+                            5'b10100: begin
+                                ctrl_o.fp_we = 1'b0;
+                                ctrl_o.rf_we = 1'b1;
+                                unique case (funct3)
+                                    3'b010: ctrl_o.fp_op = eth_rv_pkg::FP_EQ;
+                                    3'b001: ctrl_o.fp_op = eth_rv_pkg::FP_LT;
+                                    3'b000: ctrl_o.fp_op = eth_rv_pkg::FP_LE;
+                                    default: ctrl_o.illegal = 1'b1;
+                                endcase
+                            end
+                            // 11000: fcvt.{w,wu,l,lu}.{s,d}  (FP -> integer)
+                            5'b11000: begin
+                                ctrl_o.fp_we = 1'b0;
+                                ctrl_o.rf_we = 1'b1;
+                                ctrl_o.fp_op = eth_rv_pkg::FP_CVT_FP_I;
+                                ctrl_o.fp_iw = rs2[1:0];
+                                if (rs2 > 5'd3) begin
+                                    ctrl_o.illegal = 1'b1;
+                                end
+                            end
+                            // 11010: fcvt.{s,d}.{w,wu,l,lu}  (integer -> FP)
+                            5'b11010: begin
+                                ctrl_o.fp_we     = 1'b1;
+                                ctrl_o.fp_rs1_fp = 1'b0;
+                                ctrl_o.fp_rs2_fp = 1'b0;
+                                ctrl_o.fp_op     = eth_rv_pkg::FP_CVT_I_FP;
+                                ctrl_o.fp_iw     = rs2[1:0];
+                                if (rs2 > 5'd3) begin
+                                    ctrl_o.illegal = 1'b1;
+                                end
+                            end
+                            // 11100: fclass (funct3 = 001) / fmv.x.w|d (funct3 = 000)
+                            5'b11100: begin
+                                ctrl_o.fp_we = 1'b0;
+                                ctrl_o.rf_we = 1'b1;
+                                unique case (funct3)
+                                    3'b001: ctrl_o.fp_op = eth_rv_pkg::FP_CLASS;
+                                    3'b000: ctrl_o.fp_op = eth_rv_pkg::FP_MV_X_FP;
+                                    default: ctrl_o.illegal = 1'b1;
+                                endcase
+                            end
+                            // 11110: fmv.w.x / fmv.d.x
+                            5'b11110: begin
+                                ctrl_o.fp_we     = 1'b1;
+                                ctrl_o.fp_rs1_fp = 1'b0;
+                                ctrl_o.fp_rs2_fp = 1'b0;
+                                ctrl_o.fp_op     = eth_rv_pkg::FP_MV_FP_X;
+                                if (rs2 != 5'd0) begin
+                                    ctrl_o.illegal = 1'b1;
+                                end
+                            end
+                            default: ctrl_o.illegal = 1'b1;
+                        endcase
+                        // arithmetic / convert forms carry an rm field
+                        if (eth_rv_pkg::fp_op_uses_rm(ctrl_o.fp_op)) begin
+                            ctrl_o.fp_rm_used = 1'b1;
+                            ctrl_o.fp_rm      = funct3;
+                        end
+                    end
+                end
+                // ---- fused multiply-add -------------------------------------
+                OP_FMADD, OP_FMSUB, OP_FNMSUB, OP_FNMADD: begin
+                    if (insn_i[26:25] == 2'b10 || insn_i[26:25] == 2'b11) begin
+                        ctrl_o.illegal = 1'b1;   // no half / quad precision
+                    end else begin
+                        ctrl_o.is_fp     = 1'b1;
+                        ctrl_o.fp_we     = 1'b1;
+                        ctrl_o.fp_single = (insn_i[26:25] == 2'b00);
+                        ctrl_o.fp_rs1_fp = 1'b1;
+                        ctrl_o.fp_rs2_fp = 1'b1;
+                        ctrl_o.fp_rm_used = 1'b1;
+                        ctrl_o.fp_rm     = funct3;
+                        rd_addr_o        = rd;
+                        rs1_addr_o       = rs1;
+                        rs2_addr_o       = rs2;
+                        rs3_addr_o       = insn_i[31:27];
+                        unique case (opcode)
+                            OP_FMADD:  ctrl_o.fp_op = eth_rv_pkg::FP_MADD;
+                            OP_FMSUB:  ctrl_o.fp_op = eth_rv_pkg::FP_MSUB;
+                            OP_FNMSUB: ctrl_o.fp_op = eth_rv_pkg::FP_NMSUB;
+                            default:   ctrl_o.fp_op = eth_rv_pkg::FP_NMADD;
+                        endcase
+                    end
+                end
                 // SYSTEM: the trap/CSR instructions of the M/S/U machine. The
                 // privilege rules of mret/sret (and of every CSR access) depend on
                 // the *current* privilege, so the decoder only classifies the
@@ -472,6 +654,33 @@ module cor_decoder (
                             rd_addr_o         = rd_p;
                             rs1_addr_o        = rs1_p;
                             imm_o             = (insn_i[13] == 1'b0) ? clw_imm : cld_imm;
+                        end
+                        3'b001, 3'b101: begin
+                            // C.FLD / C.FSD (RV64); C.FLW / C.FSW do not exist in
+                            // the RV64 C extension, so these are the FP pair.
+                            ctrl_o.is_fp     = 1'b1;
+                            ctrl_o.fp_single = 1'b0;
+                            ctrl_o.mem_size  = eth_rv_pkg::SZ_DWRD;
+                            ctrl_o.alu_op    = eth_rv_pkg::ALU_ADD;
+                            ctrl_o.alu_a     = eth_rv_pkg::OP_A_RS1;
+                            ctrl_o.alu_b     = eth_rv_pkg::OP_B_IMM;
+                            rs1_addr_o       = rs1_p;
+                            imm_o            = cld_imm;
+                            // C.FLD (funct3 = 001) and C.FSD (funct3 = 101) differ in
+                            // bit 15 — bits 14 and 13 are 0 and 1 in BOTH (funct3's
+                            // low bits), so only the high funct3 bit splits them.
+                            if (insn_i[15] == 1'b0) begin
+                                // C.FLD: an FP destination
+                                ctrl_o.fp_we  = 1'b1;
+                                ctrl_o.wb_sel = eth_rv_pkg::WB_MEM;
+                                ctrl_o.is_load = 1'b1;
+                                rd_addr_o     = rd_p;
+                            end else begin
+                                // C.FSD: an FP source
+                                ctrl_o.fp_rs2_fp = 1'b1;
+                                ctrl_o.is_store  = 1'b1;
+                                rs2_addr_o       = rs2_p;
+                            end
                         end
                         3'b110, 3'b111: begin
                             // C.SW / C.SD
@@ -622,6 +831,28 @@ module cor_decoder (
                             rd_addr_o     = c_rd;
                             rs1_addr_o    = c_rd;
                             imm_o         = cshamt_imm;
+                        end
+                        3'b001, 3'b101: begin
+                            // C.FLDSP / C.FSDSP (RV64)
+                            ctrl_o.is_fp     = 1'b1;
+                            ctrl_o.fp_single = 1'b0;
+                            ctrl_o.mem_size  = eth_rv_pkg::SZ_DWRD;
+                            ctrl_o.alu_op    = eth_rv_pkg::ALU_ADD;
+                            ctrl_o.alu_a     = eth_rv_pkg::OP_A_RS1;
+                            ctrl_o.alu_b     = eth_rv_pkg::OP_B_IMM;
+                            rs1_addr_o       = 5'd2;
+                            if (insn_i[15] == 1'b0) begin
+                                ctrl_o.fp_we  = 1'b1;
+                                ctrl_o.wb_sel = eth_rv_pkg::WB_MEM;
+                                ctrl_o.is_load = 1'b1;
+                                rd_addr_o     = c_rd;
+                                imm_o         = cldsp_imm;
+                            end else begin
+                                ctrl_o.fp_rs2_fp = 1'b1;
+                                ctrl_o.is_store  = 1'b1;
+                                rs2_addr_o       = c_rs2;
+                                imm_o            = csdsp_imm;
+                            end
                         end
                         3'b010, 3'b011: begin
                             // C.LWSP / C.LDSP (rd = 0 reserved)

@@ -1,9 +1,12 @@
 `default_nettype none
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      eth_rv_pkg
-// Description: Frozen parameter pack + decode/writeback control types for eth_rv (RV64IMC, RV-B).
-// Details:     Single blessed configuration (C14 §2): XLEN = 64, one hart, no MMU / FPU;
-//              the M-mode CSR + trap path is the minimal set of C14 §3. Every
+// Description: Frozen parameter pack + decode/writeback control types for eth_rv (RV64IMFC, RV-C).
+// Details:     Single blessed configuration (C14 §2): XLEN = 64, one hart. As of
+//              E2-RV2 increment 2 the MMU is Sv39-only (cor_mmu) and the F/D
+//              floating-point extensions are implemented (cor_fpu), so `misa`
+//              advertises I/M/F/D/C. The M-mode CSR + trap path is the minimal set
+//              of C14 §3. Every
 //              pipeline-control field travels as one packed struct (`ctrl_t`) so the
 //              IF->ID->EX->MEM->WB registers stay flat vectors and the core lints
 //              clean under `-Wall`.
@@ -88,6 +91,12 @@ package eth_rv_pkg;
     localparam logic [11:0] CSR_MEDELEG  = 12'h302;
     localparam logic [11:0] CSR_MIDELEG  = 12'h303;
     localparam logic [11:0] CSR_MCOUNTEREN = 12'h306;
+    // The floating-point CSRs of the F extension. `fcsr` is a *view*: bits 7:5 are
+    // `frm` (write mask 3'h7) and bits 4:0 are `fflags` (write mask 5'h1f), exactly
+    // Spike's composite_csr_t over two independent sub-CSRs.
+    localparam logic [11:0] CSR_FFLAGS    = 12'h001;
+    localparam logic [11:0] CSR_FRM       = 12'h002;
+    localparam logic [11:0] CSR_FCSR      = 12'h003;
 
     // S-mode CSR set (C14 §3; E2-RV1 increment 6). The S-mode trap CSRs are
     // registers of their own — unlike mstatus/sstatus, they are not a view of a
@@ -118,7 +127,7 @@ package eth_rv_pkg;
     // (MXL=64, I, M, C, S, U) and the mstatus XL fields are the RV64 values, so a
     // program that reads them sees the same bit pattern as the Spike golden model
     // (see verif/eth_rv/README.md). `mip` is a real register as of increment 6.
-    localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_1104;
+    localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_112c;
     localparam logic [63:0] MSTATUS_XL    = 64'h0000_000a_0000_0000;  // SXL = UXL = 2
     localparam logic [63:0] MHARTID_VALUE = 64'd0;
 
@@ -137,6 +146,14 @@ package eth_rv_pkg;
     localparam logic [63:0] SSTATUS_WMASK = 64'h0000_0000_000c_6122;  // SIE|SPIE|SPP|FS|SUM|MXR
     localparam logic [63:0] SSTATUS_RMASK = 64'h8000_0002_000c_6122;  // | UXL | SD
     localparam logic [63:0] MSTATUS_FS    = 64'h0000_0000_0000_6000;  // FS = 2'b11 -> SD
+    // F/D (E2-RV2 increment 2): an FP instruction, an FP load/store or an FP move
+    // sets `mstatus.FS` to Dirty; while FS is Off (its reset value) every one of
+    // those, and every access to the three FP CSRs, is an ILLEGAL INSTRUCTION —
+    // Spike's `require_fp` / float_csr_t::verify_permissions — never a silent no-op.
+     localparam logic [63:0] MSTATUS_FS_OFF = 64'h0000_0000_0000_0000;
+    // The write masks of `fflags` and `frm` (Spike's float_csr_t masks).
+    localparam logic [4:0]  FFLAGS_MASK   = 5'h1f;
+    localparam logic [2:0]  FRM_MASK      = 3'h7;
     localparam logic [63:0] MSTATUS_SD    = 64'h8000_0000_0000_0000;
     localparam logic [63:0] MSTATUS_MIE   = 64'h0000_0000_0000_0008;
     localparam logic [63:0] MSTATUS_MPIE  = 64'h0000_0000_0000_0080;
@@ -262,6 +279,7 @@ package eth_rv_pkg;
             eth_rv_pkg::CSR_MCAUSE, eth_rv_pkg::CSR_MTVAL, eth_rv_pkg::CSR_MIP,
             eth_rv_pkg::CSR_MHARTID, eth_rv_pkg::CSR_MEDELEG, eth_rv_pkg::CSR_MIDELEG,
             eth_rv_pkg::CSR_MCOUNTEREN,
+            eth_rv_pkg::CSR_FFLAGS, eth_rv_pkg::CSR_FRM, eth_rv_pkg::CSR_FCSR,
             eth_rv_pkg::CSR_SATP,
             eth_rv_pkg::CSR_SSTATUS, eth_rv_pkg::CSR_SIE, eth_rv_pkg::CSR_STVEC,
             eth_rv_pkg::CSR_SCOUNTEREN, eth_rv_pkg::CSR_SSCRATCH, eth_rv_pkg::CSR_SEPC,
@@ -292,6 +310,89 @@ package eth_rv_pkg;
         MD_REMW   = 4'd11,
         MD_REMUW  = 4'd12
     } md_op_e;
+
+    // -------------------------------------------------- float ops
+    // One op-select for the whole FPU (cor_fpu). Every encoding the decoder accepts
+    // carries exactly one of these; FP_NONE is the "not an FP op" value and is what
+    // a zeroed ctrl_t carries.
+    typedef enum logic [5:0] {
+        FP_NONE     = 6'd0,
+        FP_ADD      = 6'd1,   // fadd.s/.d
+        FP_SUB      = 6'd2,   // fsub.s/.d
+        FP_MUL      = 6'd3,   // fmul.s/.d
+        FP_DIV      = 6'd4,   // fdiv.s/.d
+        FP_SQRT     = 6'd5,   // fsqrt.s/.d
+        FP_MADD     = 6'd6,   // fmadd.s/.d :   rs1 * rs2 + rs3
+        FP_MSUB     = 6'd7,   // fmsub.s/.d :   rs1 * rs2 - rs3
+        FP_NMADD    = 6'd8,   // fnmadd.s/.d: -(rs1 * rs2) - rs3
+        FP_NMSUB    = 6'd9,   // fnmsub.s/.d: -(rs1 * rs2) + rs3
+        FP_SGNJ     = 6'd10,  // fsgnj.s/.d
+        FP_SGNJN    = 6'd11,  // fsgnjn.s/.d
+        FP_SGNJX    = 6'd12,  // fsgnjx.s/.d
+        FP_MIN      = 6'd13,  // fmin.s/.d
+        FP_MAX      = 6'd14,  // fmax.s/.d
+        FP_EQ       = 6'd15,  // feq.s/.d
+        FP_LT       = 6'd16,  // flt.s/.d
+        FP_LE       = 6'd17,  // fle.s/.d
+        FP_CLASS    = 6'd18,  // fclass.s/.d
+        FP_MV_X_FP  = 6'd19,  // fmv.x.w / fmv.x.d : FP bits -> integer register
+        FP_MV_FP_X  = 6'd20,  // fmv.w.x / fmv.d.x : integer bits -> FP (NaN-boxed)
+        FP_CVT_FP_I = 6'd21,  // fcvt.{w,wu,l,lu}.{s,d}
+        FP_CVT_I_FP = 6'd22,  // fcvt.{s,d}.{w,wu,l,lu}
+        FP_CVT_FP_FP = 6'd23  // fcvt.s.d / fcvt.d.s
+    } fp_op_e;
+
+    // The architectural rounding modes of the F extension. The FPU only ever sees a
+    // VALIDATED value (0..4): the core resolves `rm = 3'b111` against `frm` and
+    // raises an illegal instruction for a resolved mode of 5..7, exactly Spike's
+    // `validate_rm` (which is applied only to the op classes that carry an rm field).
+    typedef enum logic [2:0] {
+        RM_RNE = 3'd0,
+        RM_RTZ = 3'd1,
+        RM_RDN = 3'd2,
+        RM_RUP = 3'd3,
+        RM_RMM = 3'd4
+    } fp_rm_e;
+
+    // True when `op` is one of the fused multiply-add forms: those are the only
+    // encodings that name a THIRD source register (rs3), and it is always an FP one.
+    function automatic logic fp_op_is_fma(input fp_op_e op);
+        unique case (op)
+            eth_rv_pkg::FP_MADD, eth_rv_pkg::FP_MSUB,
+            eth_rv_pkg::FP_NMADD, eth_rv_pkg::FP_NMSUB:
+                fp_op_is_fma = 1'b1;
+            default:
+                fp_op_is_fma = 1'b0;
+        endcase
+    endfunction
+
+    // True when `addr` is one of the three F-extension CSRs that `fcsr` is a view
+    // of. Accessing any of them while `mstatus.FS` is Off is an illegal
+    // instruction (Spike's float_csr_t::verify_permissions).
+    function automatic logic csr_is_fp(input logic [11:0] addr);
+        unique case (addr)
+            eth_rv_pkg::CSR_FFLAGS, eth_rv_pkg::CSR_FRM, eth_rv_pkg::CSR_FCSR:
+                csr_is_fp = 1'b1;
+            default:
+                csr_is_fp = 1'b0;
+        endcase
+    endfunction
+
+    // True when `op` reads the rounding mode from its encoding / `frm`. The compare,
+    // min/max, sign-injection, classify and move forms do not — their rm field is
+    // part of funct3 — and Spike does not validate rm for them.
+    function automatic logic fp_op_uses_rm(input fp_op_e op);
+        unique case (op)
+            eth_rv_pkg::FP_ADD, eth_rv_pkg::FP_SUB, eth_rv_pkg::FP_MUL,
+            eth_rv_pkg::FP_DIV, eth_rv_pkg::FP_SQRT, eth_rv_pkg::FP_MADD,
+            eth_rv_pkg::FP_MSUB, eth_rv_pkg::FP_NMADD, eth_rv_pkg::FP_NMSUB,
+            eth_rv_pkg::FP_CVT_FP_I, eth_rv_pkg::FP_CVT_I_FP,
+            eth_rv_pkg::FP_CVT_FP_FP:
+                fp_op_uses_rm = 1'b1;
+            default:
+                fp_op_uses_rm = 1'b0;
+        endcase
+    endfunction
 
     // ------------------------------------------------- memory access size
     typedef enum logic [1:0] {
@@ -332,6 +433,17 @@ package eth_rv_pkg;
         logic       is_mret;
         logic       is_sret;     // sret (S-mode return; legal in M when TSR = 0)
         logic       is_sfence;   // sfence.vma (E2-RV2 increment 1)
+        // ---- floating point (F/D, E2-RV2 increment 2) ----
+        logic       is_fp;       // any FP instruction (FS gate + FS -> Dirty)
+        logic       fp_we;       // the destination register is a FLOAT register
+        fp_op_e     fp_op;
+        logic       fp_single;   // .s form: the operand/result format is binary32
+        logic       fp_src_single; // FP->FP cvt: the SOURCE format is binary32
+        logic       fp_rm_used;  // this encoding carries an rm field
+        logic [2:0] fp_rm;       // the encoding's rm field (3'b111 = dynamic)
+        logic [1:0] fp_iw;       // cvt integer form: 0 = w, 1 = wu, 2 = l, 3 = lu
+        logic       fp_rs1_fp;   // rs1 is read from the FP register file
+        logic       fp_rs2_fp;   // rs2 is read from the FP register file
     } ctrl_t;
 
     // The error strobe's code type is `trap_cause_e`: the core no longer halts on
@@ -359,6 +471,7 @@ package eth_rv_pkg;
         logic rf_we;
         logic is_load;
         logic is_store;
+        logic fp_we;      // the destination is an FP register (trace record class)
     } commit_ctrl_t;
 
     // ------------------------------------------------ memory-stage control
@@ -370,6 +483,7 @@ package eth_rv_pkg;
         logic      is_store;
         mem_size_e mem_size;
         logic      mem_signed;
+        logic      fp_we;        // the load destination is an FP register
     } mem_ctrl_t;
 
 endpackage

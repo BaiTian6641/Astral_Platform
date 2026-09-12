@@ -70,9 +70,12 @@ RTL_SOURCES = [
     RTL_DIR / "cor_muldiv.sv",
     RTL_DIR / "cor_lsu.sv",
     RTL_DIR / "cor_regfile.sv",
-    RTL_DIR / "cor_decoder.sv",
+     RTL_DIR / "cor_decoder.sv",
     # Sv39 address translation (E2-RV2 increment 1): the page-table walker.
     RTL_DIR / "cor_mmu.sv",
+    # F/D floating point (E2-RV2 increment 2): the register file and the FPU.
+    RTL_DIR / "cor_fp_regfile.sv",
+    RTL_DIR / "cor_fpu.sv",
     RTL_DIR / "eth_rv_core.sv",
     # SoC MMIO: the console UART and the address decoder in front of the D port
     # (C14 §4). Both sit in front of either memory path, so they are part of
@@ -108,6 +111,12 @@ CORPUS_PROGRAMS = [
     # (see verif/eth_rv/README.md "Sv39 translation").
     "cor_sv39",
     "cor_pgfault",
+    # E2-RV2 increment 2: the F/D floating-point extensions. `cor_fp` compares
+    # every FP register value and every fflags/frm accrual against Spike through
+    # the trace v2 record; `cor_fptrap` pins the FS=Off illegal-instruction rule
+    # on FP instructions, FP loads/stores and the FP CSRs (see verif/eth_rv/README.md).
+    "cor_fp",
+    "cor_fptrap",
 ]
 
 HELLO_STRING = b"hello, eth_rv!\n"
@@ -472,14 +481,18 @@ def parse_fault(spec: str) -> tuple[int, str, int]:
     """``INDEX:FIELD=VALUE`` -> ``(index, field, value)`` (same shape as --inject).
 
     ``mem_addr``/``mem_wdata`` corrupt the memory stream the trace reports, which
-    is the negative control for the memory comparison (C14 §5.2).
+    is the negative control for the memory comparison (C14 §5.2), and
+    ``fflags``/``frm`` corrupt the FP record, the negative control for the FP
+    comparison (E2-RV2 increment 2).
     """
     match = re.fullmatch(
-        r"(\d+):(pc|rd|value|mem_addr|mem_wdata)=(0x[0-9a-fA-F]+|\d+)", spec.strip()
+        r"(\d+):(pc|rd|value|mem_addr|mem_wdata|fflags|frm)=(0x[0-9a-fA-F]+|\d+)",
+        spec.strip(),
     )
     if match is None:
         raise SetupError(
-            f"--fault wants INDEX:{{pc,rd,value,mem_addr,mem_wdata}}=VALUE, got {spec!r}"
+            f"--fault wants INDEX:{{pc,rd,value,mem_addr,mem_wdata,fflags,frm}}=VALUE, "
+            f"got {spec!r}"
         )
     return int(match.group(1)), match.group(2), int(match.group(3), 0)
 

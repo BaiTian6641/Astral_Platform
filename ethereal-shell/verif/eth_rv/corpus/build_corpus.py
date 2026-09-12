@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Build the ``eth_rv`` DiffTest corpus: bare-metal RV64IMC ELFs + hex fixtures.
+"""Build the ``eth_rv`` DiffTest corpus: bare-metal RV64IMFDC ELFs + hex fixtures.
 
 Every ``corpus/cor_*.S`` is linked against ``corpus/crt0.S`` and
 ``corpus/link.ld`` with the local bare-metal toolchain and written to
@@ -39,14 +39,16 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_OUT_DIR = REPO_ROOT / "generated" / "rv_difftest" / "corpus"
 
 TOOLCHAIN_PREFIX = "riscv64-unknown-elf-"
-MARCH = "rv64imc_zicsr"
-"""ISA the corpus is built for: RV64IMC + the CSR instructions.
+MARCH = "rv64imfdc_zicsr"
+"""ISA the corpus is built for: RV64IMFDC + the CSR instructions.
 
-`Zicsr` is not implied by `I` in binutils any more, so the CSR/trap programs
-(cor_csr/cor_trap) need it spelled out. It changes nothing for the RV64I/M/C
-programs — they contain no CSR instruction and assemble to the same bytes — and
-Spike enables `zicsr` by default for `--isa=rv64imc`, so the golden side needs
-no change."""
+``I``/``M``/``F``/``D``/``C`` are what the core implements and advertises in
+``misa`` (0x800000000014112c); ``Zicsr`` is not implied by ``I`` in binutils any
+more, so the CSR/FP-control programs need it spelled out. It changes nothing for
+the integer programs — they contain no FP or CSR instruction and assemble to the
+same bytes. Spike enables ``zicsr`` by default for this ISA string, and the whole
+corpus is built with ``-mabi=lp64`` (soft-float ABI): the FP programs drive the
+FP registers directly and never call libc."""
 MABI = "lp64"
 
 CFLAGS: tuple[str, ...] = (
@@ -156,6 +158,7 @@ def write_golden_fixtures(elf: Path, out_dir: Path, *, spike: str | Path | None 
     sys.path.insert(0, str(ETH_RV_DIR))
     from rv_image import load_elf_image
     from rv_spike import (
+        DEFAULT_ISA,
         last_golden_line,
         run_spike,
         trace_text_for_elf,
@@ -170,7 +173,7 @@ def write_golden_fixtures(elf: Path, out_dir: Path, *, spike: str | Path | None 
     log_path.write_text(
         "\n".join(
             [
-                f"# raw output of: spike --isa=rv64imc -l --log-commits --log=... {elf.name}",
+                f"# raw output of: spike --isa={DEFAULT_ISA} -l --log-commits --log=... {elf.name}",
                 f"# {run.version} · generator: corpus/build_corpus.py --golden-out",
                 (
                     f"# truncated after {LOG_TAIL_LINES} lines past the HTIF exit store "

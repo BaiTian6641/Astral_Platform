@@ -12,7 +12,7 @@
 | 里程碑 | 内容 | 启动目标 | 状态 |
 |---|---|---|---|
 | **RV-B（本文件）** | RV64IMC，顺序单发射 5 级，无 MMU | bare-metal / FreeRTOS over UART，**DiffTest vs Spike 零分歧** | 本规范 |
-| RV-C | +F/D（FPU）+ Sv39 MMU（M/S/U 特权态与 trap 委派/CLINT 中断已在 RV-B 增量 6 落地并经 DiffTest 验证；**Sv39 已在 E2-RV2 增量 1 落地**：`satp`/三级页表遍历/PTE 权限矩阵/页错误 12-13-15/`sfence.vma`，见 `verif/eth_rv/README.md` §"Sv39 translation"；F/D 未做） | **boot Linux**（GW5 验证档） | 增量 1 完成（Sv39） |
+| RV-C | +F/D（FPU）+ Sv39 MMU（M/S/U 特权态与 trap 委派/CLINT 中断已在 RV-B 增量 6 落地并经 DiffTest 验证；**Sv39 已在 E2-RV2 增量 1 落地**：`satp`/三级页表遍历/PTE 权限矩阵/页错误 12-13-15/`sfence.vma`，见 `verif/eth_rv/README.md` §"Sv39 translation"；**F/D 已在 E2-RV2 增量 2 落地**：32 个 FP 寄存器、F/D 全指令集（含四类融合乘加）、五种舍入模式、`fflags` 精确累积、NaN 规范化装箱、`mstatus.FS`/`fcsr`/FS=Off 非法指令陷阱，并扩展 RVFI trace 以比对 FP 状态，见 `verif/eth_rv/README.md`） | **boot Linux**（GW5 验证档） | 增量 2 完成（F/D） |
 | RV-E | 2-4 核共享 L2 相干 | SMP Linux | 后续 |
 | RV-F | Hypervisor + Vector 协处理器 + Z\* | RVA23 完整 | 后续 |
 

@@ -7,11 +7,11 @@ three adapters ship today, and selecting one is a CLI argument:
 
 ``--dut dump:PATH``
     A trace file: the canonical format (which may carry the optional
-    ``mem_addr``/``mem_wdata``[/``mem_rmask``/``mem_wmask``] suffix), or a bare
-    ``pc rd value`` dump (cycle = line ordinal) as a Verilator testbench would
-    ``$fwrite`` it. A dump without the memory suffix is compared on pc/rd/value
-    alone, and the harness says so instead of pretending the memory stream
-    matched.
+    ``mem_addr``/``mem_wdata``[/``mem_rmask``/``mem_wmask``] suffix and the keyed
+    ``fflags=0x..``/``frm=0x..`` FP state), or a bare ``pc rd value`` dump
+    (cycle = line ordinal) as a Verilator testbench would ``$fwrite`` it. A dump
+    without the memory suffix is compared on pc/rd/value alone, and the harness
+    says so instead of pretending the memory stream matched.
 ``--dut model:PATH``
     The worked-example Python DUT (:mod:`rv_model`) running an ELF or hex image.
 ``--dut callback:MODULE:FUNC``
@@ -22,9 +22,11 @@ three adapters ship today, and selecting one is a CLI argument:
 The RTL testbench writes one line per retired instruction with the
 *architectural* effects: pc, rd, value and — since the memory-stream increment
 (C14 §5.2) — the D-port's access as the optional ``mem_addr mem_wdata rmask
-wmask`` suffix, in the same convention Spike's ``--log-commits`` uses. Emitting
-only the core fields stays legal; the harness then reports the memory stream as
-not provided.
+wmask`` suffix, in the same convention Spike's ``--log-commits`` uses, plus —
+since the FP increment — ``f<rd>`` when it writes a floating-point register and
+the keyed ``fflags=0x..``/``frm=0x..`` state when it writes those CSRs. Emitting
+only the core fields stays legal; the harness then reports the memory and FP
+streams as not provided instead of pretending they matched.
 """
 from __future__ import annotations
 
@@ -175,11 +177,25 @@ INJECTION_FIELDS = (
     "mem_wdata",
     "mem_rmask",
     "mem_wmask",
+    "fflags",
+    "frm",
 )
-"""Fields :meth:`Injection.parse` accepts (every field a :class:`Commit` carries)."""
+"""Fields :meth:`Injection.parse` accepts (every field a :class:`Commit` carries).
+
+``value`` corrupts the raw 64-bit register value whatever the register class of
+the commit, so injecting it on an FP write corrupts that FP value (``f<d>``) with
+no extra field.
+"""
 
 MEM_MASK_FIELDS = ("mem_rmask", "mem_wmask")
 """Injection fields that set one byte-lane mask (and clear the other)."""
+
+FP_FIELDS: dict[str, int] = {"fflags": 5, "frm": 3}
+"""Injection fields that set FP control state, and the width each value must fit.
+
+Injecting one leaves the commit's register write (and its class) alone: a
+corrupted FP record is what the RTL-side negative control needs.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +211,8 @@ class Injection:
         """Parse ``INDEX:FIELD=VALUE``; ``FIELD`` is any field of a commit.
 
         ``pc``/``value``/``cycle``/``mem_addr``/``mem_wdata`` take a number,
-        ``rd`` a register name, ``mem_rmask``/``mem_wmask`` an 8-bit mask.
+        ``rd`` a register name, ``mem_rmask``/``mem_wmask`` an 8-bit mask, and
+        ``fflags``/``frm`` a 5-bit / 3-bit FP control-state value.
         """
         index_text, sep, rest = spec.partition(":")
         field, eq, value_text = rest.partition("=")
@@ -235,6 +252,9 @@ def _parse_field_value(spec: str, field: str, text: str) -> int:
         raise DutSpecError(f"--inject {spec!r}: {text!r} is not a number") from None
     if field in MEM_MASK_FIELDS and not 0 <= value < 256:
         raise DutSpecError(f"--inject {spec!r}: {text!r} is not an 8-bit byte-lane mask")
+    bits = FP_FIELDS.get(field)
+    if bits is not None and not 0 <= value < (1 << bits):
+        raise DutSpecError(f"--inject {spec!r}: {text!r} is not a {bits}-bit {field} value")
     return value
 
 
@@ -272,6 +292,11 @@ def apply_injection(commit: Commit, injection: Injection) -> Commit:
     performs no memory access gives it a (phantom) access, and injecting a data
     or mask field onto such a commit first invents an access at ``pc`` so the
     corruption is always visible instead of silently doing nothing.
+
+    ``fflags``/``frm`` replace the keyed FP state of the commit (inventing it on a
+    commit that reported none, which the comparator then reports when both
+    streams are FP-aware), and ``value`` corrupts the raw register value —
+    including the 64-bit FP value of an ``f<d>`` write.
     """
     if injection.field == "pc":
         return commit.with_pc(injection.value)
@@ -281,6 +306,12 @@ def apply_injection(commit: Commit, injection: Injection) -> Commit:
         return commit.with_rd(injection.value)
     if injection.field == "cycle":
         return commit.with_cycle(injection.value)
+    # the FP control fields are independent of the memory suffix: handle them
+    # before the memory block below, which invents an access for its own fields
+    if injection.field == "fflags":
+        return replace(commit, fflags=injection.value)
+    if injection.field == "frm":
+        return replace(commit, frm=injection.value)
     if injection.field == "mem_addr":
         return replace(commit, mem_addr=injection.value)
     if commit.mem_addr is None:

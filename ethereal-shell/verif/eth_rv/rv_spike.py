@@ -3,22 +3,33 @@
 
 Runs an ELF under the pinned Spike build (``generated/rv_difftest/spike``, see
 :data:`BUILD_COMMANDS`) with commit logging enabled and normalizes Spike's log
-into the canonical 4-field trace of :mod:`rv_trace`::
+into the canonical trace of :mod:`rv_trace`::
 
     core   0: 3 0x0000000080000000 (0x00000297) x 5  0x0000000080001000
     core   0: 3 0x00000000800000f8 (0x6082) x1  0x0000000000000000 mem 0x0000000080009fe0
     core   0: 3 0x00000000800000fc (0x00a2b023) mem 0x0000000080001000 0x0000000000000001
+    core   0: 3 0x0000000080000030 (0xf20280d3) f1  0x3ff0000000000000
+    core   0: 3 0x0000000080000042 (0x1a31f253) c1_fflags 0x0000000000000010 f4  0x7ff8000000000000
     -> 1 0x0000000080000000 x5 0x0000000080001000
     -> 2 0x00000000800000f8 x1 0x0000000000000000 0x0000000080009fe0 -
     -> 3 0x00000000800000fc - - 0x0000000080001000 0x0000000000000001
+    -> 4 0x0000000080000030 f1 0x3ff0000000000000
+    -> 5 0x0000000080000042 f4 0x7ff8000000000000 fflags=0x10
 
 Upstream Spike prints one line per retired instruction containing the privilege,
 pc, instruction word, every register (``x``/``f``/``c`` prefixes) or vector
-update, and ``mem`` read/write addresses. The integer register write and the
-memory access are part of the canonical record (the latter as the optional
+update, and ``mem`` read/write addresses. The register write and the memory
+access are part of the canonical record (the latter as the optional
 ``mem_addr``/``mem_wdata`` suffix of :mod:`rv_trace` — see C14 §5.2); ``insn`` is
 carried along for diagnostics. Spike is not cycle-accurate, so ``cycle`` is the
 retirement ordinal.
+
+The FP record rides on the same line: ``f<n> <raw 64-bit value>`` is an FP
+register write (``rd_is_fp``; the value is already NaN-boxed) and
+``c1_fflags``/``c2_frm`` are the keyed FP control-state updates. Spike logs
+*every* CSR write (``c768_mstatus`` included) but the canonical trace has no
+integer-CSR field, so only the two FP CSRs are kept and ``mstatus`` is ignored —
+see the FP boundary in ``local://rv8-trace-spec.md``.
 
 An instruction that **traps** is not committed: Spike logs the exception instead
 of a commit line, so a trapping instruction appears in neither the golden stream
@@ -39,8 +50,12 @@ from pathlib import Path
 from rv_image import load_elf_image
 from rv_trace import Commit, TraceFormatError, format_trace
 
-DEFAULT_ISA = "rv64imc"
-"""ISA string the corpus is built for (RV-B phase of S15 §2.2: RV64IMC, no MMU)."""
+DEFAULT_ISA = "rv64imfdc_zicsr"
+"""ISA string the corpus is built for (RV-C: RV64IMFDC + Zicsr, no MMU).
+
+I|M|F|D|C|S|U is what the core advertises in ``misa`` (0x800000000014112c).
+``Zicsr`` is spelled out because binutils no longer implies it from ``I`` and the
+CSR/FP-control programs need it; Spike enables it for this ISA by default."""
 
 SPIKE_ENV_VAR = "RV_DIFFTEST_SPIKE"
 """Environment variable that overrides the Spike binary location."""
@@ -75,7 +90,25 @@ _COMMIT_RE = re.compile(
 """One Spike commit-log line (``--log-commits``); the ``-l`` disassembly lines do not match."""
 
 _XREG_RE = re.compile(r"\bx(?P<rd>\d+)\s+(?P<value>0x[0-9a-fA-F]+)\b")
-"""Integer register update inside a commit line (``f``/``v``/``c`` updates are ignored)."""
+"""Integer register update inside a commit line (``v`` updates are ignored)."""
+
+_FREG_RE = re.compile(r"\bf(?P<rd>\d+)\s+(?P<value>0x[0-9a-fA-F]+)\b")
+"""Floating-point register update inside a commit line (``f1  0x3ff0…``).
+
+Spike logs the raw, already NaN-boxed 64-bit FP register value, which is exactly
+what ``rv_trace.Commit.value`` carries for an FP write.
+"""
+
+_CSR_RE = re.compile(r"\bc(?P<addr>\d+)_(?P<name>[a-z0-9]+)\s+0x(?P<value>[0-9a-fA-F]+)")
+"""One CSR write inside a commit line: ``c<addr>_<name> <value>``.
+
+Spike logs every CSR write this way (``c1_fflags``, ``c2_frm``, ``c768_mstatus``,
+…). Only :data:`_FP_CSR_NAMES` are part of the canonical record; the rest (the
+integer CSRs) are ignored — the trace has no field for them.
+"""
+
+_FP_CSR_NAMES = ("fflags", "frm")
+"""The two CSR write names that map onto the keyed trace fields of :mod:`rv_trace`."""
 
 _MEM_RE = re.compile(r"\bmem\s+0x(?P<addr>[0-9a-fA-F]+)(?:\s+0x(?P<data>[0-9a-fA-F]+))?\b")
 """One memory access inside a commit line: ``mem <addr> [<data>]``.
@@ -324,9 +357,10 @@ def iter_spike_commits(
             if not reached_entry:
                 continue
         insn = int(match.group("insn"), 16)
+        rest = match.group("rest")
         rd: int | None = None
         value: int | None = None
-        for reg_match in _XREG_RE.finditer(match.group("rest")):
+        for reg_match in _XREG_RE.finditer(rest):
             reg = int(reg_match.group("rd"))
             if reg == 0:  # pragma: no cover - Spike never logs x0
                 continue
@@ -338,9 +372,32 @@ def iter_spike_commits(
                 )
             rd = reg
             value = int(reg_match.group("value"), 16)
+        fp_rd: int | None = None
+        fp_value: int | None = None
+        for freg_match in _FREG_RE.finditer(rest):
+            if fp_rd is not None:
+                raise TraceFormatError(
+                    "spike commit line updates more than one floating-point register",
+                    source=source,
+                    line=lineno + 1,
+                )
+            fp_rd = int(freg_match.group("rd"))
+            fp_value = int(freg_match.group("value"), 16)
+        if rd is not None and fp_rd is not None:
+            # one commit record carries one architectural write: a line that
+            # updates both classes cannot be normalized without dropping one
+            raise TraceFormatError(
+                "spike commit line updates both an integer and a floating-point register",
+                source=source,
+                line=lineno + 1,
+            )
+        is_fp_write = fp_rd is not None
+        if is_fp_write:
+            # f0 is a real register, so it is kept (unlike x0 above)
+            rd, value = fp_rd, fp_value
         mem_addr: int | None = None
         mem_wdata: int | None = None
-        for mem_match in _MEM_RE.finditer(match.group("rest")):
+        for mem_match in _MEM_RE.finditer(rest):
             if mem_addr is not None:
                 raise TraceFormatError(
                     "spike commit line reports more than one memory access",
@@ -350,6 +407,18 @@ def iter_spike_commits(
             mem_addr = int(mem_match.group("addr"), 16)
             data = mem_match.group("data")
             mem_wdata = None if data is None else int(data, 16)
+        keyed: dict[str, int] = {}
+        for csr_match in _CSR_RE.finditer(rest):
+            name = csr_match.group("name")
+            if name not in _FP_CSR_NAMES:
+                continue  # an integer CSR (c768_mstatus …): no canonical field
+            if name in keyed:
+                raise TraceFormatError(
+                    f"spike commit line updates {name} more than once",
+                    source=source,
+                    line=lineno + 1,
+                )
+            keyed[name] = int(csr_match.group("value"), 16)
         yield lineno, Commit(
             cycle=index + 1,
             pc=pc,
@@ -358,9 +427,12 @@ def iter_spike_commits(
             insn=insn,
             mem_addr=mem_addr,
             mem_wdata=mem_wdata,
+            rd_is_fp=is_fp_write,
+            fflags=keyed.get("fflags"),
+            frm=keyed.get("frm"),
         )
         index += 1
-        if tohost is not None and _writes_htif_mailbox(match.group("rest"), tohost):
+        if tohost is not None and _writes_htif_mailbox(rest, tohost):
             return
 
 
