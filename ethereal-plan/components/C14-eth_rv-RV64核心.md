@@ -12,7 +12,7 @@
 | 里程碑 | 内容 | 启动目标 | 状态 |
 |---|---|---|---|
 | **RV-B（本文件）** | RV64IMC，顺序单发射 5 级，无 MMU | bare-metal / FreeRTOS over UART，**DiffTest vs Spike 零分歧** | 本规范 |
-| RV-C | +F/D（FPU）+ Sv39 MMU | **boot Linux**（GW5 验证档） | 后续 |
+| RV-C | +F/D（FPU）+ Sv39 MMU（M/S/U 特权态与 trap 委派/CLINT 中断已在 RV-B 增量 6 落地并经 DiffTest 验证，见 `verif/eth_rv/README.md`；Sv39 未做） | **boot Linux**（GW5 验证档） | 后续 |
 | RV-E | 2-4 核共享 L2 相干 | SMP Linux | 后续 |
 | RV-F | Hypervisor + Vector 协处理器 + Z\* | RVA23 完整 | 后续 |
 

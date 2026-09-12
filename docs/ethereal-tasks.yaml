@@ -624,6 +624,7 @@ tasks:
     phase: phase-2
     deps: [E2-RV1]
     est_days: 180
+    status: in_progress   # 2026-09-12: 首个切片 = **Sv39 MMU**（satp/三级页表遍历/PTE 权限与 A-D 位/页错误 cause 12-13-15 + SUM-MXR + sfence.vma），全部落在内存路径内 ⇒ 与现有逐访问 DiffTest 契约兼容；F/D（FPU）需先设计轨迹扩展，缓存/BTB 属性能项且会破坏比对契约（RV-B 已明确不做）
     deliverable: eth_rv MMU/FPU 扩展 + OpenSBI/Linux 启动链
     acceptance: GW5AST-138 仿真/实板 boot Linux（DDR-less rootfs 允许）
     status: todo
