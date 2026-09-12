@@ -307,12 +307,19 @@ error. `cor_boot` (built by `verif/eth_rv_core/build_boot.py`, linked at
   when S5 wires the PLIC. An access below `0xc000_0000` is a divergence, not a
   supported device.
 * **`timebase-frequency` is a DiffTest cadence, not a board oscillator.** The
-  DT declares 10 MHz because Spike's CLINT *is* an instruction-count-driven RTC
-  (`CPU_HZ / INSNS_PER_RTC_TICK`), and our CLINT is driven on the same cadence.
+  corpus DT declares 10 MHz because Spike's CLINT *is* an instruction-count-driven
+  RTC (`CPU_HZ / INSNS_PER_RTC_TICK`), and our CLINT is driven on the same cadence.
   The two sides agree while they run the same program; software that turns the
   number into seconds (sleeps, baud divisors, timer expiry) is out of contract
   until a real RTC tick input exists (E2-RV2 G9). `clock-frequency` is the same
-  kind of placeholder.
+  kind of placeholder. The **S4 boot profile is deliberately different**: its CLINT
+  advances `mtime` 1:1 with the simulation *cycle* (so `wfi` cannot freeze it) and
+  its DT therefore declares a **simulation scale** (60 MHz; 200-600 MHz is the
+  measured direction of travel) high enough that a HZ=1000 tick is long compared
+  with the tick path. The measured cost of one full tick (MTI + STI + two SBI
+  ecalls) on the RTL is ~23,300 cycles, i.e. **39% of the 60 MHz period** and 233%
+  of a 10 MHz one — which is exactly the "tick storm with no forward progress" of
+  the older 10 MHz/130 kHz runs. See the report's `追补八`.
 * **Spike's boot ROM is not our boot ROM.** With a DT enabled Spike builds its
   own reset vector and leaves `a1 = 0x1020` (its own DTB), not the contract's
   `0x8000_2000`. That is why `cor_boot` only checks that `a1` is a non-null,
@@ -1356,3 +1363,47 @@ without it silently degrades the golden to a different machine.
   prove+cover PASS, harness pytest 275 passed. Evidence and commands:
   `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` (`追补六`) and
   `local://rv13b-s4-notes.md`.
+* **Current status (2026-09-13, increment 14): the milestone is REACHED on the
+  RTL.** With `timebase-frequency` raised to the simulation scale of 600 MHz (see
+  the bullet above; the DT comment carries the formula), the beat D-port build runs
+  OpenSBI → Linux → the initramfs `/init` and prints the acceptance line:
+
+  ```
+  ETH_RV_TB_INFO: console marker (28 bytes) seen on the UART line after 11968 console bytes
+  ETH_RV_TB: PASS 362867491 commits (119549299 compressed), 2340426625 cycles,
+             65057459 loads, 44498790 stores, 17558 traps (6619 interrupts,
+             0 access faults, 84 page faults, last mcause=9), ROM entry 0x80000000,
+             UART 11968 bytes/11968 frames (0 frame errors, drain 6 cycles)
+  ```
+
+  ≈70 minutes of single-threaded wall clock (2.34×10^9 cycles, IPC 0.155). The
+  console is **byte-identical to Spike's up to the milestone** except for timestamp
+  digits and the kernel's own `Ratio of byte access time to unaligned word access`
+  measurement (0.09 vs 0.00 — both conclude `unaligned accesses are slow`): the
+  unaligned-access probe that blocked increment 13b now returns normally. The
+  `--dram` (AXI/DRAM D port) milestone run is the next piece of evidence.
+  What the numbers say about *why it is slow* (all measured):
+  * the RTL executes the **same instruction stream as Spike** (362.9M commits, and
+    the golden needs ≈4.05×10^8 instructions to the same point) but pays **6.45
+    cycles per instruction**, because `cor_mmu.sv` walks three page-table levels on
+    every access — no TLB, no PTE cache, no I-cache. That is G10, and it is the
+    whole gap;
+  * the long console silence after `SLUB: HWalign` is **not** a stall: it is the
+    kernel's boot-time CRNG jitter loop (`try_to_generate_entropy()`, ~50M
+    instructions, which the golden pays too), plus later the X.509/trusted-key
+    stretch (`gap_max = 8.5×10^8` quiet cycles);
+  * one full tick is **4 traps** (MTI + STI + two SBI ecalls) costing **~23,300
+    cycles**, so the tick overhead is `23,300/(freq/1000)`: 233% at 10 MHz (the old
+    livelock), 39% at 60 MHz, **3.9% at 600 MHz**. Measured control: the 60 MHz run
+    exhausted its **4×10^9-cycle budget without the marker** (10,150 console bytes,
+    ~1,780 short of 11,930, ≈132 min), while 600 MHz hit it in **2.340×10^9 cycles
+    ≈ 70 min** ⇒ ≥1.7× cycles / ~2× wall clock in favour of 600 MHz.
+  * the AXI/DRAM D-port build is a *different* story: on the boot's access pattern
+    (three-level page walk + streaming hashes) it runs at **IPC ≈ 0.029** — ~6× worse
+    than the beat port, so its milestone needs ≳10^10 cycles (≳5 h) and it was not
+    attempted to completion. On the 26 corpus programs the two D ports differ by only
+    ~1.15×, so this is a boot-workload effect, not D-port bandwidth (see `追补八` §9).
+  Next steps, in cost order: TLB + small I-cache (1.5-2 cycles/instruction ⇒ ~40
+  minute boots), a `/chosen/rng-seed` (removes the ~50M-instruction entropy phase
+  on both sides), then further scale tuning. Full numbers: report `追补八` §8/§9 and
+  `local://rv14-s4-notes.md`.

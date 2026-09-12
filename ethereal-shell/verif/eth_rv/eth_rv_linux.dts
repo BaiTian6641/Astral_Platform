@@ -86,14 +86,16 @@
 		 * own auto-generated DTS used as its placeholder, so no golden comparison
 		 * changes meaning when a board swaps in the real SoC clock. */
 		/* The mtime cadence is 1:1 with simulation CYCLES in this build, so the
-		 * declared frequency is the simulation clock: it must be high enough that a
-		 * HZ=1000 tick (freq/1000 cycles) is long compared with the tick handler,
-		 * or the kernel spends all its time in the timer path and makes no forward
-		 * progress (measured: 10 MHz => one interrupt per ~10,500 cycles, 18k traps,
-		 * console frozen). 60 MHz puts a tick at ~60k cycles, which at this core's
-		 * ~0.17 IPC is roughly Spike's 10,000-instruction tick. A board build
-		 * replaces this with the real SoC clock. */
-		timebase-frequency = <60000000>;
+		 * declared frequency IS the simulation clock. It must be high enough that a
+		 * HZ=1000 tick (freq/1000 cycles) is long compared with the cost of the tick
+		 * path, or the kernel spends its time in the timer path and makes no forward
+		 * progress. That cost is fixed in cycles (four traps: MTI + STI + two SBI
+		 * ecalls, ~23,300 cycles at this core's measured IPC 0.18), so the overhead
+		 * is 23,300 / (freq/1000): 233% at 10 MHz (the old livelock), 39% at 60 MHz,
+		 * 3.9% at 600 MHz. Measured on the RTL, where a 60 MHz declaration gives an
+		 * 83,333-cycle tick (60,000 declared + the handler). A board build replaces
+		 * this with the real SoC clock; see the E2-RV2 report, increment 14. */
+		timebase-frequency = <600000000>;
 
 		cpu@0 {
 			device_type = "cpu";

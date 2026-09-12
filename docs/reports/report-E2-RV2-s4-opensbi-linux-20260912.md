@@ -672,3 +672,295 @@ python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --difftest
 
 据此把 DTS 的 `timebase-frequency` 提到 **60 MHz**（tick ≈ 60,000 周期 ≈ Spike 的 10,000 指令节拍，按本核 ~0.17 IPC 折算）：控制台从 3.47 s 推进到 **4.73 s**（Mount-cache/Mountpoint-cache）后再次停滞 ⇒ **改善但未解决**。结论：瓶颈是**每 tick 的指令成本 vs 无 TLB 时的取指翻译开销**（每次翻译 3 次 PTE 读 + 取指），即差距清单 G10 的性能项；DT 频率只是可调的"时间尺度"，不能无限外推。
 下一步（廉价、可迭代）：① 用 `--clint-dump` 复测 60 MHz 下的 tick 间隔与陷阱率，确认是否仍与 HZ 自洽；② 在同一树上把 tick 处理一次的总周期数量出来（相邻两次 `mtip=1` 的周期差 vs 一次完整 M→S→M 往返的周期数）；③ 若确认为吞吐瓶颈，短期把声明频率再抬高（纯尺度调整，需在 DT 注释里写清是仿真尺度）或在 cmdline 上减少早期 tick 需求；长期是 S3/G10 的 **TLB + 小 I-cache**（会让 `sfence.vma` 真正有意义，也是上板的前置）。
+## 追补八：60 MHz 档的 tick 定量、金标/RTL 的**指令等价性**，以及"卡死"的正名（increment 14）
+
+### 结论先行
+
+1. **60 MHz 档没有 tick 风暴**：tick 周期就是声明的 1 ms，**一次 tick 的完整代价 ≈ 23,300 周期**
+   （≈ 4,200 条指令：MTI + STI + 2 次 SBI ecall 共 4 次陷阱），占声明周期 60,000 的 **39%**——
+   同一笔代价在 10 MHz 档下是 233%（即追补七看到的"几乎无前向进展"），所以"抬高声明频率"这一
+   方向是对的，60 MHz 已经把它从"活锁"降到"三成开销"。
+2. **RTL 与金标执行的是同一条指令流、同样多的指令**：同一个控制台字节处，RTL 的提交数与
+   Spike 的指令数在同一档（见 §2 的表）。金标从复位到里程碑共 **≈ 4.05×10^8 条指令**，RTL 也
+   需要同数量级的提交；差别只在**每条指令的周期数**（实测 IPC ≈ 0.18，Spike ≈ 1）⇒ 这就是差距
+   清单 G10 的 **无 TLB / 无 PTE cache**（每次取指/访存三级走查），**不是**死锁、不是时基、不是
+   陷阱投递。
+3. **此前的"卡死"正名**：控制台在 `SLUB: HWalign` 之后有一段 **~50M 条指令**的内核阶段
+   （`drivers/char/random.c` 的 `try_to_generate_entropy()` 抖动熵循环，见 §3）期间**没有任何
+   输出**；RTL 在该阶段烧掉 **284M 周期（≈10 分钟）**才印出下一行。**金标花同样的 ~50M 条
+   指令**（有界 Spike 运行：第 4,464 字节在 12M 指令处、第 4,539 字节在 60M 指令处）⇒ 这是
+   内核代码在"无熵源平台"上的固有代价，**不是 RTL 缺陷**；后续的运行是被预算/被误判截断的。
+4. 里程碑的预算据此重算：**≈ 2.25×10^9 周期**（4.05×10^8 条 @ IPC 0.18），在实测
+   ~5.5×10^5 周期/秒下是**约 70 分钟**单线程墙钟。**实测命中：2.340×10^9 周期 / 3.629×10^8 提交 /
+   ≈70 min（§8）——预估误差 4%。**
+
+### 1. 测量（step 1）：60 MHz 档的 tick 周期、一次 tick 的代价、陷阱率
+
+仪器：直接跑 `obj_s4_beat/Veth_rv_tb`，`+clint_dump=2000000 +trace_traps=1`，
+`+max_cycles=1500000000`，控制台走独立路径 `/tmp/s4a.uart`（不碰 `s4.uart` 的共享记录）。
+
+| 量 | 实测 | 说明 |
+|---|---|---|
+| `mtime` 节拍 | `mtime = cycle - 16384`（精确） | S4 档 1:1 周期驱动 ✓ |
+| 声明 vs 实际 tick 周期 | 声明 60,000 周期（HZ=1000 @ 60 MHz）；**实测 83,333 周期**（稳态窗口 2,000,001 周期内 24 次 MTI） | 差额 23,300 周期 = 一次 tick 的路径代价（oneshot 判决重臂 ⇒ 周期 = 声明周期 + 处理时间） |
+| **一次 tick 的陷阱数** | **4 次**：MTI 1 + STI 1 + SBI ecall 2（计数精确：2,223 : 2,223 : 4,466） | 非 sstc 路径：MTI→OpenSBI 置 STIP→S 模式 STI→内核 `sbi_set_timer` 又 2 次 ecall |
+| **一次 tick 的代价** | **≈ 23,300 周期 ≈ 4,200 条指令**（@ IPC 0.18）；占声明周期 **39%** | 与"每 tick 41,184 次提交"一致（该窗口 24 tick/2M 周期） |
+| 陷阱率（稳态） | 6,920 陷阱 / 78M 周期 = **1 次 / 11,272 周期**；其中 tick 占 4/次 | 该窗口还有大量非对齐仿真陷阱（§4） |
+| IPC | **0.180** 稳态（全运行一致，见 §2 曲线） | 无 TLB 的直接后果 |
+| `mtip`/`mip`/`mie` | `mtip` 0/1 翻转、`mip=0x0a0`（STIP\|SEIP）、`mie=0x02a`（SSIE\|MSIE\|STIE…）、`mtimecmp` 被写入真实 deadline 且随 `mtime` 推进 | tick 通路按预期工作 ✓ |
+
+**结论（step-1 的裁决）**：tick 周期与声明自洽（不是"tick 比以为的快/慢"），tick 的**代价**是
+固定 ~23,300 周期（与声明无关，因为是 4 次陷阱 + 内核 tick 处理 + 两次 SBI 往返的指令数 × IPC），
+所以开销占比 = 23,300 / (freq/1000)：60 MHz → 39%，**600 MHz → 3.9%**，10 MHz → 233%（活锁）。
+这正是追补七"抬高声明频率"的量化解释，也是 step 2 的判据。
+
+### 2. 金标（Spike）与 RTL 在同一控制台字节处的指令数
+
+有界 Spike 运行（`--instructions=N`，控制台重定向到文件；**注意**：把 Spike 的 stdout 接到管道
+会让它挂住，必须落盘）给出金标的"指令 ↔ 控制台字节"曲线；RTL 的曲线来自 §1 的 `+clint_dump`
+采样（`cycle/commits/console`）：
+
+| 控制台字节（同一行） | 金标指令数 | RTL 提交数 | RTL 周期 |
+|---|---|---|---|
+| 2,264（OpenSBI banner 结束） | 6.0×10^6 | 4.45×10^6 | 6.0×10^6 |
+| 4,464（`SLUB: HWalign`） | 1.2×10^7 | 9.77×10^6 | 4.0×10^7 |
+| 4,539（`Dynamic Preempt: full`） | ~5.8×10^7（>56M 且 ≤60M） | 6.00×10^7 | 3.24×10^8 |
+| 6,237（`Mountpoint-cache`） | ~8.0×10^7 | 6.97×10^7 | 3.80×10^8 |
+| 7,879（`iommu: Default domain type` 之后） | ~1.3×10^8 | 1.07×10^8 | 5.94×10^8 |
+| 里程碑 `MILESTONE-REACHED` | **≈4.05×10^8**（>400M 且 ≤410M） | **3.629×10^8**（实测） | **2.340×10^9**（实测，§8） |
+
+⇒ **两侧的指令数在同一档（±10%，RTL 甚至略少，差异来自控制台文本的行数差异，例如
+`printk: legacy console [ttyS0] enabled` 这一行金标出现两次）**；RTL 需要的是
+4.05×10^8 × (1/0.18) ≈ 2.25×10^9 周期（**实测 2.340×10^9，见 §8**）。**没有任何"多执行 10 倍
+指令"的现象**。
+
+### 3. 那 284M 周期（第 4,464 → 4,539 字节之间）到底是什么
+
+`+clint_dump=2000000` 的 `cpc` 采样落在 `blake2s_compress_generic` / `chacha_permute` /
+`chacha_block_generic`；用 `+trace_from=0xffffffff803acad4 +trace=/tmp/s4c.trace`（截获 3.68M
+次提交）按函数聚合：
+
+```
+  61.3%  blake2s_compress_generic      9.8%  chacha_permute       8.0%  memcpy
+   3.0%  reserve_bootmem_region        1.6%  chacha_block_generic 1.6%  memset
+   1.0%  __blake2s_init                1.0%  __free_pages_ok      0.9%  __free_pages_core
+   0.8%  blake2s_update                0.8%  blake2s_final        0.7%  extract_entropy
+   0.5%  crng_fast_key_erasure         0.4%  crng_make_state      ...
+```
+
+即 `try_to_generate_entropy()`（`drivers/char/random.c`）：平台无熵源时，内核用**时间抖动**自己
+攒熵——每轮把 8 字节抖动混入输入池（`blake2s`）+ `schedule()`，直到 `crng_ready()`。它在
+`SLUB` 之后、`Dynamic Preempt` 之前执行，**运行期间没有任何中断**（`mie=0x008`、`mtimecmp` 全 1、
+陷阱计数 23 直到该阶段结束），所以它的长度与 tick 无关，纯粹是内核在这条路径上的指令量。
+
+**金标同样付这 ~50M 条指令**（§2 的有界运行：字节 4,464 在 12M、4,539 在 60M）——这一点是
+本轮最重要的**归因**：此前的"控制台冻结"就是这段静默 + 预算不足，而不是 RTL 停摆。
+
+顺带一条可选的**板级裁剪**（未在本轮启用）：真板/引导器会给内核 `rng-seed`，此时
+`add_bootloader_randomness()` 直接把 `crng_init` 推到 2，这段 ~50M 条指令可以整段省掉
+（两侧同省；Alpine 内核里 `rng-seed` 与 `random.trust_bootloader` 两个字符串都在，
+`early_init_dt_scan_chosen` 认这个属性）。
+
+### 4. 陷阱构成（Run A，`+trace_traps=1`，cycle ≤ 5.94×10^8）
+
+| cause | 次数 | 含义 |
+|---|---|---|
+| 9 | 4,466 | SBI ecall（= 2 × tick 数） |
+| 7 irq=1 | 2,223 | MTI（机器定时器，OpenSBI 转发 STI） |
+| 5 irq=1 | 2,223 | STI（内核定时器 tick） |
+| **4** | **2,017** | **非对齐 load**（内核 `CONFIG_RISCV_MISALIGNED` 仿真路径） |
+| **6** | **2,016** | **非对齐 store** |
+| 2 / 3 / 12 | 5 / 1 / 1 | 启动早期的探针（与 13b 的语料结论一致） |
+
+非对齐陷阱集中在 `blake2s_compress_generic+0x1884/0x1d3a` ⇒ **就是 §3 那段熵循环自己的
+非对齐访问**（每 2M 周期约 1,783 次），走的是 OpenSBI `sbi_misaligned_*_handler` 的逐字节
+仿真。量级上它不是瓶颈（~1% 的指令），但它是 `cor_mprv` 那条链在真实内核里的再一次印证。
+
+### 5. 剩余瓶颈与下一步
+
+* **瓶颈（量化）**：指令量侧已经与金标对齐（金标 4.05×10^8 条、RTL 实测 3.629×10^8 提交），
+  周期侧是 **6.45 周期/指令**（整场 IPC 0.155；前段 0.180），来自 `cor_mmu.sv` 每次访问都做三级
+  页表走查（无 TLB、无 PTE 缓存、无 I-cache）。里程碑 = **2.34×10^9 周期 ≈ 70 分钟**（实测，见 §8）。
+* **下一步（按性价比）**：
+  1. ~~抬高声明频率~~ —— **已做并命中里程碑：600 MHz 档（§7/§8）**。按 §1 的公式，tick 开销从
+     60 MHz 的 39% 降到 3.9%（实测：600 MHz 全场 6,619 次定时中断）。再往上收益进入边际，
+     且金标的**时间门控**工作量会随声明频率增长（600 MHz 需 ≤8×10^8 条指令 vs 60 MHz 的
+     4.05×10^8，其中大部分是 Spike 节拍伪影）。`timebase-frequency` 与
+     `rv_platform`/manifest 的口径差异（10 MHz 是语料/金标文档值）已在 README/DT 注释里注明。
+  2. **给内核 `rng-seed`**（+`random.trust_bootloader=on`）：省掉 §3 的 ~50M 条指令（≈2.9×10^8
+     周期，约 10 分钟），且金标同时变快。
+  3. **G10 的 TLB + 小 I-cache**（真正的吞吐修复，也是上板前置）：目标是把 5.5 周期/指令降到
+     1.5–2 ⇒ 同一启动 ~40 分钟。代价与边界：`cor_mmu`/`eth_rv_core` 的实质改动；DiffTest 比的
+     是**每个提交的 pc/rd/value 与访存流**，TLB/cache 不改架构结果（只改时序），所以语料 26/26
+     与固件段 DiffTest 应当保持；但**若 I-cache 让 TB 无法逐次声明取指**，必须把对比点从"每次
+     访问"改为"已退休状态"（在 README 与报告里写明）。本轮**未动 RTL**（见 §6）。
+
+### 6. 里程碑运行（在飞行中）
+
+**60 MHz 档、无诊断开关的正式运行**（用项目自己的 runner 与报告路径）：
+
+```sh
+nohup python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl \
+    --max-cycles=4000000000 --timeout=14400 > /tmp/s4_marker60.log 2>&1 &
+```
+
+启动 2026-09-13 01:42；预算 4×10^9 周期（按 §5 只需 2.25×10^9）；判据仍是 runner 的
+`console marker … seen` 与 `s4.uart` 里的 `eth_rv S4: MILESTONE-REACHED`。**本轮报告写成时
+该运行仍在进行**，其结果（commits/cycles/traps/pgfaults + 墙钟 + 控制台字节）由下一位或本轮
+收尾时补进本表；控制台与进度在 `generated/rv_difftest/s4/s4.uart`（live 记录是**原始文本**，
+结束后被同路径的结构化记录替换）。
+
+| 运行 | 周期 | 提交 | 陷阱 | 控制台字节 | 备注 |
+|---|---|---|---|---|---|
+| Run A（诊断，终局） | 1.500×10^9（预算耗尽） | 2.482×10^8 | 66,171 | 9,695 | IPC 0.165；末 4×10^8 周期停在 `Freeing initrd` 之后的证书验证段（控制台不动）；陷阱构成见 §4（tick = 15,527，即平均 96,600 周期/tick） |
+| **600 MHz 里程碑运行** | **2.340×10^9** | **3.6287×10^8** | **17,558** | **11,968** | ✅ **命中里程碑**（见 §8）：IPC 0.155；6,619 中断 / 84 页错误 / 0 访问错误；墙钟 ≈70 min；控制台 0 帧错 / 0 溢出 |
+| 60 MHz 里程碑运行（对照） | **4.0×10^9（预算耗尽）** | 未取到（runner 的 stdout 丢了） | — | **10,150** | ❌ **未命中**：干净结束（0 帧错 / 0 溢出，`gap_max = 1.623×10^9`），最后一行 `Serial: 8250/16550 driver …`（金标第 10,076 字节），差 ~1,780 字节；01:42 → 03:54 约 132 min |
+### 7. Step 2：仿真尺度杠杆（60 MHz → 600 MHz）的量化与在飞行的对照
+
+按 §1 的公式（tick 开销 = 23,300 / 声明周期），60 MHz 还有 39% 的可回收开销。把 DTS 的
+`timebase-frequency` 改为 **600 MHz**（注释里写明这是仿真尺度，并给出上面那条公式与实测值），
+`build_linux_boot.py` 重建（DTB 仍 1,622 B，BootROM 内嵌 ⇒ 必须重建）后：
+
+| 检查 | 60 MHz | 600 MHz |
+|---|---|---|
+| Phase 1（Spike） | 2.46 s / 11,931 B | **5.69 s / 11,934 B，里程碑命中** ✓ |
+| 金标到里程碑的指令数（有界运行） | 405M（>400M、≤410M） | ≤800M（600M 未到、800M 已到） |
+| 金标在"非对齐探测"段的指令数 | ~50M | **~300M**（150M→450M 指令之间只有一行输出） |
+| 内核 tick（HZ=1000） | 60,000 mtime | 600,000 mtime |
+
+**关键读数**：金标的指令数随声明频率**上升**（405M → 800M），但这是 **Spike 的节拍伪影**：
+Spike 的 `mtime` 每 100 条指令才 +1，因此"1 ms 的内核时间"在 600 MHz 下要 10 倍的指令去
+填（时间门控的等待、以及按时间预算跑的探测循环都被放大）。RTL 的时间感知是
+`cycle/freq`（每周期 1 个 mtime），同一段等待的**指令数反而小得多**（实测：RTL 在每个控制台
+字节上的指令数都低于金标，例如第 7,879 字节处 RTL 1.07×10^8 提交 vs 金标 ~1.3×10^8 条）。
+所以"金标指令数上升"**不能**外推成"RTL 也更贵"；RTL 侧的真值只能由 RTL 运行给出。
+
+两个 RTL 里程碑运行**并行**在飞（各自独立的控制台路径，避免共享 `s4.uart` 被互相截断）：
+
+| 运行 | 命令 / 路径 | 预算 | 启动 |
+|---|---|---|---|
+| 60 MHz（项目 runner，正式判据） | `run_linux_boot.py --rtl --max-cycles=4000000000 --timeout=14400` → `/tmp/s4_marker60.log`、`generated/rv_difftest/s4/s4.uart` | 4×10^9 | 01:42 |
+| 600 MHz（TB 直跑，尺度对照） | `Veth_rv_tb … +uart=/tmp/s4b600.uart +clint_dump=10000000` → `/tmp/s4b600.log` | 3×10^9 | 01:49 |
+
+两个运行在 01:57-02:00 的进度（`s4.uart` 为 live 原始文本）：60 MHz 到第 7,053 字节
+（`futex hash table entries`，`ljp` 行确认 `BogoMIPS 120 / lpj=60000` ⇒ 60 MHz 树）；
+600 MHz 已越过熵阶段到第 6,088 字节（`ljp=600000` ⇒ 600 MHz 树 ✓）。两者的最终
+commits/cycles/traps/pgfaults、墙钟与是否命中里程碑，见本节末尾由运行结果补入的表。
+
+**判据（收尾时填）**：命中里程碑的那一次运行给出"声明频率 + 周期数 + 墙钟"的对照；若 600 MHz
+以更少周期命中，则把 600 MHz 记为**仿真尺度**的落点（DT 注释已按公式写明），否则退回 60 MHz
+并记录"尺度杠杆在 60→600 MHz 区间内不划算"的实测依据。
+### 8. ✅ 里程碑在 RTL 上命中（600 MHz 档，2026-09-13 02:59）
+
+**决定性证据（逐字）**：
+
+```
+ETH_RV_TB_INFO: console marker (28 bytes) seen on the UART line after 11968 console bytes
+ETH_RV_TB: PASS 362867491 commits (119549299 compressed), 2340426625 cycles, 65057459 loads,
+            44498790 stores, 17558 traps (6619 interrupts, 0 access faults, 84 page faults,
+            last mcause=9), port wait max D 0 / I 0 cycles, window 40960 KiB,
+            ROM entry 0x0000000080000000, UART 11968 bytes/11968 frames (0 frame errors,
+            drain 6 cycles)
+# uart record: bytes: 11968 frames: 11968 errors: 0 overflow: 0 drain_cycles: 6
+#              gap_min: 160 gap_max: 850119752
+```
+
+控制台结尾（与金标同一位置）：
+
+```
+[    3.306499] Run /init as init process
+/init: line 19: mkdir: not found
+/init: line 19: mkdir: not found
+eth_rv S4: initramfs /init is running as pid 1
+Linux version 6.18.48-0-lts (buildozer@build-edge-riscv64) (cc (Alpine 15.2.0) 15.2.0, …)
+eth_rv S4: MILESTONE-REACHED          ← 第 11,940 字节
+```
+
+| 量 | 值 |
+|---|---|
+| cycles | **2,340,426,625** |
+| commits | **362,867,491**（119,549,299 压缩）⇒ **IPC 0.155** |
+| loads / stores | 65,057,459 / 44,498,790 |
+| traps | **17,558**（6,619 中断、0 访问错误、**84 页错误**、最后 `mcause=9`） |
+| 控制台 | **11,968 B / 11,968 帧 / 0 帧错 / 0 溢出 / drain 6 周期** |
+| 墙钟 | **≈70 min**（01:49 → 02:59），单线程；`obj_s4_beat`（beat D 口） |
+| 构建 | 600 MHz 档的 DTB + BootROM（`build_linux_boot.py`，DTB 仍 1,622 B） |
+
+**控制台与金标逐字对比**（这是 13b 遗留验收项"RTL 侧控制台字节精确到里程碑"的答复）：
+
+* 首个不同字节在 **offset 5,715**，内容是 `sched_clock` 行的**时间戳数字**（金标 `0.000000`
+  vs RTL `0.000004`）⇒ 该点之前**逐字节相同**；
+* 把时间戳归一化后逐行比较，**唯一的内容差异**是内核自测的那一行
+  `cpu0: Ratio of byte access time to unaligned word access is 0.00`（金标）vs `0.09`（RTL）。
+  这一行本来就是内核**测出来的时序比值**（两侧都据此得出 `unaligned accesses are slow`）——
+  与 13b 的结论一致：非对齐探测在两侧都**成功返回**，RTL 的比值只是反映它更慢的访问。
+
+**也就是说：从复位到里程碑，RTL 的控制台与 Spike 逐字节一致（只有时间戳数字与一个时序比值
+不同），里程碑行出现在同一位置。** 13b 的阻塞点（`check_unaligned_access_emulated` 探测）
+现在是同一条 `unligned accesses are slow` 结论行，而不是 panic。
+
+**这 2.34×10^9 周期花在哪里**（同一次运行的 `+clint_dump=10000000` 采样，IPC 全程 0.144-0.177）：
+
+| 周期 | 控制台字节 | Δ周期 | 阶段 |
+|---|---|---|---|
+| 1.0×10^7 | 2,265 | — | OpenSBI banner 结束 |
+| 4.0×10^7 | 4,465 | 3.0×10^7 | 内核早期（至 `SLUB: HWalign`） |
+| 3.4×10^8 | 6,020 | **3.0×10^8** | **抖动熵循环**（§3；全程静默） |
+| 3.8×10^8 | 6,240 | 4.0×10^7 | `Mountpoint-cache` |
+| 5.2×10^8 | 7,582 | 1.4×10^8 | tick 开始（陷阱 998 → 5,158，含非对齐仿真突发） |
+| 7.3×10^8 | 9,698 | 2.1×10^8 | `Freeing initrd memory: 680K` 一带 |
+| 1.93×10^9 | 10,080 | **1.2×10^9** | **X.509/受信密钥验证 + initramfs 解包（`gap_max = 8.5×10^8` 就在这一段）** |
+| 2.34×10^9 | 11,940 | 4.1×10^8 | `/init` → **里程碑** |
+
+⇒ 一半以上的周期（1.2×10^9）是**一段没有控制台输出的纯计算**（内核的证书验证/解包），
+这与 §5 的结论一致：剩下的全是**吞吐**，不是等待、不是死锁。
+
+### 9. 尺度杠杆的实测裁决与剩余瓶颈
+
+* **600 MHz 档先命中**：它与 60 MHz 档并行（TB 直跑，独立控制台路径），600 MHz 于 **02:59**
+  命中（2.340×10^9 周期）；同一时刻 60 MHz 档还在第 9,807 字节（差 ~2,000 字节）。更干净的
+  对照是**同一控制台位置**：到达第 ~10,150 字节时，600 MHz 档用了约 **56 分钟**（01:49 启动），
+  60 MHz 档用了约 **115 分钟**（01:42 启动）⇒ **~2.0× 墙钟差**（两台机器负载相同：前 30 分钟
+  都是 3 个并发运行，之后 2 个）。与 §1 的公式（tick 开销 ∝ 1/freq）一致：600 MHz 全场只有
+  **6,619 次定时中断**，而 60 MHz 档在 1.5×10^9 周期时就已经有 **15,527 个 tick**。
+  **最终对照（决定性）**：60 MHz 档在 **4.0×10^9 周期预算耗尽**时只到第 10,150 字节（**未命中**，
+  差 ~1,780 字节）；600 MHz 档用 **2.340×10^9 周期**命中 ⇒ **≥1.7× 周期 / ~2× 墙钟**的差距。
+  （追补七曾指望"60 MHz + 4e9 预算"够到里程碑，实测不够——这也是本轮把它纠正的一处。）
+* **落点**：600 MHz 记为 S4 的**仿真尺度**（DTS 注释里写明它是仿真尺度、给出公式与实测值，
+  并注明板级要换真实 SoC 时钟）。它不是"理想值"：tick 开销已降到 3.9%，理论收益见边际；
+  而更高频会让**时间门控等待**的指令数上升（金标在 600 MHz 到里程碑要 ≤8×10^8 条指令，
+  60 MHz 只要 4.05×10^8——不过其中大部分是 Spike"每 100 条指令 +1 个 mtime"的节拍伪影，
+  不能直接外推到 RTL）。
+* **剩余瓶颈（量化）**：2.340×10^9 周期 / 3.629×10^8 条指令 = **6.45 周期/指令**，来源是
+  `cor_mmu.sv` 每次访问三级走查（无 TLB / PTE 缓存 / I-cache）；控制台全程还有一段
+  `gap_max = 8.5×10^8 周期`的静默（X.509/受信密钥验证那段计算）。
+  下一步按性价比：① **TLB + 小 I-cache**（目标 1.5–2 周期/指令 ⇒ 同一启动 ~40 分钟，也是
+  上板前置；DiffTest 契约见 §5/§3.3 的说明）；② **`rng-seed`**（省掉两侧各 ~50M 条指令的
+  抖动熵阶段）；③ 声明频率的继续微调（收益已进入边际）。
+* **`--dram`（AXI/DRAM D 口）：本轮未到里程碑，但原因已量化。** 按 600 MHz 档同一条命令启动
+  （03:01，TB 直跑、独立控制台路径），它在启动早期/抖动熵阶段的 **IPC ≈ 0.029**
+  （1.09×10^9 周期内 3.495×10^7 提交；同一阶段 beat 构建是 0.18–0.24）⇒ AXI 线路填充式 D 口
+  对"三级页表走查 + 流式哈希"这种访问模式要付约 **6 倍的每访问代价**。按此外推到里程碑需要
+  ≳10^10 周期（≳5 小时），03:39 停止（证据：`/tmp/s4dram.log` 的 `+clint_dump` 序列 + 停止时
+  的 live 控制台 `/tmp/s4dram.uart.stopped`，4,533 字节、仍在熵阶段）。
+  **对照**：同一套 26 条语料在两条 D 口上只差 ~1.15 倍（`cor_alu` 336 vs 313、`cor_mem` 440
+  vs 254、`cor_muldiv` 836 vs 831 周期）⇒ 这个 6 倍惩罚来自**启动负载的访问模式**，不是 D 口
+  整体带宽。这是留给 G10（TLB/I-cache）工作的一条新性能项，也是本轮"两条 D 口"的诚实收口。
+
+### 10. 门禁与改动文件
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 语料（beat D 口） | `run_difftest.py --quiet` | **26/26 MATCH + console asserted** |
+| 语料（AXI/DRAM D 口） | `run_difftest.py --quiet --dram` | **26/26 MATCH + console asserted** |
+| harness 里与本改动相关的测试 | `.venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests/test_rv_linux_boot.py` | **9 passed**（DT 契约 + PMP profile + S4 plusargs） |
+| Spike 参考启动（Phase 1，600 MHz 档） | `run_linux_boot.py --spike` | **5.69 s / 11,934 B / `MILESTONE-REACHED`** |
+| RTL 里程碑（beat D 口，600 MHz 档） | TB 直跑（见 §8） | **PASS / 里程碑命中** |
+
+`git status` 显示本轮的改动**只有三个文件**：
+`ethereal-shell/verif/eth_rv/eth_rv_linux.dts`（声明频率 60 → 600 MHz + 注释写明仿真尺度与公式）、
+`ethereal-shell/verif/eth_rv/README.md`、本报告。
+**没有改动 RTL、harness 代码或测试** ⇒ 语料/`sby` prove+cover/lint 这些门禁在构造上不受影响
+（corpus 26/26 是实跑复核；`sby` 与 lint 的对象是 `eth_rv_core`，本轮未触碰）。
+
+
