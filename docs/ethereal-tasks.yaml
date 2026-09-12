@@ -624,7 +624,7 @@ tasks:
     phase: phase-2
     deps: [E2-RV1]
     est_days: 180
-    status: in_progress   # 2026-09-12: 首个切片 = **Sv39 MMU**（satp/三级页表遍历/PTE 权限与 A-D 位/页错误 cause 12-13-15 + SUM-MXR + sfence.vma），全部落在内存路径内 ⇒ 与现有逐访问 DiffTest 契约兼容；F/D（FPU）需先设计轨迹扩展，缓存/BTB 属性能项且会破坏比对契约（RV-B 已明确不做）
+    status: in_progress   # **2026-09-12 增量 1（Sv39）完成**：`cor_mmu.sv`（satp + 三级遍历 + PTE 权限矩阵/A-D/超页对齐 + 页错误 12-13-15 + SUM/MXR + 非规范地址 + `sfence.vma`，WARL 全部取自 Spike 探针 31 组）；语料 `cor_sv39`(10557 commits/35 陷阱) + `cor_pgfault`(8336/11) ⇒ **14/14 程序 MATCH（拍 + AXI/DRAM 双路径）**，`make verif-rv` 181 passed，lint 干净；负控三条（PTE 期望不符 / 遍历注入故障 / PTE 读静默成功）均有命令与观测分歧。**DiffTest 共抓出 9 个真实 RTL 缺陷**（含取指用陈旧翻译、页表写丢失、超页叶偏移错、sfence 落 illegal、陷阱-retire 优先级等）。⚠️ 形式化：`cover` PASS，`prove` = **UNKNOWN(rc=4)**（basecase 过、归纳步失败于新增 P5 tie `eth_rv_core.sv:1758`）—— 相对增量 6 的强度回退，已派回实现者强化属性（如实记录，不掩盖）。下一增量：F/D + 轨迹扩展设计。原注：首个切片 = **Sv39 MMU**（satp/三级页表遍历/PTE 权限与 A-D 位/页错误 cause 12-13-15 + SUM-MXR + sfence.vma），全部落在内存路径内 ⇒ 与现有逐访问 DiffTest 契约兼容；F/D（FPU）需先设计轨迹扩展，缓存/BTB 属性能项且会破坏比对契约（RV-B 已明确不做）
     deliverable: eth_rv MMU/FPU 扩展 + OpenSBI/Linux 启动链
     acceptance: GW5AST-138 仿真/实板 boot Linux（DDR-less rootfs 允许）
     status: todo

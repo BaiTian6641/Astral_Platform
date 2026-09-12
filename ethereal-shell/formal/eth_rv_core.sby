@@ -21,19 +21,24 @@
 #       so it is inductive at unbounded depth; it starts at 1 after reset, which
 #       the base case covers): one record per retired instruction, in order;
 #   P5  the recorded memory access is the D-port transfer that happened: the
-#       request was driven AND accepted, the address/write mask are the bus
-#       values, the masks are legal byte-lane runs of the addressed 8-byte beat,
-#       and the store bytes on the bus equal the unshifted stored value the
-#       trace reports;
+#       request was driven AND accepted, the write mask is the bus value, the
+#       masks are legal byte-lane runs of the addressed 8-byte beat, and the
+#       store bytes on the bus equal the unshifted stored value the trace
+#       reports. Since Sv39 (E2-RV2 increment 1) the trace reports the VIRTUAL
+#       address (what Spike logs) while the bus carries the physical one, so the
+#       tie is stated as `rvfi_mem_paddr_o == $past(dmem_addr_o)` — the physical
+#       address of the committed access — plus "the page offset is shared", and
+#       both hold with translation on and off;
 #   P6  D-port write discipline: no write with a zero mask, the write mask is a
 #       subset of the addressed beat, and a read never writes;
 #   P7  a record never reports an architectural write to x0;
 #
 #   P8  a port ERROR RESPONSE is an access fault and never a retirement: a D-port
 #       beat answered with `dmem_err_i` produces no trace record and is reported
-#       with mcause 5/7 and mtval = the access address, and a fetch answered with
-#       `imem_err_i` never enters MEM at all and is reported with mcause 1 at its
-#       own pc. Stated over the free port environment, this is the "no silent
+#       with mcause 5/7 and mtval = the VIRTUAL address the instruction named
+#       (`mem_addr_r`), and a fetch answered with `imem_err_i` never enters MEM at
+#       all and is reported with mcause 1 (or 12, when the fetch's own
+#       translation faulted) at its own pc. Stated over the free port environment, this is the "no silent
 #       success on an unmapped or rejected access" half of the port contract that
 #       the `cor_fault` corpus program drives end to end.
 #
@@ -47,11 +52,22 @@
 #
 # The cover task witnesses retirements (with and without a register write, loads,
 # stores, a full-beat store), both trap classes of the pre-increment set, a
-# mispredict redirect, a stalled D-port access, and the three access faults
-# (a D-port error beat, a load fault, a store fault, a faulted fetch), so the
-# safety proof is non-vacuous.
+# mispredict redirect, a stalled D-port access, the three access faults (a D-port
+# error beat, a load fault, a store fault, a faulted fetch), and — since E2-RV2
+# increment 1 — a walker PTE read, a translation fault on both the fetch and the
+# data path, and a translated memory record, so the safety proof is non-vacuous.
 #
-# Run:  sby -f eth_rv_core.sby     (picked up by `make formal`)
+#   P9  the D port has exactly one client: the page-table walker and the MEM
+#       stage never drive it in the same cycle (`!(mmu_pte_req && dmem_req_core)`),
+#       which is what keeps a translated store's address/data/write-enable intact
+#       — without it the mux would hand the port to the walker and a store would
+#       silently become a read;
+#   P10 a walk result is only accepted for the address it was started for: a
+#       completed fetch walk leaves `ft_valid_r` set only while `fw_vaddr_r` is
+#       still the current `fetch_pc_r`, so a speculative walk cannot hand its page
+#       to a pc the redirect has already moved to.
+#
+# Run:  sby -f ethereal-shell/formal/eth_rv_core.sby     (picked up by `make formal`)
 [tasks]
 prove
 cover
@@ -77,6 +93,7 @@ read -formal cor_muldiv.sv
 read -formal cor_lsu.sv
 read -formal cor_regfile.sv
 read -formal cor_decoder.sv
+read -formal cor_mmu.sv
 read -formal eth_rv_core.sv
 prep -top eth_rv_core
 
@@ -87,4 +104,5 @@ ethereal-shell/rtl/eth_rv/cor_muldiv.sv
 ethereal-shell/rtl/eth_rv/cor_lsu.sv
 ethereal-shell/rtl/eth_rv/cor_regfile.sv
 ethereal-shell/rtl/eth_rv/cor_decoder.sv
+ethereal-shell/rtl/eth_rv/cor_mmu.sv
 ethereal-shell/rtl/eth_rv/eth_rv_core.sv

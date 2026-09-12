@@ -69,10 +69,41 @@
 //                  like Spike, only interrupts would vector, and RV-B has none).
 //                * `mret` restores `mstatus` (MIE <= MPIE, MPIE <= 1, MPP <= U)
 //                  and redirects to `mepc`.
-//                * `err_o` stays the "never silently" strobe, but it is no longer
-//                  a halt: it pulses for one cycle on every trap with
-//                  `err_code_o` = the architectural `mcause` value (`err_o` is
-//                  the valid strobe, since cause 0 is a legal code).
+//              * `err_o` stays the "never silently" strobe, but it is no longer
+//                a halt: it pulses for one cycle on every trap with
+//                `err_code_o` = the architectural `mcause` value (`err_o` is
+//                the valid strobe, since cause 0 is a legal code).
+//
+//              Sv39 address translation (E2-RV2 increment 1, C14 §3):
+//                `satp` is a real CSR, the walk is `cor_mmu`, and both memory
+//                ports see PHYSICAL addresses while the pipeline, the trace and
+//                the trap CSRs keep the VIRTUAL ones. Translation applies when
+//                `satp.MODE` is Sv39 (8) and the access is made below M-mode;
+//                M-mode is never translated (MPRV stays a documented boundary —
+//                the bit is WARL storage, its behaviour is not implemented).
+//                * fetch: the front-end translates `fetch_pc_r` before it asks
+//                  the I port, so `imem_addr_o` is physical while `rvfi_pc_o`,
+//                  `mepc`/`sepc` and a fetch fault's `mtval` stay virtual. A
+//                  translation fault is latched into IF/ID *as* the fetched
+//                  instruction (cause 12, or 1 when the PTE read itself faulted),
+//                  so it takes the ordinary EX-side trap path and never reaches
+//                  the port.
+//                * data: the MEM stage walks before it drives the D port, so
+//                  `dmem_addr_o`/`dmem_wdata_o`/`dmem_wstrb_o` describe the
+//                  physical transfer while `rvfi_mem_addr_o` (what Spike logs)
+//                  is the virtual address the instruction named — the page
+//                  offset is common to both, which `rvfi_mem_paddr_o` (the
+//                  physical address of the committed access) makes explicit.
+//                * one walker serves both paths. The pipeline stalls while a
+//                  walk runs (the walk drives the D port, so the MEM stage
+//                  cannot), and the MEM stage always wins the arbitration — the
+//                  fetch side only asks when the front-end is already free to
+//                  move, so a deferred fetch walk costs cycles and never
+//                  correctness.
+//                * `sfence.vma` is a privilege check and nothing else here: the
+//                  walker keeps no TLB and no PTE cache, so there is no cached
+//                  translation for it to invalidate. The trade is deliberate
+//                  (see verif/eth_rv/README.md "Sv39 translation").
 //
 //              v0 memory ports (see `notes`; the AXI4 master of the next slice
 //              keeps the request/response shape and moves the alignment into an
@@ -162,6 +193,7 @@ module eth_rv_core (
     output logic [63:0] rvfi_mem_wdata_o,
     output logic [7:0]  rvfi_mem_wmask_o,
     output logic [7:0]  rvfi_mem_rmask_o,
+    output logic [63:0] rvfi_mem_paddr_o,  // the PHYSICAL address of that access
 
     // ---- error strobe: unimplemented encoding, never retired silently ----
     output logic        err_o,
@@ -199,16 +231,58 @@ module eth_rv_core (
     logic [31:0] fetch_insn;
     logic [63:0] fetch_pred_pc;
     logic        fetch_hit;
-    logic        fetch_fault;   // this fetch was answered with an error response
+    logic [3:0]  fetch_fault_cause;  // 0 = no fault, else the architectural cause
+    logic        fetch_take;         // this cycle's fetch becomes the IF/ID instruction
 
     assign fetch_is_c = (imem_rdata_i[1:0] != 2'b11);
     assign fetch_insn = fetch_is_c ? {16'd0, imem_rdata_i[15:0]} : imem_rdata_i;
-    // The fetch port reports an error with its accept (same cycle as
-    // `imem_ready_i`), meaning the platform has no instruction at that address.
-    // The bytes on `imem_rdata_i` are void, so the encoding is NOT decoded: the
-    // fetch-fault marker travels down the pipe instead and raises the
-    // architectural instruction access fault in EX (see `ex_fault_r`).
-    assign fetch_fault = fetch_hit && imem_err_i;
+
+    // ---- Sv39: the fetch address is translated before it reaches the port ----
+    // `ft_*` holds the translation of the CURRENT `fetch_pc_r`: the page base
+    // (the 4 KiB offset comes from the virtual address, so a superset of it is
+    // preserved) and, when the walk faulted, the architectural cause. It is
+    // invalidated whenever the fetch pc moves (a new translation is needed) and
+    // whenever the translation's inputs could have changed — a CSR write, a
+    // trap, an xRET or `sfence.vma`. No TLB and no PTE cache: a miss costs one
+    // walk of `cor_mmu`, which is the whole cache design.
+    logic        ft_valid_r;
+    logic [51:0] ft_page_r;
+    logic [3:0]  ft_fault_r;
+    logic [63:0] fw_vaddr_r;    // the vaddr the walk in flight was started for
+    logic        ft_hit;
+    logic        ft_fault_hit;
+    logic        fetch_ready;       // the front-end may take a fetch this cycle
+    logic        imem_req_w;
+
+    assign ft_hit       = ft_valid_r && (ft_fault_r == 4'd0);
+    assign ft_fault_hit = ft_valid_r && (ft_fault_r != 4'd0);
+    // "the front-end wants a fetch": the IF/ID slot is empty or being vacated,
+    // and nothing is freezing it. Identical to the pre-Sv39 condition, with the
+    // stall terms factored out so the translation request can use it too.
+    assign fetch_ready  = !flush_all && !ex_stall && (!id_valid_r || !load_use);
+    assign imem_req_w   = fetch_ready && (!mmu_fetch_on || ft_hit);
+    assign fetch_hit    = imem_req_w && imem_ready_i;
+    assign fetch_take   = fetch_hit || (fetch_ready && ft_fault_hit);
+    // A taken fetch either has no fault (the port may still answer with an error
+    // response: `imem_err_i` with `imem_ready_i` means no instruction is there,
+    // cause 1) or carries the walk's fault (cause 12, or 1 when the PTE read
+    // itself was refused). The bytes on `imem_rdata_i` are void in both cases, so
+    // the encoding is NOT decoded — the cause travels down the pipe instead.
+    assign fetch_fault_cause = (fetch_ready && ft_fault_hit) ? ft_fault_r
+                               : (fetch_hit && imem_err_i)  ? eth_rv_pkg::CAUSE_INSN_ACCESS
+                                                            : 4'd0;
+
+    // A fetch walk is started for whichever pc the front-end has reached, and the
+    // front-end then cannot move (no translation, so no request) until the walk
+    // finishes — EXCEPT that an older instruction can redirect the pc while the
+    // walk is in flight (a taken branch, a jalr, an mret, a trap). The result is
+    // therefore tagged with the address it was started for and accepted only
+    // while that is still the current `fetch_pc_r`: without the tag, a
+    // speculative walk (the predicted fall-through of a jalr, say) that finishes
+    // in or after the redirect's cycle hands its page to the new pc, and the
+    // front-end then fetches the right *virtual* address from the wrong page.
+    logic        walk_done_fetch;
+    assign walk_done_fetch = mmu_done && walk_is_fetch_r;
 
     ctrl_t       dec_ctrl;
     logic [4:0]  dec_rd;
@@ -247,7 +321,7 @@ module eth_rv_core (
     logic [31:0] id_insn_r;
     logic        id_is_c_r;
     logic [63:0] id_pred_r;
-    logic        id_fault_r;    // this instruction's fetch was answered with an error
+    logic [3:0]  id_fault_r;    // this instruction's fetch faulted (0 = it did not)
     ctrl_t       id_ctrl_r;
     logic [4:0]  id_rd_r;
     logic [4:0]  id_rs1_r;
@@ -268,7 +342,7 @@ module eth_rv_core (
     logic [31:0] ex_insn_r;
     logic        ex_is_c_r;
     logic [63:0] ex_pred_r;
-    logic        ex_fault_r;    // this instruction's fetch was answered with an error
+    logic [3:0]  ex_fault_r;    // this instruction's fetch fault (0 = it did not)
     ctrl_t       ex_ctrl_r;
     logic [4:0]  ex_rd_r;
     logic [4:0]  ex_rs1_r;
@@ -299,6 +373,7 @@ module eth_rv_core (
     logic [4:0]  wb_rd_r;
     logic [63:0] wb_data_r;
     logic [63:0] wb_addr_r;
+    logic [63:0] wb_paddr_r;
     logic [63:0] wb_store_data_r;
     logic [7:0]  wb_wmask_r;
     logic [7:0]  wb_rmask_r;
@@ -345,7 +420,52 @@ module eth_rv_core (
     logic        ex_csr_illegal;
     logic        ex_mret_illegal;
     logic        ex_sret_illegal;
+    logic        ex_sfence_illegal;
     logic [1:0]  priv_eff;
+
+    // ---- Sv39 translation (E2-RV2 increment 1) -----------------------------
+    // One walker (`u_mmu`) serves the fetch path and the MEM stage; the MEM
+    // stage arbitrates with priority, and the walk drives the D port.
+    logic [63:0] csr_satp_r;
+    logic        mmu_on;            // satp.MODE is Sv39
+    logic        mmu_xlate;         // ... and this access is below M-mode
+    logic        mmu_fetch_on;      // a fetch must be translated
+    logic        mmu_data_on;       // a data access must be translated
+    logic        mmu_start;
+    logic [63:0] mmu_vaddr;
+    eth_rv_pkg::acc_e mmu_acc;
+    logic        mmu_busy;
+    logic        mmu_done;
+    logic [63:0] mmu_paddr;
+    logic [3:0]  mmu_fault;
+    logic        walk_is_fetch_r;   // the walk in flight serves the fetch path
+    logic        fetch_walk_start;
+    logic        mem_walk_start;
+    logic        mem_start;
+    logic        mem_owns_dport;   // the MEM stage's access owns the D port
+
+    // MEM stage access sequencing: walk first, then drive the D port, exactly
+    // one access at a time.
+    typedef enum logic [1:0] {
+        MEM_IDLE = 2'd0,
+        MEM_WALK = 2'd1,
+        MEM_ACC  = 2'd2
+    } mem_phase_e;
+
+    mem_phase_e  mem_phase_r;
+    logic [63:0] mem_paddr_r;       // the translated address of the access in MEM
+    logic        mem_is_access;
+    logic        mem_xlate_fault;
+
+    // the D port, muxed between the MEM stage and the walker's PTE read
+    logic        dmem_req_core;
+    logic        dmem_we_core;
+    logic [63:0] dmem_addr_core;
+    logic [63:0] dmem_wdata_core;
+    logic [7:0]  dmem_wstrb_core;
+    logic [1:0]  dmem_size_core;
+    logic        mmu_pte_req;
+    logic [63:0] mmu_pte_addr;
 
     // interrupt lines and selection
     logic [63:0] mip_eff;        // mip as the CSR/read path sees it
@@ -357,19 +477,22 @@ module eth_rv_core (
     logic        ex_irq;         // ... and it is taken for the instruction in EX
 
     assign md_wait  = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv && !md_valid;
-    // A misaligned access is a trap, not a stall: it never asserts `dmem_req_o`, so
-    // waiting for `dmem_ready_i` would wedge the pipeline.
-    assign mem_wait = mem_valid_r && !mem_ctrl_r.illegal
-                      && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned
-                      && !dmem_ready_i;
+    // The MEM stage holds its instruction until the access is done, which now
+    // takes three steps: walk (if translation is on), drive, accept. A
+    // misaligned access is a trap, not a stall: it never enters that sequence,
+    // so waiting for `dmem_ready_i` would wedge the pipeline.
+    assign mem_is_access = mem_valid_r && !mem_ctrl_r.illegal
+                           && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned;
+    assign mem_wait = mem_is_access && !((mem_phase_r == MEM_ACC) && dmem_ready_i);
     // A port ERROR RESPONSE is a trap too, and for the same reason: the beat is
     // accepted (`dmem_ready_i`) and the error arrives with it, so nothing waits.
     // An error beat means the platform cannot serve the access — an unmapped
     // address, a device that rejects it, or a DECERR/SLVERR bus response — and
     // the architectural answer is Spike's `trap_{load,store}_access_fault` with
     // `mtval` = the access address. Never a silent success, never a wedge.
-    assign mem_access_err = mem_valid_r && !mem_ctrl_r.illegal
-                            && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned
+    assign mem_xlate_fault = (mem_phase_r == MEM_WALK) && mmu_done
+                             && !walk_is_fetch_r && (mmu_fault != 4'd0);
+    assign mem_access_err = (mem_phase_r == MEM_ACC) && mem_is_access
                             && dmem_ready_i && dmem_err_i;
     assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_load
                       && (ex_rd_r != 5'd0) && id_valid_r
@@ -400,12 +523,24 @@ module eth_rv_core (
     assign ex_csr_illegal = ex_ctrl_r.is_csr
                             && (!ex_csr_priv_ok
                                 || ((ex_ctrl_r.csr_addr[11:10] == 2'b11)
-                                    && ex_csr_write_form));
+                                    && ex_csr_write_form)
+                                || ((ex_ctrl_r.csr_addr == eth_rv_pkg::CSR_SATP)
+                                    && (csr_priv_r == eth_rv_pkg::PRV_S)
+                                    && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_TVM) != 64'd0)));
     assign ex_mret_illegal = ex_ctrl_r.is_mret && (csr_priv_r != eth_rv_pkg::PRV_M);
-    // TSR (mstatus bit 22): when set, sret is an M-only instruction.
+    // TSR (mstatus bit 22): when set, sret is an M-only instruction. TVM
+    // (bit 20) is what makes `sfence.vma` and `satp` M-only in S-mode
+    // (Spike's require_privilege(TVM ? PRV_M : PRV_S)); in U-mode both are
+    // illegal whatever TVM says, which is the same condition.
     assign ex_sret_illegal = ex_ctrl_r.is_sret
                              && ((csr_priv_r == eth_rv_pkg::PRV_U)
                                  || ((csr_priv_r == eth_rv_pkg::PRV_S) && csr_mstatus_r[22]));
+    // sfence.vma is legal in M and in S, and illegal in U — and in S only when
+    // TVM is set (Spike's `require_privilege(TVM ? PRV_M : PRV_S)`).
+    assign ex_sfence_illegal = ex_ctrl_r.is_sfence
+                               && ((csr_priv_r == eth_rv_pkg::PRV_U)
+                                   || ((csr_priv_r == eth_rv_pkg::PRV_S)
+                                       && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_TVM) != 64'd0)));
 
     // ---- interrupt selection (Spike's take_interrupt/priority order) --------
     // pending = mip & mie; M-eligible = pending & ~mideleg while an M interrupt
@@ -468,13 +603,15 @@ module eth_rv_core (
     // A fetch fault is deliberately NOT pre-empted: the fetch already failed, and
     // in Spike that trap is raised at fetch time, before any later interrupt
     // check. A MEM-side trap outranks everything (its instruction is older).
-    assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal && !ex_fault_r && ex_next_pc[0];
+    assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal
+                                  && (ex_fault_r == 4'd0) && ex_next_pc[0];
     assign ex_trap = ex_valid_r && !ex_stall
-                     && (ex_fault_r || ex_ctrl_r.illegal || ex_ctrl_r.is_ecall
+                     && ((ex_fault_r != 4'd0) || ex_ctrl_r.illegal || ex_ctrl_r.is_ecall
                          || ex_ctrl_r.is_ebreak || ex_target_misaligned
-                         || ex_csr_illegal || ex_mret_illegal || ex_sret_illegal);
-    assign ex_irq = ex_valid_r && !ex_fault_r && !md_started_r && !mem_trap && irq_take;
-    assign mem_trap = mem_misaligned || mem_access_err;
+                         || ex_csr_illegal || ex_mret_illegal || ex_sret_illegal
+                         || ex_sfence_illegal);
+    assign ex_irq = ex_valid_r && (ex_fault_r == 4'd0) && !md_started_r && !mem_trap && irq_take;
+    assign mem_trap = mem_misaligned || mem_xlate_fault || mem_access_err;
     assign trap_is_irq = !mem_trap && ex_irq;
     assign trap_hit = mem_trap || ex_irq || ex_trap;
     assign trap_pc   = mem_trap ? mem_pc_r   : ex_pc_r;
@@ -482,9 +619,11 @@ module eth_rv_core (
 
     always_comb begin
         // The fetch fault is checked first: a faulted fetch carries no valid
-        // encoding, so nothing else about it may be interpreted.
-        if (ex_fault_r) begin
-            ex_cause = eth_rv_pkg::CAUSE_INSN_ACCESS;
+        // encoding, so nothing else about it may be interpreted. The cause is
+        // whatever the fetch path decided: 1 for a port error response, 12 for a
+        // translation fault, 1 again when the walk's own PTE read was refused.
+        if (ex_fault_r != 4'd0) begin
+            ex_cause = ex_fault_r;
         end else if (ex_ctrl_r.is_ecall) begin
             // Environment call: the cause names the mode that issued it.
             ex_cause = (csr_priv_r == eth_rv_pkg::PRV_M) ? eth_rv_pkg::CAUSE_ECALL_M
@@ -506,7 +645,7 @@ module eth_rv_core (
         // mtval: the faulting fetch address (access fault), the misaligned target
         // (fetch), the pc (breakpoint), zero (ecall) or the offending instruction
         // word (illegal) — Spike's exact choices.
-        if (ex_fault_r) begin
+        if (ex_fault_r != 4'd0) begin
             ex_trap_value = ex_pc_r;
         end else if (ex_ctrl_r.is_ebreak) begin
             ex_trap_value = ex_pc_r;
@@ -524,13 +663,21 @@ module eth_rv_core (
     // error response to the issued access. Both report `mtval` = the address.
     // An interrupt carries its IRQ code with bit 63 set in the cause word and
     // `tval` = 0 (Spike: `trap_t::get_tval()` is 0 for every interrupt).
+    // The MEM-side causes: misaligned (4/6) is decided before the access is
+    // issued, a translation fault (13/15 for a page fault, 5/7 when the walk's
+    // PTE read was refused) comes from the walker, and an access fault (5/7) is
+    // the port's error response to the issued access. All three report
+    // `mtval` = the VIRTUAL address the instruction named — the physical one
+    // never reaches a CSR.
     assign trap_cause = mem_misaligned
                         ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_MISALIGN
                                                : eth_rv_pkg::CAUSE_LOAD_MISALIGN)
-                        : mem_access_err
-                          ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_ACCESS
-                                                 : eth_rv_pkg::CAUSE_LOAD_ACCESS)
-                          : trap_is_irq ? irq_code : ex_cause;
+                        : mem_xlate_fault
+                          ? mmu_fault
+                          : mem_access_err
+                            ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_ACCESS
+                                                   : eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                            : trap_is_irq ? irq_code : ex_cause;
     assign trap_mtval = mem_trap ? mem_addr_r : (trap_is_irq ? 64'd0 : ex_trap_value);
     // Delegation: an exception is handled in S-mode when medeleg[i] is set, an
     // interrupt when mideleg[i] is set — but only for a trap taken below M-mode,
@@ -643,7 +790,7 @@ module eth_rv_core (
     // instruction must not redirect to its own (possibly misaligned) target, and
     // a fetch-faulted instruction has no meaningful target at all: the trap
     // machinery owns the PC in that cycle.
-    assign ex_redirect = ex_valid_r && !ex_ctrl_r.illegal && !ex_fault_r
+    assign ex_redirect = ex_valid_r && !ex_ctrl_r.illegal && (ex_fault_r == 4'd0)
                          && !ex_target_misaligned && (ex_next_pc != ex_pred_r);
 
     // ---- writeback value before the memory access ----
@@ -695,6 +842,7 @@ module eth_rv_core (
     logic        ex_sret_we;
     logic [63:0] mstatus_wr;
     logic [1:0]  mpp_wr;
+    logic        ex_sfence_we;
 
     // mstatus as read: the stored value with SD derived from FS (Spike sets SD on
     // every write of FS = 11 and clears it otherwise).
@@ -718,6 +866,7 @@ module eth_rv_core (
             // mcounteren/scounteren exist but have a zero write mask under
             // `--isa=rv64imc` (no Zicntr), so they read 0 whatever is written.
             eth_rv_pkg::CSR_MCOUNTEREN, eth_rv_pkg::CSR_SCOUNTEREN: csr_rdata = 64'd0;
+            eth_rv_pkg::CSR_SATP:      csr_rdata = csr_satp_r;
             eth_rv_pkg::CSR_MIP:       csr_rdata = mip_eff;
             // sip sees the delegated pending bits: mip & mideleg (Spike's
             // mip_proxy read through the MIDELEG accessor; MVIP aliasing is off).
@@ -747,6 +896,10 @@ module eth_rv_core (
     // (or an interrupt) traps.
     assign ex_csr_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_csr
                        && ((ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) || (ex_csr_src != 64'd0));
+    // `sfence.vma`: no translation state is cached (see cor_mmu), so the
+    // instruction has nothing to invalidate beyond its privilege check. It
+    // writes no register, so it must not execute as a CSR write either.
+    assign ex_sfence_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_sfence;
     assign csr_wdata = (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) ? ex_csr_src
                        : (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RS) ? (csr_rdata | ex_csr_src)
                                                                   : (csr_rdata & ~ex_csr_src);
@@ -778,6 +931,59 @@ module eth_rv_core (
     // finish work the golden model never started.
     assign md_start = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv
                       && !md_started_r && !ex_irq;
+
+    // =====================================================================
+    // Sv39 walker: shared by the fetch path and the MEM stage
+    // =====================================================================
+    // Both clients translate only below M-mode, and only while satp.MODE is
+    // Sv39. The MEM stage asks first (`mem_walk_start` is what stops the fetch
+    // side from starting a second walk), and a walk already in flight is never
+    // preempted — it is at most four cycles long, so a deferred fetch walk costs
+    // nothing but time.
+    assign mmu_on       = (csr_satp_r[63:60] == 4'd8);
+    assign mmu_xlate    = mmu_on && (csr_priv_r != eth_rv_pkg::PRV_M);
+    assign mmu_fetch_on = mmu_xlate;
+    assign mmu_data_on  = mmu_xlate;
+
+    // The MEM stage enters its sequence as soon as the walker is free: with
+    // translation off it goes straight to the access, with it on it walks first.
+    assign mem_start        = (mem_phase_r == MEM_IDLE) && mem_is_access && !mmu_busy;
+    assign mem_walk_start   = mem_start && mmu_data_on;
+    // ... and while it has an access in flight, the D port is exclusively its
+    // own: a fetch walk started in that window would have to share the port, and
+    // the mux below gives the walker priority, so the access would lose its
+    // address/data (a store would go out as a read). The fetch side therefore
+    // waits for the whole MEM sequence — it is never needed by an older
+    // instruction, so deferring it costs cycles and nothing else.
+    assign mem_owns_dport   = mem_valid_r && mem_is_access;
+    assign fetch_walk_start = fetch_ready && !flush_all && mmu_fetch_on && !ft_valid_r
+                              && !mmu_busy && !mem_owns_dport;
+    assign mmu_start    = mem_walk_start || fetch_walk_start;
+    assign mmu_vaddr    = mem_walk_start ? mem_addr_r : fetch_pc_r;
+    assign mmu_acc      = mem_walk_start ? (mem_ctrl_r.is_store ? eth_rv_pkg::ACC_STORE
+                                                                : eth_rv_pkg::ACC_LOAD)
+                                         : eth_rv_pkg::ACC_FETCH;
+
+    cor_mmu u_mmu (
+        .clk_i      (clk_i),
+        .rst_ni     (rst_ni),
+        .start_i    (mmu_start),
+        .vaddr_i    (mmu_vaddr),
+        .acc_i      (mmu_acc),
+        .priv_s_i   (csr_priv_r == eth_rv_pkg::PRV_S),
+        .sum_i      (csr_mstatus_r[18]),
+        .mxr_i      (csr_mstatus_r[19]),
+        .ppn_i      (csr_satp_r[43:0]),
+        .busy_o     (mmu_busy),
+        .done_o     (mmu_done),
+        .paddr_o    (mmu_paddr),
+        .fault_o    (mmu_fault),
+        .pte_req_o  (mmu_pte_req),
+        .pte_addr_o (mmu_pte_addr),
+        .pte_ready_i(dmem_ready_i),
+        .pte_rdata_i(dmem_rdata_i),
+        .pte_err_i  (dmem_err_i)
+    );
 
     cor_muldiv u_muldiv (
         .clk_i   (clk_i),
@@ -812,16 +1018,32 @@ module eth_rv_core (
         .misaligned_o(lsu_misaligned)
     );
 
-    assign dmem_req_o   = mem_valid_r && !mem_ctrl_r.illegal
-                          && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned;
-    assign dmem_we_o    = mem_ctrl_r.is_store;
-    assign dmem_addr_o  = mem_addr_r;
-    assign dmem_wdata_o = mem_ctrl_r.is_store ? lsu_wdata : 64'd0;
-    assign dmem_wstrb_o = mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
+    // The D port is shared: the MEM stage drives its access in the MEM_ACC
+    // phase, the walker drives its PTE reads, and the two are mutually exclusive
+    // by construction (the MEM stage only issues in MEM_ACC, which is only
+    // entered after its own walk has finished). The address the MEM stage
+    // presents is PHYSICAL (`mem_paddr_r`); the byte lanes and the store data
+    // come from the virtual address, whose low 12 bits — and therefore whose
+    // lane and offset — the walk preserves.
+    assign dmem_req_core   = (mem_phase_r == MEM_ACC) && mem_is_access;
+    assign dmem_we_core    = mem_ctrl_r.is_store;
+    assign dmem_addr_core  = mem_paddr_r;
+    assign dmem_wdata_core = mem_ctrl_r.is_store ? lsu_wdata : 64'd0;
+    assign dmem_wstrb_core = mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
+    assign dmem_size_core  = mem_ctrl_r.mem_size;
+
+    // Exactly one client at a time (the walker only runs while the MEM stage has
+    // no access in flight, and the MEM stage only issues after its own walk).
+    assign dmem_req_o   = mmu_pte_req || dmem_req_core;
+    assign dmem_we_o    = !mmu_pte_req && dmem_we_core;
+    assign dmem_addr_o  = mmu_pte_req ? mmu_pte_addr : dmem_addr_core;
+    assign dmem_wdata_o = mmu_pte_req ? 64'd0 : dmem_wdata_core;
+    assign dmem_wstrb_o = mmu_pte_req ? 8'd0 : dmem_wstrb_core;
     // The access size describes the access, not the beat: it is what lets a
     // byte-register peripheral (the console UART) reject an access it cannot
-    // serve, exactly as Spike's ns16550 rejects `len != reg_io_width`.
-    assign dmem_size_o  = mem_ctrl_r.mem_size;
+    // serve, exactly as Spike's ns16550 rejects `len != reg_io_width`. A PTE
+    // read is always a doubleword — Sv39 PTEs are 8 bytes and 8-byte aligned.
+    assign dmem_size_o  = mmu_pte_req ? eth_rv_pkg::SZ_DWRD : dmem_size_core;
 
     // =====================================================================
     // WB stage / commit + trace
@@ -861,6 +1083,10 @@ module eth_rv_core (
     assign rvfi_mem_wdata_o = wb_ctrl_r.is_store ? wb_store_data_r : 64'd0;
     assign rvfi_mem_wmask_o = wb_wmask_r;
     assign rvfi_mem_rmask_o = wb_rmask_r;
+    // ... and the PHYSICAL address the transfer actually went to: the trace
+    // reports the virtual one (what Spike logs), so this port is what lets the
+    // formal proof tie the record to the D-port transfer.
+    assign rvfi_mem_paddr_o = wb_paddr_r;
 
     // The error strobe no longer latches (nothing halts): it pulses for one cycle
     // when a trap is taken and carries the architectural cause. `err_o` is the
@@ -890,14 +1116,17 @@ module eth_rv_core (
             fetch_pc_r <= trap_target;      // a trap outranks any redirect
         end else if (ex_redirect) begin
             fetch_pc_r <= ex_next_pc;
-        end else if (fetch_hit) begin
+        end else if (fetch_take) begin
             fetch_pc_r <= fetch_pred_pc;
         end
     end
 
-    assign imem_req_o  = !flush_all && !ex_stall && (id_consumed || !id_valid_r);
-    assign imem_addr_o = fetch_pc_r;
-    assign fetch_hit   = imem_req_o && imem_ready_i;
+    // The I port sees a PHYSICAL address whenever the fetch is translated; the
+    // virtual `fetch_pc_r` is what the pipeline, the trace and the trap CSRs
+    // carry. Nothing is requested until the translation (or its fault) is in:
+    // `imem_req_w` is low then, so a faulting fetch never reaches the port.
+    assign imem_req_o  = imem_req_w;
+    assign imem_addr_o = mmu_fetch_on ? {ft_page_r, fetch_pc_r[11:0]} : fetch_pc_r;
     // ---- CSR state: trap effects outrank a younger instruction's CSR write ----
     // Trap entry is split by destination: an M-mode trap writes mepc/mcause/mtval
     // and the M stack, a delegated trap writes sepc/scause/stval and the S stack.
@@ -925,6 +1154,7 @@ module eth_rv_core (
             csr_scause_r   <= 64'd0;
             csr_stval_r    <= 64'd0;
             csr_sscratch_r <= 64'd0;
+            csr_satp_r     <= 64'd0;
         end else if (trap_hit) begin
             if (trap_to_s) begin
                 // Delegated trap: the S-mode stack. SPIE <= SIE, SPP <= the mode
@@ -1012,6 +1242,19 @@ module eth_rv_core (
                 eth_rv_pkg::CSR_MSCRATCH: begin
                     csr_mscratch_r <= csr_wdata;
                 end
+                // satp. Spike's CSR_SATP is the virtualized wrapper, whose
+                // unlogged_write() keeps `read()` unless satp_valid() — so a mode
+                // field this hart does not have leaves the WHOLE register (MODE,
+                // ASID and PPN) unchanged, while a legal mode stores the value
+                // verbatim. Sv39 (8) and Off (0) are the modes this hart has;
+                // Spike's device tree advertises `riscv,sv57`, so it also accepts
+                // 9 and 10 — the one documented boundary of this slice (see
+                // verif/eth_rv/README.md "Sv39 translation").
+                eth_rv_pkg::CSR_SATP: begin
+                    if ((csr_wdata[63:60] == 4'd0) || (csr_wdata[63:60] == 4'd8)) begin
+                        csr_satp_r <= csr_wdata;
+                    end
+                end
                 eth_rv_pkg::CSR_SSCRATCH: begin
                     csr_sscratch_r <= csr_wdata;
                 end
@@ -1046,6 +1289,76 @@ module eth_rv_core (
         end
     end
 
+
+    // ---- the fetch translation register (Sv39) ------------------------------
+    // `ft_page_r`/`ft_fault_r` describe the walk that resolved the CURRENT
+    // `fetch_pc_r`; `walk_is_fetch_r` says which client the walk in flight
+    // belongs to. The entry survives until the fetch pc moves (`fetch_take`), a
+    // trap or redirect takes over (`flush_all`), or one of the translation's
+    // inputs changes (a CSR write, mret/sret, sfence.vma) — a conservative list
+    // rather than a tag comparison, because a stale translation is a silent
+    // wrong fetch.
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            ft_valid_r      <= 1'b0;
+            ft_page_r       <= 52'd0;
+            ft_fault_r      <= 4'd0;
+            fw_vaddr_r      <= 64'd0;
+            walk_is_fetch_r <= 1'b0;
+        end else begin
+            if (mmu_start) begin
+                walk_is_fetch_r <= fetch_walk_start;
+                if (fetch_walk_start) begin
+                    fw_vaddr_r <= mmu_vaddr;
+                end
+            end
+            if (walk_done_fetch && (fw_vaddr_r == fetch_pc_r)
+                && !(fetch_take || flush_all || ex_csr_we || ex_mret_we
+                     || ex_sret_we || ex_sfence_we)) begin
+                // the walk finished and still describes the pc being fetched
+                ft_valid_r <= 1'b1;
+                ft_page_r  <= mmu_paddr[63:12];
+                ft_fault_r <= mmu_fault;
+            end else if (walk_done_fetch || fetch_take || flush_all || ex_csr_we
+                         || ex_mret_we || ex_sret_we || ex_sfence_we) begin
+                // the pc moved (a redirect/trap), a CSR changed a translation
+                // input, or the walk's answer is for an address the front-end has
+                // already left: no translation is known for the current pc. The
+                // clear outranks the set on purpose: a walk that completes in the
+                // SAME cycle as a redirect would otherwise publish a page for a pc
+                // the redirect has already replaced (the formal P10 invariant
+                // `ft_valid_r -> fw_vaddr_r == fetch_pc_r` is exactly this).
+                ft_valid_r <= 1'b0;
+            end
+        end
+    end
+
+    // ---- the MEM stage's access sequencing (Sv39) ---------------------------
+    // MEM_IDLE -> (walk when translation is on) -> MEM_WALK -> MEM_ACC -> MEM_IDLE.
+    // A walk that faults leaves the stage in MEM_IDLE (the trap has it); an
+    // access that is not a load/store never leaves MEM_IDLE.
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            mem_phase_r <= MEM_IDLE;
+            mem_paddr_r <= 64'd0;
+        end else if (mem_start) begin
+            mem_phase_r <= mmu_data_on ? MEM_WALK : MEM_ACC;
+            if (!mmu_data_on) begin
+                // no translation: the physical address IS the virtual one, and
+                // recording it here keeps `mem_paddr_r` the single answer to
+                // "where did this access go" for the trace and the bus alike
+                mem_paddr_r <= mem_addr_r;
+            end
+        end else if ((mem_phase_r == MEM_WALK) && mmu_done && !walk_is_fetch_r) begin
+            mem_paddr_r <= mmu_paddr;
+            mem_phase_r <= (mmu_fault == 4'd0) ? MEM_ACC : MEM_IDLE;
+        end else if ((mem_phase_r == MEM_ACC) && dmem_ready_i) begin
+            mem_phase_r <= MEM_IDLE;
+        end else if (!mem_is_access) begin
+            mem_phase_r <= MEM_IDLE;
+        end
+    end
+
     // IF/ID
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
@@ -1054,7 +1367,7 @@ module eth_rv_core (
             id_insn_r  <= 32'd0;
             id_is_c_r  <= 1'b0;
             id_pred_r  <= 64'd0;
-            id_fault_r <= 1'b0;
+            id_fault_r <= 4'd0;
             id_ctrl_r  <= '0;
             id_rd_r    <= 5'd0;
             id_rs1_r   <= 5'd0;
@@ -1065,20 +1378,20 @@ module eth_rv_core (
         end else if (ex_stall) begin
             id_valid_r <= id_valid_r;
         end else if (id_consumed || !id_valid_r) begin
-            id_valid_r <= fetch_hit;
-            if (fetch_hit) begin
-                id_pc_r   <= fetch_pc_r;
-                id_insn_r <= fetch_insn;
-                id_is_c_r <= fetch_is_c;
-                id_pred_r <= fetch_pred_pc;
-                id_fault_r <= fetch_fault;
+            id_valid_r <= fetch_take;
+            if (fetch_take) begin
+                id_pc_r    <= fetch_pc_r;
+                id_insn_r  <= fetch_insn;
+                id_is_c_r  <= fetch_is_c;
+                id_pred_r  <= fetch_pred_pc;
+                id_fault_r <= fetch_fault_cause;
                 // a faulted fetch has no encoding to decode: the control word is
                 // zeroed so the fault marker alone decides what happens in EX
-                id_ctrl_r <= fetch_fault ? '0 : dec_ctrl;
-                id_rd_r   <= dec_rd;
-                id_rs1_r  <= dec_rs1;
-                id_rs2_r  <= dec_rs2;
-                id_imm_r  <= dec_imm;
+                id_ctrl_r  <= (fetch_fault_cause != 4'd0) ? '0 : dec_ctrl;
+                id_rd_r    <= dec_rd;
+                id_rs1_r   <= dec_rs1;
+                id_rs2_r   <= dec_rs2;
+                id_imm_r   <= dec_imm;
             end
         end
     end
@@ -1091,7 +1404,7 @@ module eth_rv_core (
             ex_insn_r     <= 32'd0;
             ex_is_c_r     <= 1'b0;
             ex_pred_r     <= 64'd0;
-            ex_fault_r    <= 1'b0;
+            ex_fault_r    <= 4'd0;
             ex_ctrl_r     <= '0;
             ex_rd_r       <= 5'd0;
             ex_rs1_r      <= 5'd0;
@@ -1149,12 +1462,15 @@ module eth_rv_core (
             mem_wb_pre_r     <= 64'd0;
             mem_addr_r       <= 64'd0;
             mem_store_data_r <= 64'd0;
-        end else if (mem_wait) begin
-            mem_valid_r <= mem_valid_r;
         end else if (trap_hit) begin
             // the trapping instruction (or the younger one behind a MEM trap) must
-            // not enter MEM: neither may perform a memory access or commit
+            // not enter MEM: neither may perform a memory access or commit. This
+            // outranks the stall: a walk that faults has `mem_wait` asserted (the
+            // stage is waiting for the walker), and if the stall won the trapping
+            // access would simply be re-issued from the frozen slot.
             mem_valid_r <= 1'b0;
+        end else if (mem_wait) begin
+            mem_valid_r <= mem_valid_r;
         end else begin
             mem_valid_r <= ex_valid_r && !ex_stall && !ex_ctrl_r.illegal
                            && !ex_ctrl_r.is_ecall && !ex_ctrl_r.is_ebreak;
@@ -1185,6 +1501,7 @@ module eth_rv_core (
             wb_rd_r         <= 5'd0;
             wb_data_r       <= 64'd0;
             wb_addr_r       <= 64'd0;
+            wb_paddr_r      <= 64'd0;
             wb_store_data_r <= 64'd0;
             wb_wmask_r      <= 8'd0;
             wb_rmask_r      <= 8'd0;
@@ -1203,6 +1520,7 @@ module eth_rv_core (
                 wb_rd_r         <= mem_rd_r;
                 wb_data_r       <= mem_ctrl_r.is_load ? lsu_load_data : mem_wb_pre_r;
                 wb_addr_r       <= mem_addr_r;
+                wb_paddr_r      <= mem_paddr_r;
                 // Spike logs the stored data truncated to the access size, so the
                 // trace carries exactly that (see the RVFI block above)
                 wb_store_data_r <= eth_rv_pkg::store_wdata(mem_store_data_r,
@@ -1347,8 +1665,11 @@ module eth_rv_core (
                 assert(!ex_valid_r);
             end
             // ... a stalled D-port access FREEZES the MEM slot, so the
-            // instruction it holds across the stall is the same one ...
-            if ($past(mem_wait)) begin
+            // instruction it holds across the stall is the same one. A trap
+            // outranks the stall — a walk that faults stalls the stage AND takes
+            // the instruction — so the freeze is stated for the cycles no trap
+            // claims the slot.
+            if ($past(mem_wait) && !$past(trap_hit)) begin
                 assert(mem_valid_r == $past(mem_valid_r));
                 assert(mem_pc_r    == $past(mem_pc_r));
                 assert(mem_insn_r  == $past(mem_insn_r));
@@ -1372,6 +1693,45 @@ module eth_rv_core (
                 assert($past(id_consumed));
             end
 
+            // ---- the fetch fault cause is one of the two a fetch can raise ---
+            // A fetch either was refused by the port (cause 1) or faulted in its
+            // own translation (cause 12); both a 1-bit flag and a 4-bit cause
+            // would otherwise be free in the induction step, which is what makes
+            // the P8 statement below inductive.
+            assert((id_fault_r == 4'd0) || (id_fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                   || (id_fault_r == eth_rv_pkg::CAUSE_INSN_PAGE));
+            assert((ex_fault_r == 4'd0) || (ex_fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                   || (ex_fault_r == eth_rv_pkg::CAUSE_INSN_PAGE));
+            // ... and while the EX slot holds a faulted fetch — and no older MEM
+            // trap or interrupt claims the cycle — the reported cause IS that
+            // fetch's cause, which is what makes the P8 statement about `$past`
+            // inductive (a 4-bit cause register is otherwise free in the
+            // induction step).
+            if ((ex_fault_r != 4'd0) && !mem_trap) begin
+                assert(trap_cause == ex_fault_r);
+            end
+            // ... and a translation fault is always one of the six causes a walk
+            // can raise (the memory-side twin of the same invariant).
+            assert((trap_cause == eth_rv_pkg::CAUSE_LOAD_MISALIGN)
+                   || (trap_cause == eth_rv_pkg::CAUSE_STORE_MISALIGN)
+                   || (trap_cause == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                   || (trap_cause == eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                   || (trap_cause == eth_rv_pkg::CAUSE_STORE_ACCESS)
+                   || (trap_cause == eth_rv_pkg::CAUSE_ILLEGAL)
+                   || (trap_cause == eth_rv_pkg::CAUSE_BREAKPOINT)
+                   || (trap_cause == eth_rv_pkg::CAUSE_INSN_MISALIGN)
+                   || (trap_cause == eth_rv_pkg::CAUSE_INSN_PAGE)
+                   || (trap_cause == eth_rv_pkg::CAUSE_LOAD_PAGE)
+                   || (trap_cause == eth_rv_pkg::CAUSE_STORE_PAGE)
+                   || (trap_cause == 4'd8) || (trap_cause == 4'd9)
+                   || (trap_cause == 4'd11)
+                   || (trap_cause == eth_rv_pkg::IRQ_SSI)
+                   || (trap_cause == eth_rv_pkg::IRQ_MSI)
+                   || (trap_cause == eth_rv_pkg::IRQ_STI)
+                   || (trap_cause == eth_rv_pkg::IRQ_MTI)
+                   || (trap_cause == eth_rv_pkg::IRQ_SEI)
+                   || (trap_cause == eth_rv_pkg::IRQ_MEI));
+
             // ---- P3b: commit-path control invariant ---------------------------
             // A record is a load or a store, never both, and the D-port mask
             // discipline rests on the same fact: no instruction is decoded as
@@ -1391,7 +1751,11 @@ module eth_rv_core (
             if (rvfi_mem_valid_o) begin
                 assert($past(dmem_req_o));              // it really was driven
                 assert($past(dmem_ready_i));            // and accepted
-                assert(rvfi_mem_addr_o  == $past(dmem_addr_o));
+                // The record carries the VIRTUAL address (what Spike logs), the
+                // bus the PHYSICAL one, and translation preserves the page offset;
+                // `rvfi_mem_paddr_o` is the physical address of this very access.
+                assert(rvfi_mem_paddr_o == $past(dmem_addr_o));
+                assert(rvfi_mem_addr_o[11:0] == $past(dmem_addr_o[11:0]));
                 assert(rvfi_mem_wmask_o == $past(dmem_wstrb_o));
                 // exactly one direction per record
                 assert((rvfi_mem_wmask_o & rvfi_mem_rmask_o) == 8'd0);
@@ -1419,6 +1783,31 @@ module eth_rv_core (
             // ---- P7: a record never reports a write to x0 --------------------
             assert(!rvfi_rd_we_o || (rvfi_valid_o && (rvfi_rd_addr_o != 5'd0)));
 
+            // ---- P9: the D port has exactly one client ------------------------
+            // The walker's PTE read and the MEM stage's access are mutually
+            // exclusive by construction; sharing the port would let the mux take
+            // a store's write-enable and address away from it (a store would go
+            // out as a read of the walker's address).
+            assert(!(mmu_pte_req && dmem_req_core));
+            // ... a walk that faults never leaves its instruction with a
+            // translation it can use: the MEM slot is dropped by the trap, so the
+            // trapping access cannot be re-issued from a frozen slot ...
+            if ($past(mem_xlate_fault)) begin
+                assert(!mem_valid_r);
+                assert(!rvfi_valid_o);
+                assert($past(trap_hit));
+                assert($past(trap_mtval) == $past(mem_addr_r));
+            end
+            // ... and a fetch walk's result is only ever published for the address
+            // it was started for: while `ft_valid_r` is set, the tagged address is
+            // still the pc being fetched, so a speculative walk cannot hand its
+            // page to a pc that a redirect has already moved to. (Stated as an
+            // invariant on the register rather than as a next-cycle implication,
+            // which is what makes it inductive.)
+            if (ft_valid_r) begin
+                assert(fw_vaddr_r == fetch_pc_r);
+            end
+
             // ---- P8: an error response never retires --------------------------
             // A D-port beat answered with an error is an access fault: the
             // instruction cannot commit (no trace record) and the trap machinery
@@ -1430,7 +1819,7 @@ module eth_rv_core (
                 assert($past(trap_hit));
                 assert(($past(trap_cause) == eth_rv_pkg::CAUSE_LOAD_ACCESS)
                        || ($past(trap_cause) == eth_rv_pkg::CAUSE_STORE_ACCESS));
-                assert($past(trap_mtval) == $past(dmem_addr_o));
+                assert($past(trap_mtval) == $past(mem_addr_r));
             end
             // The instruction side of the same rule: a fetch the port answered
             // with an error never enters MEM (so it can never be committed) and
@@ -1441,12 +1830,13 @@ module eth_rv_core (
             // one EX actually holds; and an older MEM-side fault outranks it —
             // then the reported trap is the data one, which is what the design
             // says must happen.
-            if ($past(ex_valid_r) && $past(ex_fault_r) && !$past(ex_stall)
+            if ($past(ex_valid_r) && ($past(ex_fault_r) != 4'd0) && !$past(ex_stall)
                 && !$past(mem_trap)) begin
                 assert(!mem_valid_r);
                 assert($past(ex_trap));
                 assert($past(trap_hit));
-                assert($past(trap_cause) == eth_rv_pkg::CAUSE_INSN_ACCESS);
+                assert(($past(trap_cause) == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                       || ($past(trap_cause) == eth_rv_pkg::CAUSE_INSN_PAGE));
                 assert($past(trap_mtval) == $past(ex_pc_r));
             end
 
@@ -1465,7 +1855,18 @@ module eth_rv_core (
             cover(mem_access_err);
             cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_LOAD_ACCESS));
             cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_STORE_ACCESS));
-            cover(ex_valid_r && ex_fault_r && !ex_stall);
+            cover(ex_valid_r && (ex_fault_r != 4'd0) && !ex_stall);
+            // Sv39 (E2-RV2 increment 1): the walk, a translated record, and the
+            // three page faults on both translation paths.
+            cover(mmu_pte_req);
+            cover(mmu_done && !mmu_fault);
+            cover(mmu_start && fetch_walk_start);
+            cover(mem_start && mmu_data_on);
+            cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_LOAD_PAGE));
+            cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_STORE_PAGE));
+            cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_INSN_PAGE));
+            cover(mem_xlate_fault);
+            cover(rvfi_valid_o && rvfi_mem_valid_o && (rvfi_mem_addr_o != rvfi_mem_paddr_o));
         end
     end
 `endif

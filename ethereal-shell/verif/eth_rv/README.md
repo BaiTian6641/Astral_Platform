@@ -579,3 +579,65 @@ so a separate `eth_rv_clint.sv` would need a `Makefile` dependency line that thi
 increment's scope excludes. The one resulting `DECLFILENAME` warning is waived
 with the written justification in the file; every other `-Wall` warning still
 fails. No `Makefile` edit is required by this increment.
+
+## Sv39 translation (E2-RV2 increment 1)
+
+`satp` is a real CSR, the walk is `rtl/eth_rv/cor_mmu.sv`, and the corpus gains two
+self-checking programs: `cor_sv39` (the walk, the permission matrix, SUM/MXR, U/S,
+`sfence.vma`, TVM, the PTE-read and translated-access error paths) and `cor_pgfault`
+(the three page faults, their `mtval`, and `medeleg` delegation to S-mode).
+
+```
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_sv39
+# -> [rv-rtl] cor_sv39: PASS 11661 commits, 35 traps (5 access faults, 20 page faults)
+#    MATCH: 11661 commits compared, 0 divergence — pc, rd and value agree
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_pgfault
+# -> [rv-rtl] cor_pgfault: PASS 8620 commits, 11 traps (1 access fault, 7 page faults)
+#    MATCH: 8620 commits compared, 0 divergence — pc, rd and value agree
+```
+
+**What is translated, and what is not.** Translation applies when `satp.MODE` is Sv39
+(8) and the access is made below M-mode: M-mode is never translated, and `MPRV` stays
+WARL storage whose behaviour is not implemented (a documented boundary, like Spike's
+`Sv48`/`Sv57` modes: its device tree advertises `riscv,sv57`, so its `satp` accepts 9
+and 10 and walks four or five levels, while this hart accepts Off and Sv39 only — the
+corpus never writes them). `satp` writes follow Spike exactly: `CSR_SATP` is the
+*virtualized* wrapper there, whose `unlogged_write()` keeps `read()` unless
+`satp_valid()`, so a mode field the hart does not have leaves the WHOLE register (mode,
+ASID and PPN) unchanged while a legal mode stores the value verbatim.
+
+**Virtual vs physical in the trace.** Both ports see physical addresses; the pipeline,
+`rvfi_pc_o`, `mepc`/`sepc` and every `mtval`/`stval` keep the virtual ones — which is
+what Spike logs, so the per-access comparison is unchanged. `rvfi_mem_paddr_o` exports
+the physical address of the committed access (the formal proof uses it to tie the trace
+to the D-port transfer), and the page offset is common to both addresses.
+
+**One walker, two clients, no cache.** `cor_mmu` walks three levels, one PTE read per
+level, on the D port. The MEM stage owns the port while it has an access in flight (a
+fetch walk started in that window would take the port's address and write-enable away
+from a store — the formal proof asserts the two never overlap), and a walk result is
+accepted only for the address it was started for, so a speculative walk cannot hand its
+page to a pc a redirect has already moved to. There is **no TLB and no PTE cache**: every
+translated access re-walks. `sfence.vma` is therefore a privilege check with nothing to
+invalidate — vacuous rather than unimplemented, and it costs about 4–5 cycles per
+translated fetch (`cor_sv39` is 11661 commits / 17154 cycles). Spike *does* cache PTEs
+(`mmu.cc pte_cache`), so a program that edits a page table and does not `sfence.vma` may
+legitimately see different translations on the two sides; the corpus always sfences.
+
+**Faults.** Page faults are 12 (instruction), 13 (load) and 15 (store) with
+`mtval`/`stval` = the faulting virtual address; a PTE read the platform cannot serve is
+the *access* fault of the access type (1/5/7) with the same tval — Spike's `pte_load`
+raises `throw_access_exception` where an invalid PTE raises
+`throw_page_fault_exception`. A/D are never updated in hardware (`menvcfg.ADUE = 0` after
+reset), so a missing A, or a missing D on a store, is a page fault. The probe table these
+expectations came from (N/PBMT/Svrsw60t59b/reserved bits, the reserved R=0/W=1 encoding,
+superpage alignment, non-canonical VAs) is in `'/home/polar/.omp/agent/sessions/-Astral_Platform/2026-09-11T03-58-45-190Z_01a08e9e-29c6-75d1-b24f-7a9de22d7187/local/rv7-notes.md'`.
+
+**Negative controls for this slice** (`--tb-plusarg`, see the CLI reference):
+
+| control | what it proves |
+|---|---|
+| `--fault N:mem_wdata=VALUE` | the memory-stream comparison is live on the new programs (it diverges at exactly commit N) |
+| `+dmem_corrupt_addr=A +dmem_corrupt_xor=X` | corrupting a page-table word changes the DUT's translation (and its fault), i.e. the DiffTest catches a wrong PTE *interpretation* — the corpus's own checks fail first (`a0` = the failing check index) |
+| `+no_dmem_err=1` | a PTE read answered as a silent success is caught: the DUT retires (and traps) where Spike faults |
+| `+trace_traps=1` | prints every trap the core reports (pc, cause, instruction), which is how a run's trap sequence is read back |

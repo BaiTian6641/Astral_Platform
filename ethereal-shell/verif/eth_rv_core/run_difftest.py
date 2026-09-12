@@ -71,6 +71,8 @@ RTL_SOURCES = [
     RTL_DIR / "cor_lsu.sv",
     RTL_DIR / "cor_regfile.sv",
     RTL_DIR / "cor_decoder.sv",
+    # Sv39 address translation (E2-RV2 increment 1): the page-table walker.
+    RTL_DIR / "cor_mmu.sv",
     RTL_DIR / "eth_rv_core.sv",
     # SoC MMIO: the console UART and the address decoder in front of the D port
     # (C14 §4). Both sit in front of either memory path, so they are part of
@@ -102,6 +104,10 @@ CORPUS_PROGRAMS = [
     "cor_time",
     "cor_hello",
     "cor_fault",
+    # E2-RV2 increment 1: Sv39 translation, its permission matrix and its faults
+    # (see verif/eth_rv/README.md "Sv39 translation").
+    "cor_sv39",
+    "cor_pgfault",
 ]
 
 HELLO_STRING = b"hello, eth_rv!\n"
@@ -398,6 +404,7 @@ def run_rtl(
     fault: str | None,
     quiet: bool,
     uart_fault: str | None = None,
+    plusargs: list[str] | None = None,
 ) -> RtlRun:
     """Run the RTL on one ELF; produce its commit trace and console record.
 
@@ -426,6 +433,9 @@ def run_rtl(
     if uart_fault is not None:
         frame, bit = parse_uart_fault(uart_fault)
         argv += [f"+uart_fault_frame={frame}", f"+uart_fault_bit={bit}"]
+    # pass-through negative controls (`+no_dmem_err=1`, `+dmem_corrupt_addr=…`
+    # `+dmem_corrupt_xor=…`, `+trace_traps=1`, …) — see verif/eth_rv/README.md
+    argv += list(plusargs or [])
     done = run(argv, cwd=REPO_ROOT, quiet=quiet)
     banner = "ETH_RV_TB:"
     status = next(
@@ -534,6 +544,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="--dram: read line fill in beats (1 = one beat per transaction, the default is 8)",
     )
     parser.add_argument("--quiet", action="store_true", help="only print the harness verdicts")
+    parser.add_argument(
+        "--tb-plusarg",
+        action="append",
+        default=[],
+        help=(
+            "extra +plusarg for the testbench, verbatim (repeatable). The Sv39 negative "
+            "controls use it: +no_dmem_err=1 (a PTE read answered as a silent success), "
+            "+dmem_corrupt_addr=ADDR +dmem_corrupt_xor=XOR (a page table read corrupted, "
+            "i.e. a fault injected on a walk), +trace_traps=1 (print every trap)"
+        ),
+    )
     return parser
 
 
@@ -574,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
                 fault=args.fault,
                 quiet=args.quiet,
                 uart_fault=args.uart_fault,
+                plusargs=args.tb_plusarg,
             )
         except SetupError as exc:
             sys.stderr.write(f"[rv-rtl] error: {exc}\n")

@@ -162,6 +162,21 @@ module tb_eth_rv_core;
     // instruction) — the control that shows the error response is load-bearing
     // rather than decorative.
     int unsigned no_dmem_err;
+    // Sv39 negative control (E2-RV2 increment 1): `+dmem_corrupt_addr=A
+    // +dmem_corrupt_xor=X` folds `X` into every D-port beat whose 8-byte-aligned
+    // window is at `A`, in both directions. Aimed at a page-table page it is the
+    // "fault injected on a walk": the walker reads a PTE that differs from the
+    // one the program wrote, so the DUT's translation (or its fault) differs from
+    // Spike's, which reads the real memory. Nothing inside the DUT knows about
+    // it — what the DiffTest compares is the DUT's committed trace, so the
+    // control proves the comparison is live rather than the RTL being able to
+    // pass it by construction.
+    logic [63:0] dmem_corrupt_addr;
+    logic [63:0] dmem_corrupt_xor;
+    // Debug aid for the Sv39 slice: `+trace_traps=1` prints every trap the core
+    // takes (pc, cause, instruction) — the commit trace deliberately has no
+    // record for a trap, so this is how a run's trap sequence is read back.
+    int unsigned trace_traps;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -252,6 +267,7 @@ module tb_eth_rv_core;
     logic [63:0] rvfi_mem_wdata;
     logic [7:0]  rvfi_mem_wmask;
     logic [7:0]  rvfi_mem_rmask;
+    logic [63:0] rvfi_mem_paddr;   // the PHYSICAL address of the recorded access
 
     logic        core_err;
     logic [63:0] core_err_pc;
@@ -297,6 +313,7 @@ module tb_eth_rv_core;
         .rvfi_mem_wdata_o(rvfi_mem_wdata),
         .rvfi_mem_wmask_o(rvfi_mem_wmask),
         .rvfi_mem_rmask_o(rvfi_mem_rmask),
+        .rvfi_mem_paddr_o(rvfi_mem_paddr),
         .err_o           (core_err),
         .err_pc_o        (core_err_pc),
         .err_insn_o      (core_err_insn),
@@ -590,11 +607,19 @@ module tb_eth_rv_core;
     // aligned beat: the eight bytes of the window at (addr & ~7) — read through
     // `mem_word`, which bounds-checks, so an out-of-window beat reads zero rather
     // than an arbitrary array slot (it is an ERROR response anyway).
-    assign dmem_rdata = dmem_req ? mem_word(dmem_addr & ~64'd7) : 64'd0;
+    assign dmem_rdata = dmem_req ? (mem_word(dmem_addr & ~64'd7)
+                                    ^ (dmem_corrupt_hit ? dmem_corrupt_xor : 64'd0))
+                                 : 64'd0;
     // Outside the mapped window the access is an error response, in the same
     // cycle it is accepted — the same "ready + err" shape the DRAM socket's
     // DECERR produces through `eth_rv_axi_master` in the other build.
     assign dmem_err_raw = dmem_ready && !in_mem(dmem_addr);
+
+    // The walk-injection control (see `dmem_corrupt_addr`): it corrupts the beat
+    // the port returns for one 8-byte-aligned window, so a PTE the walker reads is
+    // not the PTE the program wrote.
+    wire dmem_corrupt_hit = (dmem_corrupt_xor != 64'd0)
+                            && ((dmem_addr & ~64'd7) == dmem_corrupt_addr);
 
     // byte-lane write, at the cycle the access is accepted
     integer      lane;
@@ -731,6 +756,7 @@ module tb_eth_rv_core;
     int unsigned n_stores;
     int unsigned traps;
     int unsigned n_access_faults;   // EXCEPTIONS taken with mcause 1/5/7
+    int unsigned n_pgfaults;        // ... and with mcause 12/13/15 (Sv39)
     int unsigned n_interrupts;      // traps that were interrupts
 
     // ---- WEDGE GUARD: a port request must be answered ----------------------
@@ -823,6 +849,7 @@ module tb_eth_rv_core;
             n_stores        <= 0;
             traps           <= 0;
             n_access_faults <= 0;
+            n_pgfaults      <= 0;
             n_interrupts    <= 0;
             dport_wait      <= 0;
             iport_wait      <= 0;
@@ -915,6 +942,11 @@ module tb_eth_rv_core;
                 $display("ETH_RV_TB: FAIL the I port never answered the fetch at 0x%016x (%0d cycles) — wedge",
                          imem_addr, iport_wait + 1);
             end else if (core_err && !stop_now) begin
+                if (trace_traps != 0) begin
+                    $display("ETH_RV_TB: trap %0d pc=0x%016x cause=%0d insn=0x%08x irq=%0d",
+                             traps + 1, core_err_pc, core_err_code, core_err_insn,
+                             core_err_irq);
+                end
                 traps    <= traps + 1;
                 last_trap_cause <= core_err_code;
                 if (core_err_irq) begin
@@ -924,6 +956,9 @@ module tb_eth_rv_core;
                 end else if ((core_err_code == 4'd1) || (core_err_code == 4'd5)
                              || (core_err_code == 4'd7)) begin
                     n_access_faults <= n_access_faults + 1;
+                end else if ((core_err_code == 4'd12) || (core_err_code == 4'd13)
+                             || (core_err_code == 4'd15)) begin
+                    n_pgfaults <= n_pgfaults + 1;
                 end
                 if (traps >= max_traps) begin
                     failed   <= 1'b1;
@@ -958,6 +993,9 @@ module tb_eth_rv_core;
         uart_fault_bit    = 0;
         starve_dmem       = 0;
         no_dmem_err       = 0;
+        dmem_corrupt_addr = 64'd0;
+        dmem_corrupt_xor  = 64'd0;
+        trace_traps       = 0;
         rst_n        = 1'b0;
 
         void'($value$plusargs("mem=%s", mem_path));
@@ -967,6 +1005,9 @@ module tb_eth_rv_core;
         void'($value$plusargs("memlat=%d", mem_lat));
         void'($value$plusargs("max_cycles=%d", max_cycles));
         void'($value$plusargs("max_traps=%d", max_traps));
+        void'($value$plusargs("trace_traps=%d", trace_traps));
+        void'($value$plusargs("dmem_corrupt_addr=%h", dmem_corrupt_addr));
+        void'($value$plusargs("dmem_corrupt_xor=%h", dmem_corrupt_xor));
         void'($value$plusargs("fault_index=%d", fault_index));
         void'($value$plusargs("fault_value=%h", fault_value));
         void'($value$plusargs("fault_field=%s", fault_field));
@@ -1076,16 +1117,16 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response that never became an access fault");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 n_interrupts, n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_store_data, last_insn,
                  n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 n_interrupts, n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_store_data, last_insn,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `endif

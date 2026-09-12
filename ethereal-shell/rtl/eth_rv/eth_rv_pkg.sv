@@ -91,9 +91,9 @@ package eth_rv_pkg;
 
     // S-mode CSR set (C14 §3; E2-RV1 increment 6). The S-mode trap CSRs are
     // registers of their own — unlike mstatus/sstatus, they are not a view of a
-    // machine register. `satp` is deliberately NOT implemented: this slice has no
-    // MMU, so paging is a documented boundary (see verif/eth_rv/README.md
-    // "Privilege modes and trap delegation").
+    // machine register. `satp` is implemented as of E2-RV2 increment 1 (Sv39
+    // only: see cor_mmu.sv and verif/eth_rv/README.md).
+    localparam logic [11:0] CSR_SATP       = 12'h180;
     localparam logic [11:0] CSR_SSTATUS    = 12'h100;
     localparam logic [11:0] CSR_SIE        = 12'h104;
     localparam logic [11:0] CSR_STVEC      = 12'h105;
@@ -141,6 +141,7 @@ package eth_rv_pkg;
     localparam logic [63:0] MSTATUS_MIE   = 64'h0000_0000_0000_0008;
     localparam logic [63:0] MSTATUS_MPIE  = 64'h0000_0000_0000_0080;
     localparam logic [63:0] MSTATUS_SIE   = 64'h0000_0000_0000_0002;
+    localparam logic [63:0] MSTATUS_TVM   = 64'h0000_0000_0010_0000;
     localparam logic [63:0] MSTATUS_SPIE  = 64'h0000_0000_0000_0020;
     localparam logic [63:0] MSTATUS_SPP   = 64'h0000_0000_0000_0100;
     localparam logic [63:0] MSTATUS_MPP   = 64'h0000_0000_0000_1800;
@@ -190,8 +191,45 @@ package eth_rv_pkg;
         CAUSE_STORE_ACCESS   = 4'd7,   // store access fault (unmapped / rejected / DECERR)
         CAUSE_ECALL_U        = 4'd8,   // ecall from U-mode
         CAUSE_ECALL_S        = 4'd9,   // ecall from S-mode
-        CAUSE_ECALL_M        = 4'd11   // ecall from M-mode
+        CAUSE_ECALL_M        = 4'd11,  // ecall from M-mode
+        // The three PAGE faults (E2-RV2 increment 1). They are what the Sv39
+        // walk raises: `mtval`/`stval` is the faulting VIRTUAL address (never
+        // the physical one), exactly like Spike's
+        // `trap_{instruction,load,store}_page_fault(virt, addr, 0, 0)`. A PTE
+        // read the platform answers with an error is the *access* fault of the
+        // access type instead (Spike's pte_load -> throw_access_exception).
+        CAUSE_INSN_PAGE      = 4'd12,  // instruction page fault
+        CAUSE_LOAD_PAGE      = 4'd13,  // load page fault
+        CAUSE_STORE_PAGE     = 4'd15   // store/AMO page fault
     } trap_cause_e;
+
+    // ---------------------------------------------- translation access type
+    // What the Sv39 walk is for. The three values map to the three page-fault
+    // causes (12/13/15) and to the three access-fault causes (1/5/7) a failed
+    // PTE read raises, so cor_mmu carries one enum instead of two `case`s.
+    typedef enum logic [1:0] {
+        ACC_FETCH = 2'd0,
+        ACC_LOAD  = 2'd1,
+        ACC_STORE = 2'd2
+    } acc_e;
+
+    // The architectural cause a page fault of this access type carries.
+    function automatic logic [3:0] page_fault_cause(input acc_e acc);
+        unique case (acc)
+            eth_rv_pkg::ACC_FETCH: page_fault_cause = eth_rv_pkg::CAUSE_INSN_PAGE;
+            eth_rv_pkg::ACC_LOAD:  page_fault_cause = eth_rv_pkg::CAUSE_LOAD_PAGE;
+            default:               page_fault_cause = eth_rv_pkg::CAUSE_STORE_PAGE;
+        endcase
+    endfunction
+
+    // ... and the access fault a PTE read that the platform cannot serve raises.
+    function automatic logic [3:0] access_fault_cause(input acc_e acc);
+        unique case (acc)
+            eth_rv_pkg::ACC_FETCH: access_fault_cause = eth_rv_pkg::CAUSE_INSN_ACCESS;
+            eth_rv_pkg::ACC_LOAD:  access_fault_cause = eth_rv_pkg::CAUSE_LOAD_ACCESS;
+            default:               access_fault_cause = eth_rv_pkg::CAUSE_STORE_ACCESS;
+        endcase
+    endfunction
 
     // Interrupt cause codes (the low bits of `mcause`/`scause` when bit 63 is
     // set). The names are the architectural ones; the values are Spike's IRQ_*
@@ -224,6 +262,7 @@ package eth_rv_pkg;
             eth_rv_pkg::CSR_MCAUSE, eth_rv_pkg::CSR_MTVAL, eth_rv_pkg::CSR_MIP,
             eth_rv_pkg::CSR_MHARTID, eth_rv_pkg::CSR_MEDELEG, eth_rv_pkg::CSR_MIDELEG,
             eth_rv_pkg::CSR_MCOUNTEREN,
+            eth_rv_pkg::CSR_SATP,
             eth_rv_pkg::CSR_SSTATUS, eth_rv_pkg::CSR_SIE, eth_rv_pkg::CSR_STVEC,
             eth_rv_pkg::CSR_SCOUNTEREN, eth_rv_pkg::CSR_SSCRATCH, eth_rv_pkg::CSR_SEPC,
             eth_rv_pkg::CSR_SCAUSE, eth_rv_pkg::CSR_STVAL, eth_rv_pkg::CSR_SIP:
@@ -292,6 +331,7 @@ package eth_rv_pkg;
         logic       is_ebreak;
         logic       is_mret;
         logic       is_sret;     // sret (S-mode return; legal in M when TSR = 0)
+        logic       is_sfence;   // sfence.vma (E2-RV2 increment 1)
     } ctrl_t;
 
     // The error strobe's code type is `trap_cause_e`: the core no longer halts on

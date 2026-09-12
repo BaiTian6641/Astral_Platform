@@ -387,13 +387,26 @@ module cor_decoder (
                 // not implemented and must never become unnoticed no-ops.
                 OP_SYSTEM: begin
                     if (funct3 == 3'b000) begin
-                        unique case (insn_i[31:20])
-                            12'h000: ctrl_o.is_ecall  = 1'b1;
-                            12'h001: ctrl_o.is_ebreak = 1'b1;
-                            12'h102: ctrl_o.is_sret   = 1'b1;
-                            12'h302: ctrl_o.is_mret   = 1'b1;
-                            default: ctrl_o.illegal   = 1'b1;
-                        endcase
+                        // sfence.vma (E2-RV2 increment 1) is decoded FIRST: its
+                        // imm[11:5] is 0001001, so the trap/CSR case below would
+                        // otherwise mark it illegal (imm[4:0] is rs2, which no
+                        // other encoding here uses). Only the x0, x0 form is
+                        // architecturally the plain fence; the rs1/rs2 forms carry
+                        // a vaddr/ASID the RTL has no cached translation to filter
+                        // (see cor_mmu), so all of them decode the same way. rd is
+                        // read-only zero in the encoding, so nothing writes back.
+                        if (insn_i[31:25] == 7'b0001001) begin
+                            ctrl_o.is_sfence = 1'b1;
+                            rd_addr_o        = 5'd0;
+                        end else begin
+                            unique case (insn_i[31:20])
+                                12'h000: ctrl_o.is_ecall  = 1'b1;
+                                12'h001: ctrl_o.is_ebreak = 1'b1;
+                                12'h102: ctrl_o.is_sret   = 1'b1;
+                                12'h302: ctrl_o.is_mret   = 1'b1;
+                                default: ctrl_o.illegal   = 1'b1;
+                            endcase
+                        end
                     end else if (funct3[1:0] != 2'b00) begin
                         // csrrw/csrrs/csrrc + the immediate (uimm) forms. The op
                         // select is exactly funct3[1:0] (see csr_op_e).
