@@ -561,6 +561,7 @@ module tb_eth_rv_core;
     logic [63:0] core_err_pc;
     logic [31:0] core_err_insn;
     logic [3:0]  core_err_code;
+    logic [63:0] core_err_tval;
     logic        core_err_irq;
 
     // CLINT interrupt lines (MSIP/MTIP), the PLIC's external-interrupt lines
@@ -622,6 +623,7 @@ module tb_eth_rv_core;
         .err_insn_o      (core_err_insn),
         .err_code_o      (core_err_code),
         .err_irq_o       (core_err_irq),
+        .err_tval_o      (core_err_tval),
         .step_o          (step_strobe)
     );
 
@@ -1615,18 +1617,18 @@ module tb_eth_rv_core;
                          imem_addr, iport_wait + 1);
             end else if (core_err && !stop_now) begin
                 if (trace_traps != 0) begin
-                    $display("ETH_RV_TB: trap %0d pc=0x%016x cause=%0d insn=0x%08x irq=%0d",
-                             traps + 1, core_err_pc, core_err_code, core_err_insn,
-                             core_err_irq);
+                    $display("ETH_RV_TB: trap %0d pc=0x%016x cause=%0d tval=0x%016x insn=0x%08x irq=%0d",
+                             traps + 1, core_err_pc, core_err_code, core_err_tval,
+                             core_err_insn, core_err_irq);
                 end
                 // `+stop_trap_cause`: the first trap OF the declared kind
                 // ends the run and is printed whether or not `+trace_traps` is set.
                 // This is the diagnostic that turns a 10^9-cycle boot into a few
                 // dozen lines ending at the trap nobody asked for.
                 if (stop_trap_cause_en && (core_err_code == stop_trap_cause[3:0])) begin
-                    $display("ETH_RV_TB: FAIL halting on cause %0d after %0d commits / %0d cycles: pc=0x%016x insn=0x%08x irq=%0d (%0d trap(s) before it)",
+                    $display("ETH_RV_TB: FAIL halting on cause %0d after %0d commits / %0d cycles: pc=0x%016x tval=0x%016x insn=0x%08x irq=%0d (%0d trap(s) before it)",
                              core_err_code, commits, cycle_cnt, core_err_pc,
-                             core_err_insn, core_err_irq, traps + 1);
+                             core_err_tval, core_err_insn, core_err_irq, traps + 1);
                     failed   <= 1'b1;
                     stop_now <= 1'b1;
                 end

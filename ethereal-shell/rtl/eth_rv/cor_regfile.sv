@@ -10,7 +10,12 @@
 //              (by the time the consumer reaches EX the producer has left WB),
 //              and it is a real one — it shows up as a stale operand on the
 //              third instruction after an ALU producer, which is exactly how the
-//              DiffTest caught it (cor_alu commit #50 at pc 0x8000_00c4).
+//              DiffTest caught it (cor_alu commit #50 at pc 0x8000_00c4). The
+//              bypass covers a write-back landing in the SAME cycle only; a
+//              consumer whose write-back lands one cycle LATER than its ID read
+//              is covered by the EX forwarding network while the producer is
+//              still in MEM/WB, and a consumer held in EX past that window is
+//              covered by the core's ID/EX operand refresh (`cor_mprv` pins it).
 //
 //              x0 is forced to zero at the read ports as well as being
 //              write-protected, so a stray write to x0 can never leak into an

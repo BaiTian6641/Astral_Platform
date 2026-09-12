@@ -9,13 +9,19 @@
 //              * IF   fetches through a held-until-ready instruction port and
 //                     decodes combinationally, so the static predictor and the
 //                     ID stage share one decoder instance.
-//              * ID   reads the register file (no internal bypass — every hazard
-//                     is forwarded in EX, which keeps forwarding bugs visible).
+//              * ID   reads the register file (whose read ports bypass a write-back
+//                     landing in the SAME cycle) and latches the two operands.
 //              * EX   ALU (cor_alu), M extension (cor_muldiv, stalled until its
 //                     result strobe), branch resolution and the redirect.
 //                     Forwarding is EX/MEM -> EX and WB -> EX, MEM ahead of WB
 //                     (the younger producer wins). A load-use hazard inserts one
 //                     bubble; the consumer then takes the load from WB.
+//                     A consumer HELD in EX (a D-port walk, a mul/div, the FPU)
+//                     also has its operand latches refreshed from the write-back:
+//                     it acts when it LEAVES EX, by which time the producer may
+//                     have retired and taken the forwarding window with it, so
+//                     the latch captured a cycle before that write landed would
+//                     otherwise be the value it used (see the ID/EX stage).
 //              * MEM  data port access; waits on `dmem_ready_i` (arbitrary
 //                     latency, the request is held until accepted).
 //              * WB   register write + ONE RVFI trace record per retired
@@ -228,6 +234,7 @@ module eth_rv_core (
     output logic [31:0] err_insn_o,
     output logic [3:0]  err_code_o,
     output logic        err_irq_o,   // with err_o: this trap is an interrupt
+    output logic [63:0] err_tval_o,  // ... and its mtval/stval
 
     // ---- executed-instruction strobe (the SoC CLINT's mtime cadence) ----
     output logic        step_o
@@ -1681,6 +1688,14 @@ module eth_rv_core (
     assign err_pc_o   = trap_pc;
     assign err_insn_o = trap_insn;
     assign err_code_o = trap_hit ? trap_cause : 4'd0;
+    // `mtval` is the trap's own datum: the faulting virtual address for a
+    // translation/access fault and for a misaligned access, the pc for a
+    // breakpoint/illegal-fetch, the instruction word for an illegal encoding and
+    // zero for an interrupt. It is what the corpus programs read back from the
+    // CSR and what a kernel prints as `badaddr`, so the testbench's trap trace
+    // carries it too — a `cause 13` line without the address it faulted on is
+    // the expensive half of a translation bug hunt.
+    assign err_tval_o = trap_hit ? trap_mtval : 64'd0;
     // The 4-bit cause code cannot carry bit 63, so the "this is an interrupt"
     // bit travels beside it: a trap is either an exception or an interrupt, and
     // only the former can be an access fault.
@@ -2210,6 +2225,25 @@ module eth_rv_core (
                 ex_valid_r <= 1'b0;
             end else if (ex_stall) begin
                 ex_valid_r <= ex_valid_r;
+                // An instruction held in EX must not lose its producer. The
+                // operand latches are loaded from the ID read, which is a cycle
+                // *earlier* than the producer's write-back lands (the register
+                // file's write-first bypass only covers the same cycle), and the
+                // EX forwarding network over `ex_fwd_a`/`ex_fwd_b` only sees a
+                // producer while it is still in MEM/WB. An instruction that is
+                // held past its producer's WB slot — waiting on a page walk, a
+                // mul/div or the FPU — would then act on the stale register-file
+                // value, and it acts at the moment it LEAVES EX (a CSR write, a
+                // branch, the store data, the bus address), so the value seen then
+                // is the one that matters. Refreshing the latches from the
+                // write-back while the stage is held is what makes that value the
+                // one the producer wrote; the write-back is also what the
+                // forwarding network would have offered, one cycle earlier.
+                if (wb_we && (wb_rd_r == ex_rs1_r)) ex_rs1_val_r <= wb_data_r;
+                if (wb_we && (wb_rd_r == ex_rs2_r)) ex_rs2_val_r <= wb_data_r;
+                if (wb_fp_we && (wb_rd_r == ex_rs1_r)) ex_fp_rs1_val_r <= wb_data_r;
+                if (wb_fp_we && (wb_rd_r == ex_rs2_r)) ex_fp_rs2_val_r <= wb_data_r;
+                if (wb_fp_we && (wb_rd_r == ex_rs3_r)) ex_fp_rs3_val_r <= wb_data_r;
             end else if (flush_all) begin
                 ex_valid_r <= 1'b0;
             end else begin

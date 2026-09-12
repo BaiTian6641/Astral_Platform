@@ -328,13 +328,16 @@ error. `cor_boot` (built by `verif/eth_rv_core/build_boot.py`, linked at
 
 ## Corpus
 
-The corpus grew program by program; the twenty self-checking bare-metal programs
-below are built the same way (`-march=rv64imafdc_zicsr_zicntr -mabi=lp64 -nostdlib
--mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
-`corpus/crt0.S`). The eight this section started with are tabulated here; the ten
-added by later increments each have their own section below (`cor_priv`,
-`cor_deleg`, `cor_intr`, `cor_time`; `cor_sv39`, `cor_pgfault`; `cor_fp`,
-`cor_fptrap`; `cor_atomic`, `cor_wfi`):
+The corpus grew program by program; the twenty-six self-checking bare-metal
+programs now in `run_difftest.py`'s `CORPUS_PROGRAMS` are built the same way
+(`-march=rv64imafdc_zicsr_zicntr -mabi=lp64 -nostdlib -mcmodel=medany`, linked at
+`0x8000_0000` by `corpus/link.ld`, entered via `corpus/crt0.S`; `cor_boot` links at
+a non-base entry with its own script). The eight this section started with are
+tabulated here; the later increments each have their own section below
+(`cor_priv`, `cor_deleg`, `cor_intr`, `cor_time`; `cor_sv39`, `cor_pgfault`;
+`cor_fp`, `cor_fptrap`; `cor_atomic`, `cor_wfi`; `cor_misalign`, `cor_mprv` —
+the last two carry the S4 boot's two data-access findings, see "The stalled-operand
+hazard, the S4 blocker, and `cor_mprv`"):
 
 | program | coverage |
 |---|---|
@@ -1131,6 +1134,116 @@ the FDT magic at the address `a1` actually names.
   report, so a failed long run still carries its console evidence.
 * The verdict/`failed` handling is unchanged; the FAIL/`$fatal` position moved only.
 
+### The stalled-operand hazard, the S4 blocker, and `cor_mprv`
+
+The RTL boot's kernel panic was **not** an MMU/MPRV defect. It was an EX-stage
+operand hazard, and it is worth stating in full because it is the kind of bug the
+DiffTest corpus exists to catch and had no program for.
+
+**Root cause.** OpenSBI's `sbi_load_u8()` emulates one byte of the kernel's
+misaligned load like this (`fw_jump.elf` at `0x8000c5a8`):
+
+```
+  li    a5, 0            # (in the surrounding loop) a5 = 0
+  csrrs a5, mstatus, a6  # a6 = MSTATUS_MPRV: a5 = the OLD mstatus, MPRV set
+  lbu   a7, 0(a0)        # the emulated byte read — a TRANSLATED M-mode access
+  csrw  mstatus, a5      # restore (MPRV clear, MPP = the trapping mode)
+```
+
+`csrrs rd, csr, rs1` must hand `rd` the CSR's value **before** its own write, so
+`a5` becomes the pre-`MPRV` `mstatus`. The `lbu` in between is an M-mode data
+access with `MPRV = 1`, i.e. a *translated* one, and it stalls in MEM for its page
+walk. That is what the restore `csrw` waits behind — and the waiter no longer saw
+`a5`:
+
+* the `csrrs` writes `a5` back when it reaches WB (`wb_data_r` → register file);
+* the `csrw` was latched into EX in the **previous** cycle, i.e. its operand
+  latches hold the register file's read from *before* that write-back (the
+  register file's write-first bypass only covers a write-back in the *same*
+  cycle, and the `csrrs` was still in MEM then);
+* the EX forwarding network *did* offer the right value while the `csrrs` sat in
+  WB — but the `csrw` was held in EX past that slot, and once the producer
+  retires the forward disappears, leaving the stale latch.
+
+So the restore wrote a mangled `mstatus` (in the observed run: `MPRV` stayed 1
+and `MPP` became **U**), the *next* emulated byte read was translated with
+U-mode privilege against the kernel's `U = 0` stack page, and the kernel saw a
+`cause 13` load page fault at `stval = addr + 1`. OpenSBI redirected that fault
+to S-mode with the *original* `mepc`, exactly as `sbi_misaligned_load_handler`
+does for a fault inside its own byte loop, and Linux — which asked for a
+misaligned-access trap (`cause 4`) and got a page fault instead — panicked:
+
+```
+[    3.735048] Unable to handle kernel paging request at virtual address ffffffc60000bca2
+[    3.748508] epc : check_unaligned_access_emulated+0x36/0x58
+[    3.771186] status: 0000000200000100 badaddr: ffffffc60000bca2 cause: 000000000000000d
+```
+
+**Fix** (`eth_rv_core.sv`, the ID/EX stage): while the EX stage is held
+(`ex_stall`), the operand latches are refreshed from the write-back —
+`ex_rs1_val_r`/`ex_rs2_val_r` from `wb_we`, the three FP latches from
+`wb_fp_we` — so the value an instruction finally acts on (a CSR write, a branch,
+the store data, the bus address) is the one its producer wrote even when it was
+held past the producer's WB slot. The forwarding network is unchanged; this only
+closes the window in which a held consumer's latch could go stale. The hazard is
+general (any consumer stalled in EX behind a producer that retires), not MPRV- or
+CSR-specific: `cor_alu` caught the *no-stall* form of the same class in
+increment 1, and the register file's write-first bypass exists for the third case
+(the same-cycle one).
+
+**Regression program: `cor_mprv`.** No earlier corpus program had a consumer
+that stalls in EX behind a register-file producer, and none exercised an M-mode
+`MPRV` data access at all. `cor_mprv.S` now does both, and it reproduces the
+whole chain in ~40 instructions: scripted S-mode with Sv39 on, the kernel's own
+misaligned `ld` (`cause 4`, `mtval` = the address) emulated by an M-mode handler
+that plays OpenSBI — eight `lbu`s, each with `mstatus.MPRV` set and restored
+around it, and the value landing in the trapped instruction's destination — then
+the same byte read in M-mode with `MPP = S` (must translate and read the datum),
+`MPP = U` against a `U = 0` leaf (must be `cause 13`), `MPP = M` (must *not*
+translate: `cause 5`, an access fault), and a `U = 1` leaf for contrast. Its
+handler also reads `mstatus` back mid-sequence into a `rec_status` slot, and the
+DiffTest compares that store against Spike: the pre-fix RTL wrote
+`0x0000_000a_0002_0000` where Spike writes `0x0000_000a_0000_0880` — a
+divergence that names the defect in one line, one second into the run.
+
+**How the diagnosis was made** (the fast path, in contrast to a 25-minute boot):
+
+```
+# 1. ground truth from the pinned kernel/OpenSBI sources, not from memory:
+#    the faulting instruction, decoded from the booted image itself
+riscv64-unknown-elf-objdump -D -b binary -m riscv:rv64 \
+    --adjust-vma=0xffffffff80000000 --start-address=0xffffffff80014c34 \
+    --stop-address=0xffffffff80014ca0 generated/rv_difftest/s4/Image
+#    -> 80014c6a: 00173703  ld a4,1(a4)      (8-byte load, 2-byte-aligned EA)
+#    and the emulator that traps it:
+riscv64-unknown-elf-objdump -d generated/rv_difftest/s4/fw_jump.elf | \
+    sed -n '/<sbi_load_u8>:/,+12p'
+#    -> csrrs a5,mstatus,a6 / lbu a7,0(a0) / csrw mstatus,a5
+
+# 2. the mechanism itself, as a corpus program (seconds, not minutes):
+python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --only cor_mprv \
+    --out generated/rv_difftest/corpus
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_mprv
+#    pre-fix:  DIVERGENCE (value_mismatch) at commit #8339: pc=0x800071c x30
+#              golden 0x0000000a00000880 != dut 0x0000000a00020000
+#              65 traps, last mcause=13 pc=0x8000724
+#    post-fix: MATCH: 9002 commits compared, 0 divergence
+```
+
+The S4 trap trace (`+trace_traps=1`, with `tval` now printed by the testbench —
+that is the one piece of the instrumentation this hunt left behind) shows the
+pre-fix sequence end to end, and it is the proof that the fault is the
+*emulator's* own access, not the kernel's:
+
+```
+trap 8057 pc=0xffffffff80014c6a cause=4  insn=0x00173703   # kernel's ld a4,1(a4) — correct
+trap 8058 pc=0x000000008000c5cc cause=13 insn=0x00054883   # OpenSBI's `lbu a7,0(a0)`
+trap 8059 pc=0xffffffff80014c6a cause=4  insn=0x00173703   # the probe is retried ...
+trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883   # ... and faults again
+```
+`0x8000c5cc` is `sbi_load_u8`'s `lbu` (see §"The stalled-operand hazard"), and the
+`cause 4`/`cause 13` pair repeats until the kernel gives up and panics.
+
 ### Boundaries of the S4 profile (read before trusting a number)
 
 * **`mtime` is not a diffable quantity yet, and the older note that called this a
@@ -1165,12 +1278,16 @@ the FDT magic at the address `a1` actually names.
   not a correctness one.
 * **`timebase-frequency`/`clock-frequency` remain DiffTest placeholders** (10 MHz), and
   the DT says so. The kernel's BogoMIPS/baud numbers derived from them are fiction.
-* **Current status (2026-09-12):** Phase 1 (Spike → userspace) passes. On the RTL the
-  console is byte-identical to Spike's for the first 4,462 bytes (OpenSBI + early kernel
-  init), the firmware DiffTest matches for the first 714,987 commits, and the kernel
-  then dies in `check_unaligned_access_emulated` with `cause=1`/`stval=epc` where a
-  misaligned `ld` should raise `cause=4` and be emulated by OpenSBI's
-  `sbi_misaligned_load_handler`. That is the open blocker; the full write-up, the
-  numbers and the boundaries are in
+* **Current status (2026-09-12, evening):** Phase 1 (Spike → userspace) passes, and the
+  RTL now reaches the same handoff. Two RTL fixes closed the gap, both found through the
+  corpus and both Spike-verified: the CLINT's `mtime` cadence is a per-build choice
+  (`CLINT_RTC_TICK_STEPS/ADVANCE`, 1/1 for S4 — without it every `udelay` cost ~100× the
+  instructions and the boot stalled in `__delay`), and the EX-stage operand latches are
+  refreshed from the write-back while the stage is held ("The stalled-operand hazard,
+  the S4 blocker, and `cor_mprv`" below) — the kernel's `check_unaligned_access_emulated`
+  panic was that hazard, not the MMU. The firmware DiffTest's honest bound is still
+  #714,987 commits (`mtime` is not a comparable quantity, see above); the corpus is now
+  26/26 MATCH on both D-port paths and `eth_rv_core.sby` prove+cover pass. The numbers,
+  the commands and the console evidence are in
   `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` and
-  `local://rv12-linux-notes.md`.
+  `local://rv13-s4-notes.md`.

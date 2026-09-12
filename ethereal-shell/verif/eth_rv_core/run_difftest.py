@@ -155,6 +155,15 @@ CORPUS_PROGRAMS = [
     # program touched a misaligned datum, which is why five increments of
     # DiffTest never compared this path against Spike.
     "cor_misalign",
+    # E2-RV2 increment 7 (S4): the M-mode MPRV data access (OpenSBI's
+    # `sbi_load_u8` sets mstatus.MPRV around a byte read, so the emulation's
+    # access is translated with the trapped mode's privilege). The program also
+    # pins the operand hazard the emulation's own
+    # `csrrs a5, mstatus; <stalling access>; csrw mstatus, a5` sequence hits:
+    # a consumer held in EX past its producer's write-back used to act on the
+    # stale register-file value (see the RTL's ID/EX stage and README
+    # "MPRV and the stalled-operand hazard").
+    "cor_mprv",
     # E2-RV2 increment 7 (S4): the PMP CSR floor the firmware programs — reset
     # state, write masks, the L-bit lock, and the RV64-absent pmpcfg1/pmpcfg3
     # staying illegal. Storage semantics only; enforcement is a documented gap.

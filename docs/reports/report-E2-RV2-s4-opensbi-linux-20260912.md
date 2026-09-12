@@ -3,7 +3,7 @@
 - **任务**：`E2-RV2`（RV-C）**增量 7 = S4（OpenSBI → Linux 里程碑）**；可行性见 `local://s4-feasibility.md`，逐条命令见 `local://rv12-linux-notes.md`。
 - **日期**：2026-09-12
 - **Plan-Ref**：`ethereal-plan/components/C14-eth_rv-RV64核心.md` §里程碑表（RV-C 行）；`ethereal-plan/subsystems/S15-应用处理器子系统.md` §5（DDR-less boot）
-- **一句话结论**：**Phase 1（Spike）✅ 完成** —— 同一对镜像 + 同一棵 DT 在 Spike 上把 Linux 6.18.48 带到 initramfs/用户态交接（2.2 s、11,928 B 控制台、里程碑命中）；**Phase 2（RTL）❌ 未达成** —— RTL 用同一对镜像启动了 OpenSBI 与内核早期初始化，控制台前 4,462 B 与 Spike **逐字节相同**，随后内核在**非对齐访问探测**（`check_unaligned_access_emulated`）中以 `cause=1`（instruction access fault）panic；此外固件段的 DiffTest 在 **#714,988** 提交处因 `mtime`（步进计数）漂移而分叉。**按约定如实上报，不伪造里程碑。**
+- **一句话结论**：**Phase 1（Spike）✅ 完成**（同一对镜像 + 同一棵 DT，2.2 s、11,928 B 控制台、里程碑命中）；**Phase 2（RTL）的阻塞点已消除、运行在收尾**：三处 RTL 修复（`mtime` 档位、`mstatus.MPRV`、**EX 操作数锁存刷新**）之后，内核越过了此前必死的 `check_unaligned_access_emulated` 探测（控制台同一位置从 `Kernel panic` 变为 `unligned accesses are slow`，见 §追补四 §8），beat 运行仍在向里程碑推进（7,646 B、内核时间 4.03 s，未宣称命中）；语料 **26/26 MATCH**（beat 与 AXI/DRAM 两条 D 口）、`sby prove`+`cover` PASS、`verilator --lint-only -Wall` 干净、harness pytest 274 passed。固件段 DiffTest 的诚实边界仍是 **#714,987**（`mtime` 不可比，见 §边界）。**按约定如实上报。**
 
 ## 本阶段实现内容
 
@@ -121,10 +121,11 @@ DT 被 OpenSBI 正确解析（平台名/时钟/IPI/控制台全部来自我们�
 
 ## 下一阶段需要做的内容
 
-1. **修非对齐访问分叉（唯一阻塞项）**：用 20 行裸机探针（S 模式非对齐 `ld`/`sd` + 打印 `mcause/mtval`）DiffTest Spike 对照，几秒内即可定位；候选点=`mem_misaligned` 与取指/MMU 路径的交互（本 RTL 中 `cause=1 & stval=epc` 只能来自取指路径）。
-2. **修步进脉冲丢失**（`step_o` 的 `!mem_trap`/冲刷分支）：让 CLINT 的 mtime 与 Spike 的 `INSNS_PER_RTC_TICK` 在 trap 前后都一致——否则内核定时器/时间戳永远不可 diff（也顺带把 `mtime` 从“边界”升回“可 diff”）。
-3. 修好后重跑 `--rtl`（beat）与 `--rtl --dram`，把里程碑与两种 D 口的数字补齐；再跑一次完整固件段 DiffTest 记录最终 MATCH 提交数。
-4. 板级启动遗留（`local://rv12-linux-notes.md` §6）：真实 timebase、DT/initrd 的加载者、可配置波特率发送器、控制台之外的 PLIC 源、硬件 A/D 或接受软件 A/D 成本。
+1. **把 beat 运行跑到里程碑**：`nohup python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl --max-cycles=4000000000 --timeout=14400 > /tmp/s4_beat2.log 2>&1 &`（阻塞点已消除：控制台已在同一位置从 `Kernel panic` 变为 `unligned accesses are slow`；判断标准=`console marker … seen` / `s4.uart` 里出现 `eth_rv S4: MILESTONE-REACHED`）。
+2. **接着跑 `--rtl --dram`**（必须串行：两条运行共用 `generated/rv_difftest/s4/`），把两行 `ETH_RV_TB: PASS` 的
+   commits/cycles/traps/pgfaults 与墙钟填进 §追补四 §8。
+3. **可选回归**：`run_linux_boot.py --difftest` 重跑固件段 DiffTest（预期仍 MATCH 到 #714,987，`mtime` 边界不变），并把 `make verif-rv-rtl`（现在含 `cor_mprv`）纳入常跑。
+4. **`mtime` 的板级/仿真口径**：`timebase-frequency=130000` 与 1:1 节拍是仿真口径（内核时间戳因此不可与 Spike 逐字比较）；板级启动要换成真实 SoC 时钟，并把 DT 的加载者/可配置波特率/UART 之外的 PLIC 源按 `local://rv13-s4-notes.md` §4 收尾。
 5. 外部门控项不变：`E2-AST1`、`E1-DMO3`、`E0-INF2`。
 
 ## 状态与证据图
@@ -293,3 +294,192 @@ A 的输出里 `ETH_RV_TB: FAIL first undeclared trap …` 一行就是下一个
 1. 在**该点**打印 `mstatus.MPRV/MPP`、有效特权、`satp`、被翻译的地址与 PTE（一个 `+trace_mprv` 类 plusarg；失败点在 ~1e9 周期处，故一次 25 min 运行即可）；
 2. 判定 cause 13 是"我们的翻译结果与内核页表不一致"（例如走页时用错了 `satp`/特权）还是"该访问本应先触发 cause 4"（LSB 对齐判定：`badaddr` 为 `…a2`，须确认内核那条指令的宽度）；
 3. 用一次性 Spike 探针对照（此前实现者尝试过合成 S 模式 MPRV 场景，Spike 侧未能复现，故这次要记录探针命令与输出）。
+
+## 追补四：根因（EX 操作数 hazard，**不是** MMU/MPRV）、修复、`cor_mprv`，以及里程碑
+
+### ❌→✅ 结论先行：追补三的假设是错的，失败点根本不在走页
+
+追补三把 `cause 13` 解释为"翻译结果与内核页表不一致 / 特权用错"，并把下一步指向
+"打印 walk 的输入"。**这条路是死路**：真正的缺陷在 **EX 阶段的操作数锁存**，
+与 MMU、MPRV、`satp`、PTE 全无关。下面按证据顺序重写。
+
+### 1. 先把两条指令钉死（从已启动的镜像里读，不靠记忆）
+
+* **触发指令**：`objdump -D -b binary -m riscv:rv64 --adjust-vma=0xffffffff80000000`
+  反汇编 `generated/rv_difftest/s4/Image`，`check_unaligned_access_emulated+0x36`
+  处（vaddr `0xffffffff80014c6a` = 文件偏移 `0x14c6a`）是
+  `00173703  ld a4,1(a4)`：**8 字节、2 字节对齐的有效地址**（oops 的寄存器
+  `sp = a4 = 0xffffffc60000bca0` ⇒ EA = `…bca1`），所以架构上的正确陷阱是
+  **`cause 4`、`mtval = …bca1`**，与 oops 里的 `cause 13 / badaddr …bca2` 不是同一件事。
+  该函数（Alpine 6.18.48，`arch/riscv/kernel/traps_misaligned.c`）就是
+  `asm volatile("ld %[tmp], 1(%[ptr])")` —— 故意的非对齐探测。
+* **仿真器**：pin 的 `fw_jump.elf`（OpenSBI v1.3）里 `sbi_load_u8`（`0x8000c5a8`）是
+  `csrrs a5,mstatus,a6`（a6 = MPRV，a5 ← 旧 mstatus）→ `lbu a7,0(a0)`（**MPRV 打开
+  的翻译访问**）→ `csrw mstatus,a5`（恢复）；`sbi_misaligned_ldst.c` 按字节循环，
+  任一字节出错就 `sbi_trap_redirect()`，并把 `uptrap.epc` 改回 **内核的 mepc** ——
+  这正是 oops 显示内核 pc 却由 handler 触发的原因。
+
+### 2. 一次 0.2 秒的复现（新语料程序 `cor_mprv`，替代 25 分钟的启动运行）
+
+把上面这条链缩进一个 bare-metal 程序（S 模式 Sv39 + 内核式非对齐 `ld` + M 模式
+handler 用 `sbi_load_u8` 的方式仿真 + MPRV 的 MPP=S/U/M 三种对照），DiffTest 直接
+把 RTL 与 Spike 对齐：
+
+```
+python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --only cor_mprv --out generated/rv_difftest/corpus
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_mprv
+```
+
+**修前**（RTL）：
+
+```
+DIVERGENCE (value_mismatch) at commit #8339: pc=0x000000008000071c rd=x30
+  golden: 0x0000000a00000880        # MPRV=0, MPP=S
+  dut   : 0x0000000a00020000        # MPRV=1, MPP=U   ← 恢复写入了错的 mstatus
+trap 1 pc=0x8000019e cause=4 insn=0x001bba83      # 内核那条 ld：正确
+trap 2 pc=0x80000728 cause=15 ...                 # 仿真循环内部开始连环出错
+trap 3 pc=0x80000734 cause=13 ...                 # 与 S4 控制台同一形态
+```
+
+`0x0000000a00020000` = `MPRV` 仍置位、`MPP` 变成 U。于是**下一字节的 `lbu` 以 U
+特权翻译内核的 `U=0` 页** ⇒ `cause 13`、`stval = addr+1 = 0x…ca2` —— 与 S4 的 oops
+逐字段吻合（`badaddr …ca2`、`cause 0d`）。
+
+### 3. 根因：被 stall 的消费者丢失生产者的值
+
+* `csrrs rd, csr, rs1` 必须把 **写之前的** CSR 值给 `rd`（`a5` ← 旧 `mstatus`）；
+* `a5` 的寄存器写在 `csrrs` 到达 **WB** 时才落地，而 `csrw`（恢复）在**上一拍**就已
+  经被锁进 EX —— 它的操作数锁存来自"写回落地之前"的一次寄存器堆读取
+  （寄存器堆的 write-first bypass 只覆盖**同一拍**的写回）；
+* EX 的转发网络本来能在 `csrrs` 停留 WB 的那一拍给出正确值，但 `csrw` 被那条
+  **翻译**访问（`lbu` 的走页）卡在 EX 数拍，等它离开 EX 时生产者已经退休，
+  转发窗口关闭，只剩陈旧的锁存值。
+
+即：**任何在 EX 里被 stall、且其生产者先退休的消费者**都可能吃到陈旧操作数。
+这不是 MPRV/CSR 特有的：increment 1 的 `cor_alu` 抓到的"无 stall 形态"、
+`cor_regfile` 的 write-first bypass（同一拍形态）都是同一类问题的另外两种时序。
+三种时序合起来说明：操作数正确性依赖"生产者值可见窗口"与"消费者消费时刻"的
+对齐，而**被 stall 的消费者**是唯一没有被覆盖的情形。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EX as EX slot (csrw mstatus,a5)
+    participant MEM as MEM slot (lbu, translated)
+    participant WB as WB slot (csrrs a5,mstatus,MPRV)
+    participant RF as regfile a5
+    Note over EX,RF: 第 N 拍 — csrrs 在 EX：mstatus |= MPRV，rd 值 0x0a00000880 进 MEM 寄存器
+    Note over EX,RF: 第 N+1 拍 — csrw 进 EX，此刻读 RF(a5) = 0x20000（写回尚未落地）
+    Note over MEM: lbu 开始走页 → mem_wait → 整条流水冻结
+    MEM->>WB: 第 N+2 拍 — csrrs 进 WB：RF(a5) ← 0x0a00000880（write-first 只覆盖同一拍）
+    Note over WB: 第 N+2 拍 WB 转发本可给出正确值，但 EX 被 ex_stall 挡住，写不进去
+    Note over EX: 第 N+3 拍起 — 生产者退休、转发窗口关闭，锁存值仍是 0x20000
+    Note over EX: csrw 最终离开 EX 时写入 mstatus ← (MPRV=1, MPP=U) → 下一次 lbu 以 U 翻译 → cause 13
+    Note over EX,RF: 修复：ex_stall 期间用 wb_we/wb_fp_we 刷新五个操作数锁存
+```
+
+### 4. 修复（`eth_rv_core.sv`，ID/EX 阶段）
+
+`ex_stall` 期间用写回刷新操作数锁存：`ex_rs1_val_r`/`ex_rs2_val_r` 跟随 `wb_we`，
+三个 FP 锁存跟随 `wb_fp_we`。指令**在离开 EX 的那一刻**才真正消费操作数（CSR 写、
+跳转、store data、总线地址），所以"离开时的值"必须正确；转发网络不变，本修复只
+补上"被 stall 的消费者"这个窗口。附带的常驻可观测性：核新增 `err_tval_o`，TB 的
+trap 行现在打印 `tval=`（`+trace_traps` / `+stop_trap_cause`）——`cause 13` 不带
+出错地址是排查翻译问题时最贵的一半。
+
+### 5. S4 上的仪器化证据（修前，`+trace_traps=1`）
+
+修前那次 S4 运行（`Veth_rv_tb +trace_traps=1 +max_cycles=1100000000`，直接跑 TB，
+因为 runner 当时还没有 `tval` 打印）在 ~1.1e9 周期内记下了 12,825 条 trap；失败的
+那一段是**成对重复**的：
+
+```
+ETH_RV_TB: trap 8057 pc=0xffffffff80014c6a cause=4  insn=0x00173703
+ETH_RV_TB: trap 8058 pc=0x000000008000c5cc cause=13 insn=0x00054883
+ETH_RV_TB: trap 8059 pc=0xffffffff80014c6a cause=4  insn=0x00173703
+ETH_RV_TB: trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883
+```
+
+* `0xffffffff80014c6a` = 内核的 `ld a4,1(a4)`，`insn=0x00173703` 完全吻合 ⇒
+  **内核那条非对齐访问的陷阱是对的（cause 4）**；
+* `0x000000008000c5cc` = OpenSBI `sbi_load_u8` 里的 **`lbu a7,0(a0)`**
+  （`insn=0x00054883` 逐位吻合）⇒ **出错的是仿真器自己的字节读取（cause 13）**，
+  不是内核的访问；
+* 两条成对重复 ⇒ 内核重试它的探测，每次都在仿真器的第二个字节上以页错误失败，
+  直到 trap 预算/`attempted to kill init` 收场。
+
+这组数据把追补三的"walk 输入错了"排除干净：`satp`、页表、特权对**内核的**访问
+都是对的（cause 4 正确触发），错的是**第二次**字节读取所带的特权。
+
+### 6. Spike 探针（先探针后写断言）与语料
+
+`cor_mprv` 的每个期望值都是先跑 Spike 读出来的（探针命令与整张表见
+`local://rv13-s4-notes.md` §1c）：S 模式非对齐 `ld` → `cause 4 / tval 0x40000001`；
+字节仿真后 `mstatus = 0x0000_000a_0000_0880`；MPRV 访问在 `MPP=S`/`U`/`M` 下分别是
+**成功读 0x02 / `cause 13` / `cause 5`**（`U=1` 叶 + `MPP=U` 成功、`MPP=S&SUM=0`
+则 `cause 13`）。Spike 侧 `rc=0`，RTL 修后 `MATCH: 9002 commits, 0 divergence`。
+
+至此语料 **26/26**（原 25 + `cor_mprv`）。
+
+### 7. 修复后的验证矩阵
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 语料（beat D 口） | `run_difftest.py --quiet` | **26/26 MATCH**（原 25 全绿 + `cor_mprv`） |
+| 语料（AXI/DRAM D 口） | `run_difftest.py --quiet --dram` | **26/26 MATCH** |
+| harness pytest | `.venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests` | **274 passed** |
+| 核 lint（按 Makefile 的阈值，scoped） | `verilator --lint-only -Wall -Wno-UNUSEDPARAM --top-module eth_rv_core …` | 干净（0 warning） |
+| 形式验证 | `sby -f ethereal-shell/formal/eth_rv_core.sby prove` / `cover` | **PASS（k-induction，rc=0）/ PASS（rc=0）** |
+| S4（beat） | `run_linux_boot.py --rtl --max-cycles=4000000000 --timeout=14400` | 见 §8 |
+| S4（--dram） | `run_linux_boot.py --rtl --dram …` | 见 §8 |
+
+### 8. 里程碑结果（最终数字）
+
+**修前 vs 修后，同一个失败点（决定性证据）。** 失败点在内核 3.7 s 处的
+`check_unaligned_access_emulated` 探测；修前那里是 panic，修后控制台继续往下走：
+
+```
+# 修前（10,296 B 控制台的结尾）
+[    3.723506] cpuidle: using governor menu
+[    3.735048] Unable to handle kernel paging request at virtual address ffffffc60000bca2
+[    3.748508] epc : check_unaligned_access_emulated+0x36/0x58
+[    3.771186] status: 0000000200000100 badaddr: ffffffc60000bca2 cause: 000000000000000d
+[    3.801023] Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b
+
+# 修后（同一命令、同一镜像、同一次探测）
+[    3.723506] cpuidle: using governor menu
+[    4.034572] cpu0: Ratio of byte access time to unaligned word access is 0.01, unaligned accesses are slow
+```
+
+第二行就是那次探测**成功返回**之后 `set_unaligned_access_speed()` 打印的结论
+（"unligned accesses are slow" = 平台会用陷阱+仿真来模拟非对齐访问，正是内核想
+检测到的东西）。也就是说：**S4 的唯一阻塞点已经消除**，内核越过了此前必死的
+`check_unaligned_access_all_cpus()`，继续正常初始化。
+
+**运行状态（本轮预算结束时，如实记录）**
+
+| 运行 | 命令 | 状态 |
+|---|---|---|
+| beat | `python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl --max-cycles=4000000000 --timeout=14400 --rebuild` | **进行中**：控制台 7,646 字节、内核时间 4.03 s（> 修前 panic 的 3.79 s），日志 `/tmp/s4_beat.log`、控制台 `generated/rv_difftest/s4/s4.uart`（live）；`console marker` 尚未出现，故**未宣称命中** |
+| --dram | 同一 runner 加 `--dram` | **未开始**（两条 S4 运行共用 `generated/rv_difftest/s4/`，必须串行） |
+
+计数（commits / cycles / traps / page faults）由 TB 在**结束那一拍**打印到
+`ETH_RV_TB: PASS ...`，因此只有等这次 beat 运行跑到里程碑标记（或预算）才有数字；
+修前的同一位置是：beat 2e9 周期 → 368,009,358 commits、10,296 B 控制台、
+panic（`Attempted to kill init`），1.1e9 周期那次 12,825 条 trap。**如何在被中断后
+继续**：`nohup python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl
+--max-cycles=4000000000 --timeout=14400 > /tmp/s4_beat2.log 2>&1 &`（模型已是最新
+RTL，无需 `--rebuild`；`s4.uart` 会被新运行覆盖，如需保留先复制）；跑完后接着
+`… --rtl --dram`，然后把两行 `ETH_RV_TB: PASS` 填回本表。
+
+### 9. 追补三"下一步"的答复
+
+1. 打印失败点的 MPRV/MPP/satp/PTE：**不需要了**——失败点不在 walk；真正需要的值
+   （`mstatus` 恢复成了什么）由 `cor_mprv` 的 `csrr mstatus` 金标对照直接给出，
+   并留成常驻回归；
+2. cause 13 是"翻译不一致"还是"本该 cause 4"：**都不是**——它是**第二次**字节读取
+   在错误的特权下翻译，`badaddr …a2 = EA+1` 正是这一点；EA 本身（`…a1`）从未被
+   错误翻译；
+3. Spike 探针：已做并记录（见 `local://rv13-s4-notes.md` §1c 的表）；此前"合成
+   S 模式 MPRV 场景对不上 Spike"的结论不适用于本程序——`cor_mprv` 的 MPRV 访问在
+   **M 模式**直接做，Spike 完全可复现，S 模式部分只需要 `medeleg = 0`。
