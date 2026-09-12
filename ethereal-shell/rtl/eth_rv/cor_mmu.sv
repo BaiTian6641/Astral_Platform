@@ -233,6 +233,25 @@ module cor_mmu (
             && (fault_r != eth_rv_pkg::CAUSE_STORE_PAGE)) begin
             assert(1'b0);
         end
+        // A walk carries the access type it was started for, so the cause it
+        // PUBLISHES is one of the two that type can raise: (1, 12) for a fetch,
+        // (5, 13) for a load, (7, 15) for a store. Guarded by the publishing
+        // state, because `fault_r` is a register that outlives its walk (it holds
+        // the previous walk's answer until the next one overwrites it) and only
+        // `done_o` gives it meaning — which is exactly where the core reads it.
+        // The per-type split is what the core's fetch invariant needs.
+        if (state_r == MM_DONE) begin
+            if (acc_r == eth_rv_pkg::ACC_FETCH) begin
+                assert((fault_r == 4'd0) || (fault_r == eth_rv_pkg::CAUSE_INSN_ACCESS)
+                       || (fault_r == eth_rv_pkg::CAUSE_INSN_PAGE));
+            end else if (acc_r == eth_rv_pkg::ACC_LOAD) begin
+                assert((fault_r == 4'd0) || (fault_r == eth_rv_pkg::CAUSE_LOAD_ACCESS)
+                       || (fault_r == eth_rv_pkg::CAUSE_LOAD_PAGE));
+            end else begin
+                assert((fault_r == 4'd0) || (fault_r == eth_rv_pkg::CAUSE_STORE_ACCESS)
+                       || (fault_r == eth_rv_pkg::CAUSE_STORE_PAGE));
+            end
+        end
         cover(done_o && (fault_o == 4'd0));
         cover(done_o && (fault_o == eth_rv_pkg::CAUSE_LOAD_PAGE));
         cover(pte_req_o);
