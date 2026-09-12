@@ -527,7 +527,7 @@ tasks:
     est_days: 4
     deliverable: rtl/mfsm/
     acceptance: 仿真中上位机脚本经 EMRI 驱动完整部署流程；ethctl 无感切换
-    status: in_progress   # 2026-09-13 立项: mFSM（无 CPU、寄存器式、Profile-E）与 E0-SHL1 的 EBI-Tiny 一并落地（计划已把小器件 profile 归入此任务）；交付 `rtl/ebi/ebi_tiny.sv` + mFSM 寄存器面（EMRI ABI，ADR-014/015）+ BFM 随机读写一致性测试；ethctl 侧的无感切换由 E1-BMC4 收口
+    status: done   # 2026-09-13 收官: mFSM + EBI-Tiny（含 E0-SHL1）交付。新增 `rtl/ebi/{ebi_pkg,ebi_tiny}.sv`（单主 32 位 valid/ready 寄存器总线 + 组合地址映射 decoder；6 窗口；未解码/区域越界一律 ready+err 绝不挂死）、`rtl/mfsm/{mfsm_pkg,mfsm_session,mfsm_top}.sv`（**复用 `emri_regfile #(HAS_BMC=0)` 原样**，ADR-015 的"同一 ABI"由构造保证；§5 五状态会话 FSM）。验收证据：E0-SHL1 的 BFM 随机一致性 **TEST PASSED（13,944 checks / 10,000 ops，各窗口提交数==写入数，6 个额外种子全过，Verilator 下同数通过）**；E2-BMC1 的部署流程 **TEST PASSED（320 checks）**：主机→EBI-Tiny→mFSM→OCC→真实 fabric_top 的完整 BLANK→begin_rx→12 字流→VERIFY_REQ→verify→occ_go→OCC DONE→ADR-019 CRC 门控 READBACK→TFF 翻转 + 镜像 B 热替换，另含 abort/无操作/LOCKED/CRC/NEEDS_BLANK 角落与五状态覆盖；**ABI parity sweep：0x00-0x3F + 0x50-0x5F 与 BMC 模式同 OCC 输入逐项比对，仅 `CAPABILITIES`（has_bmc 0/1）一处不同**。金模型 45 pytest，`make test-model` 2831 passed；verilator -Wall 三个 unit 全 0 警告无豁免；Makefile 已接线（RTL_CLEAN + deps + 两条 test-sv）。8 条假设按 G6 以 `// ASSUMPTION (TBD, 2026-09-13)` 落在代码里，规范歧义清单见报告
 
   - id: E2-BMC2
     title: （可选）VexRiscv 备选核 wrapper 验证
