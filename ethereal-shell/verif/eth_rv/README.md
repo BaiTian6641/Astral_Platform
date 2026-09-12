@@ -1244,28 +1244,79 @@ trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883   # ... and faults agai
 `0x8000c5cc` is `sbi_load_u8`'s `lbu` (see §"The stalled-operand hazard"), and the
 `cause 4`/`cause 13` pair repeats until the kernel gives up and panics.
 
+### The PMP/DT defect and the stall dump (increment 13b)
+
+Two harness-level additions, both opt-in:
+
+**`+clint_dump=<cycles>` (testbench) / `--clint-dump=<cycles>` (runner).** One
+line every N cycles with `cycle`, `commits`, `traps`, `console` bytes,
+`mtime`, `mtimecmp`, `mtip`, `mip`, `mie`, `mideleg`, `mstatus`, `priv` and the
+**committed** pc (`cpc` — `imem_addr` is a fetch request and can sit ahead of
+retirement, so a hung-boot dump needs both). It is the only way to separate "the
+kernel programmed a deadline far in the future" from "the CLINT never adopted the
+written `mtimecmp`" from "the interrupt is pending but not taken" once the console
+goes quiet, and it is what ruled all three out for the S4 stall (see the status
+bullet above). Off by default: the corpus never sets it, so no program's trace
+changes.
+
+**`riscv,pmpregions` / `riscv,pmpgranularity` in `eth_rv_linux.dts`.** Spike reads
+the hart's PMP count from the *device tree* and falls back to **0** when the
+property is missing (`riscv/sim.cc` `fdt_parse_pmp_num()` → `set_pmp_num()`;
+`--pmpregions` does not survive that override — verified). The S4 tree never
+declared it, so the golden booted with PMP disabled while the RTL stores 16
+entries (`cor_pmp` pins that storage against Spike), and the two firmware boots
+took different paths at OpenSBI's first PMP probe. The evidence is one
+instruction:
+
+```
+# the DUT's own commit trace vs the golden's, compared pc-by-pc:
+FIRST PC DIVERGENCE at commit #714887:
+  golden pc=0x000000008000c8f0   # __sbi_expected_trap+0x0  (a trap was taken)
+  dut    pc=0x000000008000910e   # sbi_hart_init+0xbc
+$ riscv64-unknown-elf-objdump -d generated/rv_difftest/s4/fw_jump.elf \
+      --start-address=0x8000910e --stop-address=0x80009116
+  8000910e: 3a051073  csrw pmpcfg0,a0      # a0 = 0; Spike traps (cause 2, mtval = this word)
+  8000912:  30559073  csrw mtvec,a1
+# ...and the banners disagree on exactly that:
+#   golden:  Boot HART PMP Count : 0     Boot HART PMP Granularity : 0
+#   DUT:     Boot HART PMP Count : 16    Boot HART PMP Granularity : 4
+```
+
+With the properties in the tree both sides report `16 / 4 / 54` and follow the same
+OpenSBI path. Two consequences worth knowing:
+
+* the golden gets **slower** (Spike scans up to 16 PMP entries per access): the S4
+  Spike boot goes from ~2 s to minutes. It is a reference run; correctness first.
+* the DTB grows (1552 → 1622 B) and the S4 BootROM embeds it, so the *images* must
+  be rebuilt (`build_linux_boot.py`), not just the Verilator model.
+
+`test_linux_dts_declares_the_hart_pmp_profile` pins the property, because a tree
+without it silently degrades the golden to a different machine.
+
 ### Boundaries of the S4 profile (read before trusting a number)
 
-* **`mtime` is not a diffable quantity yet, and the older note that called this a
-  post-trap boundary was WRONG.** The firmware already diverges, with no trap in
-  sight: `cor_misalign`-era measurement of the S4 firmware found the first
-  divergence at commit #714,988 (`pc=0x8000a6dc`, an `mtime` read: Spike `0x1c20`
-  vs DUT `0x1bbc`). The arithmetic says the **DUT is right and Spike is the one that
-  drifts**: with the CLINT's `50`-per-`5000`-step staircase the DUT's value is exactly
-  `50 * floor((714988 - 5) / 5000) = 7100`, i.e. one tick per 100 *retired*
-  instructions, while Spike's `7200` needs at least 720,000 retired instructions when
-  only 714,983 had happened. Spike's CLINT advance is therefore driven by its
-  `idle()`/`step(INTERLEAVE)` loop rather than by the retired-instruction count, and
-  any iteration truncated early makes its `mtime` run *ahead*. No hart-side strobe can
-  reproduce that, so the honest statement is that `mtime`/`time` is not a comparable
-  signal **at all** for a run whose golden is Spike with a bounded or trap-crossing
-  step loop — and that every `rdtime`/`time` value and every printk timestamp of a
-  long run is off accordingly. (`step_o`'s `!mem_trap` term is *correct* for
-  "retired": an instruction squashed by an older trap does not retire.) The S4
-  console's kernel timestamps diverge from Spike's at ~0.0003 s (10 µs) for the same
-  reason: read the console for text, never for the timestamps, and do not ask the
-  firmware DiffTest to compare an `mtime`-derived value (it stops at commit #714,988
-  for exactly this, on the golden side).
+* **The firmware DiffTest's first divergence was the PMP probe, not `mtime`**
+  (found in increment 13b, see "the PMP/DT defect" below). It is at commit
+  #714,887: the DUT retires OpenSBI's `csrw pmpcfg0, a0` (`0x8000910e`,
+  `sbi_hart_init+0xbc`) while Spike takes `cause 2` on that same instruction,
+  because **Spike reads its PMP count out of the DEVICE TREE**
+  (`riscv/sim.cc` `fdt_parse_pmp_num()`, property `riscv,pmpregions`) and falls
+  back to 0 when the property is absent — which our `eth_rv_linux.dts` was. The
+  golden therefore booted with PMP off ("Boot HART PMP Count : 0") while the RTL
+  (16 entries, `cor_pmp`-pinned) took OpenSBI's PMP path, and after that commit
+  the two sides are running *different programs*. Fixing the tree
+  (`riscv,pmpregions = <16>` + `riscv,pmpgranularity = <4>`) removed this whole
+  class; the older `mtime` arithmetic is still true but is a **cadence** artifact:
+  the boot profile's `mtime` is 1:1 with the clock, so the DiffTest must build its
+  own model with the CLINT's Spike cadence (`--difftest` ->
+  `build_model(..., spike_cadence=True)`, `obj_s4_fw`) before any `time` value can
+  be compared at all.
+  The old arithmetic (DUT `0x1bbc` = `50 * floor((714988 - 5) / 5000)`) was worked
+  out on two *diverged* streams — every commit after #714,887 in that pair is
+  PMP-path firmware against no-PMP firmware — so it says nothing about `mtime`.
+  With the tree fixed and the Spike cadence compiled in, the firmware DiffTest is
+  the arbiter again, and `rdtime`/`time` values (and every console timestamp of a
+  long run) are comparable exactly as far as that DiffTest matches.
 * **Console bit rate.** Spike's ns16550 writes a THR store straight out with LSR
   permanently `TEMT|THRE`; the DUT shifts bytes at 16 cycles/bit and cannot
   back-pressure a writer that trusts THRE, so the S4 build sizes the transmit/receive
@@ -1278,28 +1329,30 @@ trap 8060 pc=0x000000008000c5cc cause=13 insn=0x00054883   # ... and faults agai
   not a correctness one.
 * **`timebase-frequency`/`clock-frequency` remain DiffTest placeholders** (10 MHz), and
   the DT says so. The kernel's BogoMIPS/baud numbers derived from them are fiction.
-* **Current status (2026-09-12, night):** Phase 1 (Spike → userspace) passes; the RTL no
-  longer dies where it used to, and the misaligned-access probe the whole blocker was
-  about now succeeds (`…cpuidle: using governor menu` is followed by
-  `cpu0: Ratio of byte access time to unaligned word access is 0.01, unaligned accesses
-  are slow` instead of the old `Kernel panic`). Three RTL fixes got it there, all
-  corpus- or Spike-verified: the CLINT `mtime` cadence is a per-build choice
-  (`CLINT_RTC_TICK_STEPS/ADVANCE`, 1/1 for S4), `mstatus.MPRV` translates M-mode data
-  accesses, and the EX operand latches are refreshed from the write-back while the stage
-  is held ("The stalled-operand hazard, the S4 blocker, and `cor_mprv`" below).
-  **The console marker is still NOT reached**, and the remaining blocker is a
-  *simulation-time* one, in a different class from the old one: `mtime` is advanced by
-  retired instructions (`step_o`), so it freezes during `wfi` — every `udelay` (busy
-  wait) worked, but the first real `msleep`/idle leaves the hart in `arch_cpu_idle`
-  waiting for a timer that can never fire. A 4×10⁹-cycle beat run ends there:
-  4,000,000,002 cycles, 552,228,689 commits, 10,544 console bytes (88% of Spike's
-  11,928), last line `printk: legacy bootconsole [ns16550a0] disabled`, stop pc
-  `arch_cpu_idle+0x10`, no oops. The fix belongs in the S4 build's clock drive (pulse
-  the CLINT from simulation cycles, not retirements — the TB's `step_i`, no RTL change),
-  after which the run should go to the marker (budget ≳6×10⁹ cycles; ~1.4×10⁹ of the
-  first 4×10⁹ went into the kernel's asymmetric-key verification, i.e. the no-TLB
-  throughput cost). `--dram` has not been run yet (the two share `generated/rv_difftest/s4/`
-  and must be serial). Corpus **26/26 MATCH** on both D-port paths, `eth_rv_core.sby`
-  prove+cover PASS, harness pytest 274 passed. Evidence and commands:
-  `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` (`追补四`) and
-  `local://rv13-s4-notes.md`.
+* **Current status (2026-09-12, increment 13b):** the S4 blocker turned out to be a
+  one-number regression in this tree plus one harness mismatch, both fixed:
+
+  * **`timebase-frequency`.** With the boot profile's 1:1 `mtime` cadence, a HZ=1000
+    kernel tick is `timebase/1000` cycles long, so increment 13's `130000` gave a
+    tick every **130 cycles** — a tick storm the kernel cannot make progress under.
+    It is not an RTL behaviour: *Spike* deadlocks the same way with the same tree
+    (823 s, never reaches the milestone, console stops mid-line at `/init: `), and
+    swapping only the timebase back to **10 MHz** (which is
+    `rv_platform.TIMEBASE_FREQUENCY`, the value the platform constant always had)
+    makes Spike reach the milestone in **4.95 s / 11,930 B**. 130 kHz was therefore
+    the regression the previous increment introduced, and the RTL's "stall after
+    `sched_clock`" was its symptom.
+  * **`riscv,pmpregions`** in the tree (see the PMP/DT section): the golden had been
+    running with PMP disabled while the RTL has 16 entries, so the firmware
+    DiffTest diverged at commit #714,887 and the two banners disagreed.
+
+  With both fixed: Phase 1 passes (4.95 s, 11,930 B, `MILESTONE-REACHED`, PMP
+  16/4/54, `aclint-mtimer @ 10000000Hz`), Spike and the RTL take the same OpenSBI
+  path, and the firmware DiffTest's cadence mismatch is gone (`--difftest` builds
+  the Spike-cadence model). The instrumented stall values (`+clint_dump`) that
+  localized this are in the report's `追补六`: `mtime` 1:1 with the clock,
+  `mtimecmp = 0xffff…ff` (never programmed), `mip = 0`, `mie = 0x008`, `priv = S`,
+  `mstatus.SIE = 0`. Corpus **26/26 MATCH** on both D-port paths, `eth_rv_core.sby`
+  prove+cover PASS, harness pytest 275 passed. Evidence and commands:
+  `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` (`追补六`) and
+  `local://rv13b-s4-notes.md`.

@@ -250,10 +250,27 @@ def run_spike_milestone(
 # --- RTL --------------------------------------------------------------------------
 
 
-def build_model(out: Path, *, dram: bool, line_beats: int, rebuild: bool) -> Path:
-    """Verilate the S4 testbench: 40 MiB window, the S4 ROM word layout."""
+def build_model(
+    out: Path, *, dram: bool, line_beats: int, rebuild: bool, spike_cadence: bool = False
+) -> Path:
+    """Verilate the S4 testbench: 40 MiB window, the S4 ROM word layout.
+
+    Two cadences, because the two S4 modes want opposite things from `mtime`:
+
+    * the BOOT profile (`spike_cadence=False`) compiles `mtime` 1:1 with the
+      simulation clock, which is what a kernel's delay/idle loops need (see the
+      two comments on the defines below);
+    * the FIRMWARE DiffTest profile (`spike_cadence=True`) keeps the CLINT's
+      default Spike cadence — one tick per 100 retired instructions — because
+      that is the only configuration in which the golden's `time` reads are
+      comparable at all. Comparing the boot profile's `mtime` against Spike's is
+      what the previous increment's "mtime is not diffable" boundary actually
+      measured: a cadence mismatch, not an architectural one.
+    """
     verilator = _tool("verilator")
-    mode = f"dram{line_beats}" if dram else "beat"
+    # `fw_` prefixes the firmware-DiffTest profile; the boot profile's directory
+    # names are unchanged (`obj_s4_beat` / `obj_s4_dram<beats>`).
+    mode = ("fw_" if spike_cadence else "") + (f"dram{line_beats}" if dram else "beat")
     obj_dir = out / f"obj_s4_{mode}"
     exe = obj_dir / "Veth_rv_tb"
     sources = [*RTL_SOURCES, *(DRAM_SOURCES if dram else []), TB_SOURCE]
@@ -265,22 +282,26 @@ def build_model(out: Path, *, dram: bool, line_beats: int, rebuild: bool) -> Pat
     defines = [
         f"-DETH_RV_MEM_BYTES={rv_platform.LINUX_RAM_WINDOW_BYTES}",
         f"-DETH_RV_CLINT_PRELOAD={SPIKE_STUB_STEPS}",
-        # mtime 1:1 with retired instructions: a Linux kernel's delay loops wait on the
-        # timebase, and Spike's 1-tick-per-100-instructions cadence turns every microsecond
-        # of udelay into ~100x the instructions (measured: the boot stalls in __delay).
-        "-DETH_RV_CLINT_TICK_STEPS=1",
-        # ...and the tick strobe itself comes from the simulation clock, not from
-        # retirements: an idle hart in wfi retires nothing, so a retirement strobe
-        # freezes mtime and the first msleep/idle hangs the boot (measured: the hart
-        # ends in arch_cpu_idle with the console silent).
-        "-DETH_RV_CLINT_CYCLE_STEP",
-        "-DETH_RV_CLINT_TICK_ADVANCE=1",
         f"-DETH_RV_ROM_ENTRY_WORD={rv_platform.LINUX_ROM_ENTRY_WORD}",
         f"-DETH_RV_ROM_STUB_WORD={rv_platform.LINUX_ROM_STEP_WORD}",
         # The console queue (see the TB): a boot's printk bursts far exceed the
         # corpus's few bytes.
         f"-DETH_RV_UART_FIFO_DEPTH={LINUX_UART_FIFO_DEPTH}",
     ]
+    if not spike_cadence:
+        defines += [
+            # mtime 1:1 with retired instructions: a Linux kernel's delay loops wait
+            # on the timebase, and Spike's 1-tick-per-100-instructions cadence turns
+            # every microsecond of udelay into ~100x the instructions (measured: the
+            # boot stalls in __delay).
+            "-DETH_RV_CLINT_TICK_STEPS=1",
+            # ...and the tick strobe itself comes from the simulation clock, not from
+            # retirements: an idle hart in wfi retires nothing, so a retirement strobe
+            # freezes mtime and the first msleep/idle hangs the boot (measured: the hart
+            # ends in arch_cpu_idle with the console silent).
+            "-DETH_RV_CLINT_CYCLE_STEP",
+            "-DETH_RV_CLINT_TICK_ADVANCE=1",
+        ]
     if dram:
         defines += ["-DETH_RV_DRAM_AXI", f"-DETH_RV_LINE_BEATS={line_beats}"]
     argv = [
@@ -313,6 +334,7 @@ def rtl_argv(
     max_cycles: int,
     max_traps: int,
     stop_trap_cause: int | None = None,
+    clint_dump: int = 0,
 ) -> list[str]:
     """The S4 testbench plusargs (the boot contract, one place)."""
     argv = [
@@ -342,6 +364,12 @@ def rtl_argv(
         # beat-build boot the declared kind is 9 (SBI ecalls), so the run ends at the
         # trap nobody asked for instead of somewhere in the last 10^9 cycles.
         argv += ["+trace_traps=1", f"+stop_trap_cause={stop_trap_cause}"]
+    if clint_dump != 0:
+        # `+clint_dump=<cycles>`: the diagnostic CLINT/interrupt dump (default off).
+        # A stalled boot's console cannot say whether the timer's deadline is too far
+        # away, whether the written mtimecmp was adopted, or whether the pending bit
+        # never became an interrupt; one line per N cycles carries all three.
+        argv.append(f"+clint_dump={clint_dump}")
     return argv
 
 
@@ -581,6 +609,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--quiet", action="store_true", help="only the summaries")
+    parser.add_argument(
+        "--clint-dump",
+        type=int,
+        default=0,
+        metavar="CYCLES",
+        help=(
+            "print the CLINT/interrupt dump every CYCLES cycles (diagnostic; 0 = off). "
+            "It carries mtime/mtimecmp, mip/mie/mideleg/mstatus and the pc, which is "
+            "what splits 'no timer tick arrived' into its distinct causes"
+        ),
+    )
     args = parser.parse_args(argv)
     modes = {"spike": args.spike, "rtl": args.rtl, "difftest": args.difftest}
     if args.all:
@@ -607,6 +646,7 @@ def main(argv: list[str] | None = None) -> int:
                 exe, out=S4_DIR, manifest=manifest, trace=None, stop_pc=None,
                 max_cycles=args.max_cycles, max_traps=args.max_traps,
                 stop_trap_cause=args.stop_trap_cause,
+                clint_dump=args.clint_dump,
             )
             print("[s4] RTL boot: 40 MiB window, console-marker stop ...", flush=True)
             wall, status, console = run_rtl(
@@ -620,7 +660,15 @@ def main(argv: list[str] | None = None) -> int:
                 _compare_console(spike_console, console, summary)
         if modes["difftest"]:
             write_memory_image(S4_DIR, manifest, rebuild=args.rebuild)
-            exe = build_model(S4_DIR, dram=False, line_beats=args.axi_line_beats, rebuild=args.rebuild)
+            # The firmware DiffTest compares values, and the one value the boot
+            # profile deliberately changes is `time`: this mode therefore builds the
+            # Spike-cadence model (see build_model), which is the only way the two
+            # sides' `mtime` reads can agree. Without it the comparison stops at the
+            # first `rdtime` for a cadence reason and looks like an architectural one.
+            exe = build_model(
+                S4_DIR, dram=False, line_beats=args.axi_line_beats, rebuild=args.rebuild,
+                spike_cadence=True,
+            )
             summary["difftest"] = run_difftest(
                 exe, S4_DIR, manifest, timeout=args.timeout, max_traps=args.max_traps,
                 max_cycles=args.max_cycles,

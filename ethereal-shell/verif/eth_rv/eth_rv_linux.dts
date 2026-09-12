@@ -75,10 +75,17 @@
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
-		/* The simulation's own retired-instruction rate, measured (~130k/s): with the
-		 * 1:1 mtime cadence this makes the kernel's notion of time match the model.
-		 * A board build replaces this with the real SoC clock. */
-		timebase-frequency = <130000>;
+		/* DiffTest placeholder, and the value the golden is run with: the kernel's
+		 * HZ=1000 tick is 1 ms, i.e. `timebase-frequency / 1000` mtime ticks. With
+		 * the S4 CLINT cadence (`mtime` 1:1 with the simulation clock) a 130 kHz
+		 * timebase makes a tick 130 cycles long — a tick storm the kernel cannot
+		 * make progress under: the boot deadlocks right after `Run /init as init
+		 * process` in *Spike* too (reproduced) and never arms a timer in the RTL.
+		 * 10 MHz gives 10,000 cycles (~1,700 instructions at the measured IPC) per
+		 * tick, which boots to the milestone on both sides. It is also what Spike's
+		 * own auto-generated DTS used as its placeholder, so no golden comparison
+		 * changes meaning when a board swaps in the real SoC clock. */
+		timebase-frequency = <10000000>;
 
 		cpu@0 {
 			device_type = "cpu";
@@ -87,6 +94,18 @@
 			status = "okay";
 			riscv,isa = "rv64imafdc_zicsr_zicntr";
 			mmu-type = "riscv,sv39";
+			/* The hart HAS 16 PMP entries (`eth_rv_core` stores pmpcfg0..15 and
+			 * pmpaddr0..15; `cor_pmp` pins that storage against Spike). Spike reads
+			 * these two properties out of the DTB and they OVERRIDE its
+			 * `--pmpregions` default: with them absent the golden runs with
+			 * `n_pmp = 0` (riscv/dts.cc `fdt_parse_pmp_num` returns -ENODEV and
+			 * sim.cc falls back to 0), so OpenSBI's `csrw pmpcfg0` probe traps with
+			 * cause 2 on the Spike side only and the two sides' firmware boots take
+			 * different paths ("PMP Count: 0" vs 16 in the banner). The values are
+			 * Spike's own auto-DTS values, which is what the corpus's
+			 * `dtb=spike-auto` runs have always used. */
+			riscv,pmpregions = <16>;
+			riscv,pmpgranularity = <4>;
 
 			cpu0_intc: interrupt-controller {
 				#interrupt-cells = <1>;

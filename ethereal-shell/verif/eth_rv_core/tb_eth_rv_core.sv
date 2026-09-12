@@ -428,6 +428,15 @@ module tb_eth_rv_core;
     // last 10^9 cycles" is the most a log can say, because the trap trace is
     // hundreds of thousands of lines long and the interesting one is the last.
     int unsigned stop_trap_cause;
+    // `+clint_dump=<cycles>`: diagnostic only, DEFAULT OFF (0 = no output, no cost).
+    // One line every N cycles carrying the values a stalled boot needs and the
+    // console cannot show: the CLINT's `mtime`/`mtimecmp` (is the deadline far away,
+    // or was the written value never adopted?), the hart's interrupt CSRs (pending =
+    // mip & mie, and is the source delegated?) and the fetch address. It is how
+    // "the hart waits for a tick that never arrives" is split into its three
+    // distinct causes. The corpus never sets it, so no program's trace changes.
+    int unsigned clint_dump_cycles;
+    int unsigned clint_dump_cnt;
     bit          stop_trap_cause_en;
 
     // ------------------------------------------------------------------ memory
@@ -583,6 +592,12 @@ module tb_eth_rv_core;
         wire clint_step = step_strobe;
     `endif
     logic [63:0] clint_mtime;   // the CLINT's mtime register == the `time` CSR
+    // The pending-interrupt view a `csrr mip` returns: the core's own `mip_eff` is
+    // its software-writable register ORed with the CLINT/PLIC lines, so the same
+    // composition is repeated here (diagnostic only, `+clint_dump`).
+    wire [11:0] mip_dump = u_dut.csr_mip_r[11:0]
+                           | (msip ? 12'h008 : 12'h000) | (mtip ? 12'h080 : 12'h000)
+                           | (meip ? 12'h800 : 12'h000) | (seip ? 12'h200 : 12'h000);
     logic [63:0] rom_entry;     // the payload entry the BootROM will jump to
     logic [13:0] rom_steps;     // the stub's instruction count, from the ROM image
 
@@ -1244,6 +1259,11 @@ module tb_eth_rv_core;
     logic [63:0] last_mem_paddr;   // ... its physical address (Sv39 runs differ)
     logic [63:0] last_store_data;
     logic [31:0] last_insn;
+    // The last COMMITTED pc and privilege, which is what "where is the hart" means
+    // when the pipeline is stalled: `imem_addr` is a fetch request and can sit
+    // ahead of (or behind) retirement, so a hung-boot dump needs both.
+    logic [63:0] last_commit_pc;
+    logic [1:0]  last_commit_priv;
     int unsigned cycle_cnt;
     bit          stop_now;
     bit          failed;
@@ -1384,6 +1404,8 @@ module tb_eth_rv_core;
             last_mem_paddr  <= 64'd0;
             last_store_data <= 64'd0;
             last_insn       <= 32'd0;
+            last_commit_pc  <= 64'd0;
+            last_commit_priv <= 2'd0;
             cycle_cnt       <= 0;
             stop_now        <= 1'b0;
             failed          <= 1'b0;
@@ -1413,6 +1435,20 @@ module tb_eth_rv_core;
                 progress_cnt <= 0;
                 $display("ETH_RV_TB_INFO: progress cycle=%0d commits=%0d traps=%0d pgfaults=%0d console=%0d pc=0x%016x",
                          cycle_cnt, commits, traps, n_pgfaults, rx_nbytes, imem_addr);
+            end
+
+            // ---- CLINT/interrupt dump (`+clint_dump`, diagnostic only) --------
+            // `mtimecmp` is read from the CLINT instance: it is the deadline the
+            // hardware actually holds, which is the whole point of the knob (the
+            // console can only say "no tick arrived").
+            clint_dump_cnt <= clint_dump_cnt + 1;
+            if ((clint_dump_cycles != 0) && (clint_dump_cnt >= clint_dump_cycles)) begin
+                clint_dump_cnt <= 0;
+                $display("ETH_RV_TB_CLINT: cycle=%0d commits=%0d traps=%0d console=%0d mtime=0x%016x mtimecmp=0x%016x mtip=%0d mip=0x%03x mie=0x%03x mideleg=0x%03x mstatus=0x%016x priv=%0d cpc=0x%016x %0d",
+                         cycle_cnt, commits, traps, rx_nbytes,
+                         clint_mtime, u_mmio.u_clint.mtimecmp_r, mtip,
+                         mip_dump, u_dut.csr_mie_r[11:0], u_dut.csr_mideleg_r[11:0],
+                         u_dut.csr_mstatus_r, u_dut.csr_priv_r, last_commit_pc, last_commit_priv);
             end
 
             // ---- wedge guard: every port request is answered (see the comment
@@ -1532,6 +1568,8 @@ module tb_eth_rv_core;
                 if (started_now_rec) begin
                     commits <= commits + 1;
                     last_insn <= rvfi_insn;
+                    last_commit_pc <= rvfi_pc;
+                    last_commit_priv <= u_dut.csr_priv_r;
                     if (rvfi_insn[1:0] != 2'b11) begin
                         n_compressed <= n_compressed + 1;
                     end
@@ -1712,6 +1750,7 @@ module tb_eth_rv_core;
         uart_marker_hex   = "";
         marker_len        = 0;
         progress_cycles   = 0;
+        clint_dump_cycles = 0;                         // diagnostic dump: off by default
         // `marker_pos`/`marker_hit` are the receiver's own state and are cleared
         // by that block's reset branch (see the marker match), like every other
         // register this testbench owns.
@@ -1749,6 +1788,7 @@ module tb_eth_rv_core;
         void'($value$plusargs("rom_dtb=%d", rom_dtb));
         void'($value$plusargs("uart_marker=%s", uart_marker_hex));
         void'($value$plusargs("progress=%d", progress_cycles));
+        void'($value$plusargs("clint_dump=%d", clint_dump_cycles));
         stop_trap_cause_en = ($value$plusargs("stop_trap_cause=%d", stop_trap_cause) != 0);
         // `+uart=<file>` is also opened HERE, before anything can abort, and every
         // received byte is written and flushed as it arrives. The structured record

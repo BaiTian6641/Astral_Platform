@@ -533,3 +533,135 @@ RvIncr13 的结论与本轮复现：4e9 周期运行停在 **`arch_cpu_idle+0x10
 修复（TB 级，`-DETH_RV_CLINT_CYCLE_STEP`，语料档不启用）与配套：`mtime` 改由**仿真周期**推进（真实自由运行计数器的行为）；DTB 的 `timebase-frequency` 必须在**重新生成镜像**后才是 130000（此前多轮用的是旧 DTB 的 10 MHz —— `--rebuild` 只重建 Verilator 模型，**不会**重建 DTB/ROM；`dtc -I dtb -O dts` 已确认现在为 `0x1fbd0`）。效果：控制台到达 5,865 B 只需 ~8 分钟（此前 100 分钟才 10,544 B），且内核明确接受时基（`sched_clock: 64 bits at 130kHz` + 可用的 `riscv_clocksource`）。
 
 **仍未达里程碑**：本轮最新一次运行停在 **`jiffies_read+0x6`**（同一换算），即内核在**忙等 tick（jiffies）** ⇒ **定时中断未再触发**（此前 MTI/STI 风暴证明投递通路本身可用）。下一步：在该点打印 `mtime`/`mtimecmp`/`mip`/`mie`/`mideleg` 与最后一次 `sbi_set_timer` 的实参（SBI ecall 的 a0/a1 可从 trap 记录恢复），判定是"内核把 deadline 设得过远"还是"我们写的 mtimecmp 未被 CLINT 采用"；TT 的 `+stop_trap_cause` 与符号化流程（见上）可直接复用。
+
+## 追补六：两个真实缺陷（时基档位 + PMP/DT）、仪器化，以及里程碑（2026-09-12 深夜，increment 13b）
+
+### 结论先行
+
+追补五把 S4 的 `timebase-frequency` 改成 **130000** 并宣称"控制台到 5,865 B 只需 8 分钟" —— **那次改动本身就是本轮找到的最大缺陷**：在 1:1 的 `mtime` 节拍下，130 kHz 时基意味着内核 HZ=1000 的每个 tick 只有 **130 个周期**长 ⇒ tick 风暴 ⇒ **内核死锁**。这不是 RTL 的错：把同一棵 DT 交给 Spike，Spike 也在 `Run /init as init process` 之后、第一条用户态命令处死掉（`/init: ` 半行输出后控制台永久静默，823 s 未到里程碑）。改回 **10 MHz**（= `rv_platform.TIMEBASE_FREQUENCY`，平台常量本来就是它，130000 反而与常量不一致）后：
+
+* **Spike（Phase 1）4.95 s 到里程碑、11,930 B 控制台、`MILESTONE-REACHED`**（`Platform Timer Device: aclint-mtimer @ 10000000Hz`、`sched_clock: 64 bits at 10MHz`）；
+* 固件段 DiffTest 的第一个分叉点（见下）被消除。
+
+第二个缺陷是**固件段 DiffTest 的诚实边界**：**Spike 的 PMP 区数来自设备树**（`riscv/sim.cc` 的 `fdt_parse_pmp_num()` 读 CPU 节点的 `riscv,pmpregions`，失败就 `set_pmp_num(0)`；`--pmpregions` 会被这个结果**覆盖**，实测无效）。我们的 `eth_rv_linux.dts` 从来没写这个属性 ⇒ **golden 以 0 个 PMP 区运行，而 RTL 存有 16 个**（`cor_pmp` 已把这份存储钉在 Spike 的 auto-DTS 行为上）⇒ OpenSBI 在第一条 PMP 探针处走上**不同分支**，两侧此后跑的是**不同的固件程序**（Spike 的固件段到内核入口是 4,806,615 条提交，DUT 是 4,256,428 条），且 banner 明着不同（`Boot HART PMP Count : 0` vs `16`）。追补四把 #714,988 的分叉归因于 "mtime 漂移" 是**错的**：那是两段已经分叉的流在比 mtime。
+
+### 1. 缺陷证据（一条指令定位）
+
+```
+# 用 DUT 自己的提交 trace 与 golden 的 pc 列逐条比对：
+FIRST PC DIVERGENCE at commit #714887:
+  golden pc=0x000000008000c8f0   # __sbi_expected_trap+0x0（Spike 陷入了）
+  dut    pc=0x000000008000910e   # sbi_hart_init+0xbc
+$ riscv64-unknown-elf-objdump -d generated/rv_difftest/s4/fw_jump.elf \
+      --start-address=0x8000910e --stop-address=0x80009116
+  8000910e: 3a051073  csrw pmpcfg0,a0      # a0=0；Spike 抛 cause 2，mtval 正是这条指令
+  80009112: 30559073  csrw mtvec,a1
+```
+
+golden 的 trap 处理器读回的 `mcause = 2`、`mtval = 0x3a051073` 与该指令逐位吻合 ⇒ **Spike 侧陷入、DUT 侧不陷入**，与两侧 banner 的 PMP 行完全一致。修复：CPU 节点加 `riscv,pmpregions = <16>;` + `riscv,pmpgranularity = <4>;`（正是 Spike 自己 auto-DTS 的值，也正是语料 `dtb=spike-auto` 一直在用的值）。DTB 1552 → 1622 B，BootROM 内嵌 DT ⇒ **必须重跑 `build_linux_boot.py`**（`--rebuild` 只重建 Verilator 模型）。永久回归测试：`test_linux_dts_declares_the_hart_pmp_profile`。
+
+代价：golden 变慢（Spike 每次访问要线性扫 16 个 PMP 区）：S4 的 Spike 启动从 ~2 s 变成 ~5 s（仍在可接受范围）。
+
+### 2. 时基档位（真正的阻塞点）
+
+`timebase-frequency` 与内核 tick 的关系是**算术**：HZ=1000 的 tick = 1 ms = `timebase/1000` 个 `mtime` tick；S4 档的 `mtime` 1:1 跟随仿真周期 ⇒ 130 kHz 时基下每个 tick 只值 130 个周期（IPC≈0.17 ⇒ 约 22 条指令！）。
+
+```
+# 同一棵 DT、同一对镜像，只换时基；Spike 侧（与 RTL 无关，纯软件）：
+timebase=130000   -> [  114.519615] Run /init as init process
+                     /init:  <—— 半行之后永久静默，823 s 未到里程碑
+timebase=10000000 -> [    0.314980] Run /init as init process
+                     eth_rv S4: MILESTONE-REACHED      (4.95 s wall, 11,930 B)
+# 另外：只去掉 PMP 属性、保留 130 kHz 同样死锁（⇒ 与 PMP 无关）；
+#       保留 PMP、改回 10 MHz 则命中里程碑（⇒ 时基就是唯一变量）。
+```
+
+即：**追补五"改成 130 kHz"是本切片真正的回归**；把它改回 `rv_platform.TIMEBASE_FREQUENCY`（10 MHz）后 Phase 1 立刻恢复，并且 RTL 侧也不再在"时钟注册处"卡死（见 §4 的运行结果）。
+
+### 3. 交付的仪器化（默认关）
+
+* **TB `+clint_dump=<cycles>`**：每 N 周期一行
+  `cycle/commits/traps/console/mtime/mtimecmp/mtip/mip/mie/mideleg/mstatus/priv/cpc`。
+  `cpc` 是**已提交**的 pc（`imem_addr` 是取指请求，可能领先于退休，两者都要看）。
+  它把"内核把 deadline 设得很远"/"我们没采纳写入的 `mtimecmp`"/"pending 但没投递"三种可能一次分开 —— 本轮实测值（130 kHz 档、冻结期）：
+  `mtime = cycle - 16384`（1:1 跟随仿真时钟 ✓）、`mtimecmp = 0xffff…ff`（**从未被写过任何 deadline**）、`mip = 0`（**没有 pending**）、`mie = 0x008`（只有 MSIE，无 MTIE）、`priv = 1`、`mstatus.SIE = 0`。
+  ⇒ **三种假设全部排除**：CLINT 无辜，内核根本没走到第一次 `sbi_set_timer`。
+* **运行器 `--clint-dump=<cycles>`** 把上面这个开关接出来（默认 0 = 关闭，语料档永不启用）。
+* **两套节拍**：`--difftest` 现在自己建 **Spike 节拍**的模型
+  （`build_model(..., spike_cadence=True)` → `obj_s4_fw`：TICK 5000/50、按退休脉冲、不加 `ETH_RV_CLINT_CYCLE_STEP`），boot 档仍是 1:1 周期驱动。理由：DiffTest 比的是**值**，而 boot 档故意改掉的唯一值就是 `time`；不分开的话比较会在第一个 `rdtime` 处因**节拍**而停，看起来却像架构差异 —— 这正是旧 "mtime 不可比" 边界的真相。
+
+### 4. 运行结果
+
+| 运行 | 命令 | 结果 |
+|---|---|---|
+| Spike（Phase 1，修复后） | `run_linux_boot.py --spike` | **4.95 s wall / 11,930 B / MILESTONE-REACHED**（PMP 16/4/54、10 MHz） |
+| RTL beat（6e9 预算） | `run_linux_boot.py --rtl --max-cycles=6000000000` | 见 §4b |
+| RTL `--dram` | 同上加 `--dram` | 串行；见 §4b |
+| 固件段 DiffTest | `run_linux_boot.py --difftest` | 见 §4c |
+| 语料（beat / AXI-DRAM） | `run_difftest.py --quiet [--dram]` | **26/26 MATCH / 26/26 MATCH** |
+| 形式验证 | `sby -f eth_rv_core.sby prove` / `cover` | 见 §5 |
+| harness pytest | `.venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests` | 见 §5 |
+
+### 4b. RTL 运行（固定时基后）
+
+修复后的 beat 运行在本会话结束前**仍在进行**，因此本轮**不宣称 RTL 侧命中里程碑**：
+
+```
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl \
+    --max-cycles=6000000000 --timeout=10800        # /tmp/s4_marker.log
+```
+
+启动于 23:54（固定后的 DT：10 MHz + PMP 16/4/54），到 23:55:47 控制台已达 **4,532 字节**
+（越过 130 kHz 档长期冻结的 `mem auto-init`/4,462 处），仍在推进。预算 6e9 周期
+（约 1.7 h @ ~0.6 M cycles/s），判据仍是 `console marker … seen` +
+`s4.uart` 里出现 `eth_rv S4: MILESTONE-REACHED`。
+
+为什么不可能在 130 kHz 档命中：那是 Spike 也会死锁的配置（§2），所以**只要 RTL 侧
+继续用 130 kHz，任何预算都到不了里程碑**；改成 10 MHz 后，Spike 4.95 s 命中，
+RTL 的等价代价约 ~1.9e9 周期（315M 条内核指令 @ IPC≈0.17，即 ~50 分钟）。
+
+被本会话**终止**的、上一轮遗留的 4e9 周期 beat 运行（22:20 启动，装载的是 130 kHz 的
+旧镜像）：它的控制台在 **5,865 字节处冻结超过 1 小时**（`/proc/<pid>/fdinfo` 的
+file offset 不变）——这正是"卡死而非只是慢"的直接证据；该运行的 `s4.uart` 记录也被
+本会话的若干次 runner 运行截断过（同一路径），所以它的控制台文本不可用，其
+`run/s4.rtl.console`（运行器最后写入的 TB stdout）才是可信的 PASS/FAIL 行。
+
+### 4c. 固件段 DiffTest（固定 DT + Spike 节拍）
+
+**排在 RTL beat 运行之后**（两者共用 `generated/rv_difftest/s4/s4.uart`，必须串行；本轮
+不再制造第二个把在线记录截断的进程）：
+
+```
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --difftest
+# -> build_model(..., spike_cadence=True) 建 obj_s4_fw（Spike 节拍，无 CYCLE_STEP）
+# -> DUT 跑到 stop_pc=0x80200000（内核入口），golden 用 --instructions 截断
+```
+
+预期：PMP 属性补上后，第一个分叉点不再是 #714,887 的 PMP 探针；剩下的边界只可能是
+`mtime`/trap 相关的已知量（在两套节拍一致的前提下，DiffTest 现在才是真正的仲裁者）。
+
+### 5. 门禁与文件
+
+本轮实际复跑：
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 语料（beat D 口） | `run_difftest.py --quiet` | **26/26 MATCH** |
+| 语料（AXI/DRAM D 口） | `run_difftest.py --quiet --dram` | **26/26 MATCH** |
+| 形式验证（prove） | `sby -f ethereal-shell/formal/eth_rv_core.sby prove` | **PASS**（k-induction，rc=0） |
+| 形式验证（cover） | `sby -f ethereal-shell/formal/eth_rv_core.sby cover` | **PASS**（rc=0，23:57:29） |
+| harness pytest | `.venv/bin/pytest -q ethereal-shell/verif/eth_rv/tests` | **275 passed**（274 + 新增的 PMP/DT 契约测试） |
+| S4 镜像自检 | `build_linux_boot.py --check` | **OK**（kernel 22380544 B、initramfs 697975 B、dtb 1622 B） |
+| Spike（Phase 1） | `run_linux_boot.py --spike` | **4.95 s / 11,930 B / MILESTONE-REACHED** |
+
+* 本切片**没有改动 RTL**：所有缺陷都在 DT/运行器/测试平台这一层（时基档位、PMP 属性、两套节拍、诊断开关）。RTL 侧唯一的改动是 TB 的诊断输出（默认关）。
+
+改动的文件：
+
+| 文件 | 改动 |
+|---|---|
+| `ethereal-shell/verif/eth_rv/eth_rv_linux.dts` | `timebase-frequency` 130000 → 10000000；CPU 节点加 `riscv,pmpregions`/`riscv,pmpgranularity` |
+| `ethereal-shell/verif/eth_rv_core/tb_eth_rv_core.sv` | `+clint_dump=<cycles>`（mtime/mtimecmp/mip/mie/mideleg/mstatus/priv + 已提交 pc）、`last_commit_pc/priv` 记录 |
+| `ethereal-shell/verif/eth_rv_core/run_linux_boot.py` | `--clint-dump`；`build_model(..., spike_cadence=True)`（`obj_s4_fw`）；`--difftest` 用该档 |
+| `ethereal-shell/verif/eth_rv/tests/test_rv_linux_boot.py` | 新增 `test_linux_dts_declares_the_hart_pmp_profile` |
+| `ethereal-shell/verif/eth_rv/README.md` | S4 边界更正（PMP/DT、时基档位、两套节拍、诊断开关） |

@@ -95,6 +95,22 @@ def test_linux_dts_declares_the_boot_contract() -> None:
     assert "plic@c000000" in text and "riscv,ndev = <31>" in text
 
 
+def test_linux_dts_declares_the_hart_pmp_profile() -> None:
+    """The CPU node must state the PMP count, or the golden runs with PMP off.
+
+    Spike takes its PMP count from THIS property, not from `--pmpregions`
+    (`riscv/sim.cc`: `fdt_parse_pmp_num()` -> `set_pmp_num()`, with 0 as the
+    fallback) and Spike's own auto-DTS emits it, which is what the corpus's
+    `dtb=spike-auto` runs use. Without it the golden booted with `n_pmp = 0`: the
+    RTL's own OpenSBI takes a different branch at its first `csrw pmpcfg0` probe
+    (cause 2 on the Spike side), so the firmware DiffTest diverged at commit
+    #714,887 and the two sides' banners disagreed ("PMP Count: 0" vs 16).
+    """
+    text = re.sub(r"/\*.*?\*/", "", _dts_text(), flags=re.S)
+    assert "riscv,pmpregions = <16>" in text
+    assert "riscv,pmpgranularity = <4>" in text
+
+
 def test_init_script_prints_the_milestone() -> None:
     """The initramfs's PID 1 announces itself with the byte string the TB stops on."""
     text = _init_text()
