@@ -165,6 +165,12 @@ module eth_rv_mmio_mux #(
     // the checked-in image). The stub's own pulses are swallowed from the image's
     // step-count word, so only this one mode-dependent number is supplied here.
     parameter int unsigned CLINT_STEP_PRELOAD = 5,
+    // mtime cadence: one tick every CLINT_RTC_TICK_STEPS retired instructions, advancing
+    // CLINT_RTC_TICK_ADVANCE per tick (defaults 5000/50 = Spike's DiffTest cadence). The
+    // SoC/Linux profile uses 1/1 so mtime tracks retired instructions 1:1 like a real
+    // free-running counter, which is what a kernel's delay loops assume.
+    parameter int unsigned CLINT_RTC_TICK_STEPS   = 5000,
+    parameter int unsigned CLINT_RTC_TICK_ADVANCE = 50,
     parameter logic [63:0] ROM_BASE        = 64'h0000_0000_0000_1000,  // BootROM region (S3 contract)
     parameter int unsigned ROM_BYTES       = 4096,                     // 4 KiB
     parameter int unsigned ROM_ENTRY_WORD  = 8,                        // offset 32: the payload entry
@@ -299,7 +305,9 @@ module eth_rv_mmio_mux #(
     eth_rv_clint #(
         .BASE            (CLINT_BASE),
         .CLINT_SIZE      (CLINT_SIZE),
-        .STEP_PRELOAD    (CLINT_STEP_PRELOAD)
+        .STEP_PRELOAD    (CLINT_STEP_PRELOAD),
+        .RTC_TICK_STEPS   (CLINT_RTC_TICK_STEPS),
+        .RTC_TICK_ADVANCE (CLINT_RTC_TICK_ADVANCE)
     ) u_clint (
         .clk_i        (clk_i),
         .rst_ni       (rst_ni),

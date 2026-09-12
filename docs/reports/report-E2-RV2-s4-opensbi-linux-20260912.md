@@ -149,3 +149,147 @@ flowchart LR
 ```
 
 **证据位置**：`generated/rv_difftest/s4/`（镜像 + manifest + `run/summary.json`、`run/s4.spike.console`、`run/s4.rtl.console`、`s4.uart`、`run/s4.traps.log`）；`local://rv12-linux-notes.md`（全部命令、边界、板级遗留）。
+
+## 追补（同一会话后半段：非对齐访问探针与根因收敛）
+
+### ✅ 新增常驻语料程序 `cor_misalign`（闭合一个真实覆盖缺口）
+
+`ethereal-shell/verif/eth_rv/corpus/cor_misalign.S`，已登记进 `run_difftest.py` 的
+`CORPUS_PROGRAMS`（builder 自动 glob `cor_*.S`）。它覆盖此前**没有任何语料程序覆盖**的
+非对齐 *数据* 访问：
+
+```
+$ python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_misalign
+[rv-rtl] cor_misalign: ETH_RV_TB: PASS 302 commits (108 compressed), 438 cycles, 19 loads, 11 stores,
+         7 traps (0 interrupts, 0 access faults, 0 page faults, last mcause=4), ... window 1024 KiB ...
+MATCH: 302 commits compared, 0 divergence — pc, rd and value agree
+[rv-rtl] OK: 1 corpus program(s), MATCH vs Spike + console asserted
+```
+
+7 个陷阱各自钉住一条：非对齐 `ld`/`lh`/`lw` → **cause 4**、非对齐 `sd`/`sh` → **cause 6**，
+`mtval` = 指令命名的地址；越界读/写**不写目标寄存器、不落内存**；**跨 4 KiB 页边界**的
+非对齐 `ld` 仍是 cause 4；并且第 5 条走的是 **"陷入 → 处理器逐字节模拟 → mret 回原模式
+→ 值落在目标寄存器"** 的路线（即 OpenSBI `sbi_misaligned_load_handler` 的做法）。末尾把
+陷阱数钉成 7，任何"多抓/漏抓"都会被同时判为非零退出码与 trace 分叉。
+
+### 🔬 反向结论：panic **不是**非对齐陷入/委托的缺陷
+
+把 S4 内核的实际场景临时接进探针（写 OpenSBI 的 `medeleg` 掩码、清 cause 4 的委托位、
+`mret` 进 S 模式做非对齐 `ld`、M 模式模拟后 `mret` 回 S）后：
+
+* **RTL 行为与内核期望完全一致**：9 个陷阱、模拟值正确落回 `s7`、`s10=0`（没有被委托给 S）。
+* golden 侧**无法**从人工构造的 `mstatus`/`medeleg`/`stvec` 复现 Spike 的 S-mode 行为
+  （探针在 Spike 上 exit 18 = "M 模式处理了但模拟值没落到 s7"），因此该子段**没有**留在
+  语料程序里（`.S` 内已写明原因），需要的是固件真实状态（S4 启动本身提供）。
+
+因此这条线索被排除，panic 的 `cause=1`/`stval=epc` 只剩两条，都记在下一节。
+另一个观察：严格 round-trip（写 `medeleg=0x109` 读回 `0x109`）在 **Spike** 上不成立
+（探针据此报 14）——这是**探针期望的伪差**，不是已确认的 RTL 差异；放宽到"bit 4 必须为 0、
+bit 8 必须保留"后两侧都过。
+
+### ⚠️ 仍未解决（明说，不掩盖）
+
+* **RTL 修复本身没做**：本会话预算在半途耗尽。收敛后的两条线索： (a) `step_o =
+  ex_valid_r && !ex_stall && !mem_trap` 丢脉冲（固件段 #714,988 处 mtime 已差 100 units =
+  10,000 步，**早于任何 trap**，见 README 更正后的边界节）；(b) 取指/走查错误通道
+  （`fetch_hit && imem_err_i` 或 PTE 读被拒 → `mmu_fault == CAUSE_INSN_ACCESS`）。
+  下一步建议：① 让步进逐条计数（或两侧都不丢）后重跑 `--difftest`，看 #714,988 的分叉是否
+  消失；② 给 TB 加"首个 `cause != 9` 的 trap 即停并打印"的模式，把 panic 前的 trap 序列缩到
+  几十行，再对着 `check_unaligned_access_emulated` 的 epc 读。
+* **`--rtl --dram` 未跑**：beat 路径尚未越过里程碑，跑第二个 D 口只会复现同一失败；命令与
+  前置条件已就绪（`run_linux_boot.py --rtl --dram`）。
+* **页陷阱数仍为 0**：到 30.2M 提交为止只有 23 个 trap 且全为 cause 9（S 模式 ecall），
+  说明内核页表在建表时就带了 A/D（无硬件 A/D 时的常规做法），所以"页陷阱 > 0"这条验收
+  在本镜像上**没有得到满足**——按约定如实记录而不是造数。
+
+### ✅ 本会话复跑的门禁
+
+`make verif-rv` → **274 passed**（含 `cor_misalign` 登记后的语料构建）；`make lint` →
+`[lint] OK - all project RTL lint-clean.`；`make formal` → **7/7 PASS**；TB 在 S3/S4 两套
+`-D` 下 `--lint-only -Wall --timing` 均 0 警告。
+
+## 追补二：`step_o` 用算术排除、诊断开关交付、移交命令
+
+### ✅ 用算术排除 `step_o`（结论：**不需要改 RTL**）
+
+差值的算术是决定性的：
+
+| 量 | 值 | 说明 |
+|---|---|---|
+| 分叉点 | commit **#714,988**，`pc=0x8000a6dc`（一次 `mtime` 读） | 固件段，trap 之前 |
+| Spike | `0x1c20` = 7200 | 需要 ≥ **720,000** 条已退役指令 |
+| DUT | `0x1bbc` = 7100 | `50 * floor((714988-5)/5000)` = **7100** 精确吻合 |
+
+即 DUT 的值正是"每 100 条**退役**指令 +1"的阶梯（`RTC_TICK_STEPS=5000`、`RTC_TICK_ADVANCE=50`，
+与 Spike 的 `INTERLEAVE/INSNS_PER_RTC_TICK` 同源），而 Spike 在只退役 714,983 条时已经走到
+7200 ⇒ **漂移在 Spike 一侧**：它的 CLINT 推进由 `idle()`/`step(INTERLEAVE)` 循环驱动，而不是
+由退役指令数驱动，任何被提前截断的循环迭代都会让它**超前** ✗。hart 侧无法复现这一点，所以正确
+结论是：**`mtime`/`time` 根本不是可比较量**（不只是 trap 之后），README 已按此更正。
+`step_o` 的 `!mem_trap` 项对"退役"语义是**正确**的（被更老 trap 冲刷掉的指令确实不退役），
+因此本项**没有 RTL 改动**，而是把错误的假设用数字排除掉。
+
+### ✅ `+stop_trap_cause=<n>`（诊断开关，已交付并验证）
+
+TB 新 plusarg：**首个 cause 不等于 `n` 的 trap 立即停机**并打印（自动带 `+trace_traps=1`）；
+S4 runner 暴露为 `--stop-trap-cause=9`（把启动期间的 SBI ecall 视为正常，停在真正致命的那次）。
+负控实测（`cor_misalign` 声明 4、程序里第一个 cause 6 是未对齐 store）：
+
+```
+$ python3 … run_difftest.py --only cor_misalign --tb-plusarg=+stop_trap_cause=4
+ETH_RV_TB: FAIL first undeclared trap after 69 commits / 101 cycles:
+  pc=0x00000000800000cc cause=6 insn=0x018b3023 irq=0 (declared cause=4, 2 trap(s) before it)
+```
+
+⇒ 一步就把"最后 10⁹ 周期里某处 panic"变成"若干行，末尾就是没人要的那次 trap"。
+
+### ⚠️ 固件窗口不能再往 #714,988 之后 MATCH（原因是 golden 侧）
+
+该提交是一次 `mtime` 读，按上面的结论**不可比较**；因此固件段 DiffTest 的诚实结果是
+"**MATCH 到 #714,987**，之后第一个不可比较量出现在 golden 侧"。要看到**下一个真实分叉**，
+需要先跑带 `+stop_trap_cause` 的长启动把 panic 前后的 trap 序列列出来（45 分钟级，已移交）。
+
+### 📤 移交给维护者的命令（本会话预算耗尽）
+
+```sh
+S4=generated/rv_difftest/s4
+export PATH=$HOME/oss-cad-suite/bin:$HOME/tools/riscv/usr/bin:$PATH
+
+# A) beat 构建：带诊断开关的长启动（停在首个非 9 的 trap，并打印它）
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl \
+    --stop-trap-cause=9 --max-cycles=2000000000 --timeout=7200 --rebuild
+
+# B) 里程碑启动（不带诊断，跑到 console marker 或预算）
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl \
+    --max-cycles=2000000000 --timeout=7200
+
+# C) AXI/DRAM D 口构建（里程碑达成后）
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl --dram \
+    --max-cycles=2000000000 --timeout=7200
+```
+
+A 的输出里 `ETH_RV_TB: FAIL first undeclared trap …` 一行就是下一个分析入口：它的
+`pc/cause/insn` 加上前一行 `trap N …` 序列，可直接对着
+`check_unaligned_access_emulated+0x36`（epc `0xffffffff80014c6a`）读。
+
+## 追补三：Phase 2 的两处 RTL 修复与当前精确状态（2026-09-12 晚）
+
+### 修复 1：`mtime` 节拍（S4 档 1:1）
+
+症状：RTL 控制台在 **0.022 s 内核时间**处停滞，trap 列表被 `cause=7 irq=1`（MTI）与 `cause=5 irq=1`（STI）**定时器风暴**占满，符号化后落在 **`__delay` ↔ `__sbi_ecall`**（用 `System.map` 解析 `0xffffffff8089ddb2/d6` → `__delay+0x16/0x1a`；`0xffffffff8001978c` → `__sbi_ecall+0x8`）⇒ 内核的延时循环在等时基，而我们的 `mtime` 是 **每 100 条退休指令 +1**（Spike 的 DiffTest 节拍）⇒ 用户请求的每微秒延时都要花 ~100 倍的指令。
+
+修复（**按时档参数化，语料档不变**）：`eth_rv_mmio_mux` 新增 `CLINT_RTC_TICK_STEPS/ADVANCE` 参数 → `eth_rv_clint`；TB 用 `-DETH_RV_CLINT_TICK_STEPS/_ADVANCE`（默认 5000/50 = Spike 节拍）；`run_linux_boot.py` 的 S4 档传 **1/1**；`eth_rv_linux.dts` 的 `timebase-frequency` 改为 **130000**（实测的仿真退休指令率，注释说明板级要换成真实 SoC 时钟）。
+效果：内核时间从 0.022 s 推进到 **3.80 s**（≈170 倍），控制台 9,842 → **10,296 字节**（golden 11,928 的 ~86%）。语料 **25/25 仍 MATCH**（档位默认不变）。
+
+### 修复 2：`mstatus.MPRV`（原为"仅存储、无行为"的边界）
+
+`check_unaligned_access_emulated+0x36` 处的失败：规范里 M 模式的仿真器（OpenSBI 的 misaligned-load handler）用 **MPRV** 以 MPP 的特权级翻译/检查 S/U 地址；我们的核此前 M 模式**从不翻译** ⇒ 仿真路径的访问以物理地址执行。
+修复：`mmu_priv = (mstatus.MPRV && priv==M) ? mstatus.MPP : priv`，数据访问用 `mmu_priv` 决定是否翻译（`mmu_data_on`）与走页时的 S 位（`priv_s_i`）；**取指不受 MPRV 影响**（规范）。语料 **25/25 仍 MATCH**（MPRV=0 时行为逐位不变）。
+
+### 当前精确状态（未达里程碑，如实记录）
+
+修复 2 之后失败**从 `cause 1`（取指访问错，badaddr = 内核代码地址）变为 `cause 13`（**加载页错误**，badaddr = `0xfffffc60000bca2` = 内核栈 `sp+2`）** ⇒ **翻译路径已被走到**（MPRV 修复生效），但**仿真访问本身以页错误失败**，随后 `swapper/0[1] exited` ⇒ `Kernel panic - not syncing: Attempted to kill init! exitcode=0x0000000b`。100M → 2e9 预算的多次运行（每次 ~50 min）控制台逐步推进到 10,296 字节（3.80 s 内核时间），但 **`console marker NOT seen`**。
+
+下一步（留给下一位）：
+1. 在**该点**打印 `mstatus.MPRV/MPP`、有效特权、`satp`、被翻译的地址与 PTE（一个 `+trace_mprv` 类 plusarg；失败点在 ~1e9 周期处，故一次 25 min 运行即可）；
+2. 判定 cause 13 是"我们的翻译结果与内核页表不一致"（例如走页时用错了 `satp`/特权）还是"该访问本应先触发 cause 4"（LSB 对齐判定：`badaddr` 为 `…a2`，须确认内核那条指令的宽度）；
+3. 用一次性 Spike 探针对照（此前实现者尝试过合成 S 模式 MPRV 场景，Spike 侧未能复现，故这次要记录探针命令与输出）。

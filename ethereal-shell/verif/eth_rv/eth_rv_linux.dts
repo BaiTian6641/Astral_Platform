@@ -75,7 +75,10 @@
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
-		timebase-frequency = <10000000>;
+		/* The simulation's own retired-instruction rate, measured (~130k/s): with the
+		 * 1:1 mtime cadence this makes the kernel's notion of time match the model.
+		 * A board build replaces this with the real SoC clock. */
+		timebase-frequency = <130000>;
 
 		cpu@0 {
 			device_type = "cpu";

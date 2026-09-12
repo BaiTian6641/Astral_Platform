@@ -265,6 +265,11 @@ def build_model(out: Path, *, dram: bool, line_beats: int, rebuild: bool) -> Pat
     defines = [
         f"-DETH_RV_MEM_BYTES={rv_platform.LINUX_RAM_WINDOW_BYTES}",
         f"-DETH_RV_CLINT_PRELOAD={SPIKE_STUB_STEPS}",
+        # mtime 1:1 with retired instructions: a Linux kernel's delay loops wait on the
+        # timebase, and Spike's 1-tick-per-100-instructions cadence turns every microsecond
+        # of udelay into ~100x the instructions (measured: the boot stalls in __delay).
+        "-DETH_RV_CLINT_TICK_STEPS=1",
+        "-DETH_RV_CLINT_TICK_ADVANCE=1",
         f"-DETH_RV_ROM_ENTRY_WORD={rv_platform.LINUX_ROM_ENTRY_WORD}",
         f"-DETH_RV_ROM_STUB_WORD={rv_platform.LINUX_ROM_STEP_WORD}",
         # The console queue (see the TB): a boot's printk bursts far exceed the
@@ -302,6 +307,7 @@ def rtl_argv(
     stop_pc: int | None,
     max_cycles: int,
     max_traps: int,
+    stop_trap_cause: int | None = None,
 ) -> list[str]:
     """The S4 testbench plusargs (the boot contract, one place)."""
     argv = [
@@ -326,6 +332,11 @@ def rtl_argv(
         argv.append(f"+trace={trace}")
     if stop_pc is not None:
         argv.append(f"+stop_pc=0x{stop_pc:x}")
+    if stop_trap_cause is not None:
+        # `+stop_trap_cause`: halt at the first trap that is not this cause. For the
+        # beat-build boot the declared kind is 9 (SBI ecalls), so the run ends at the
+        # trap nobody asked for instead of somewhere in the last 10^9 cycles.
+        argv += ["+trace_traps=1", f"+stop_trap_cause={stop_trap_cause}"]
     return argv
 
 
@@ -554,6 +565,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-cycles", type=int, default=2_000_000_000,
                         help="the TB cycle budget (a bound, not an expectation)")
     parser.add_argument("--rebuild", action="store_true", help="force a Verilator rebuild")
+    parser.add_argument(
+        "--stop-trap-cause",
+        type=int,
+        default=None,
+        help=(
+            "halt the RTL run at the first trap whose cause is not this one, with "
+            "+trace_traps=1 (e.g. 9 declares the boot's SBI ecalls as expected and "
+            "stops at the trap that killed it)"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="only the summaries")
     args = parser.parse_args(argv)
     modes = {"spike": args.spike, "rtl": args.rtl, "difftest": args.difftest}
@@ -580,6 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             tb_argv = rtl_argv(
                 exe, out=S4_DIR, manifest=manifest, trace=None, stop_pc=None,
                 max_cycles=args.max_cycles, max_traps=args.max_traps,
+                stop_trap_cause=args.stop_trap_cause,
             )
             print("[s4] RTL boot: 40 MiB window, console-marker stop ...", flush=True)
             wall, status, console = run_rtl(

@@ -148,6 +148,17 @@ CORPUS_PROGRAMS = [
     # the one corpus program whose whole point is that the image loader and the
     # testbench must not assume entry == window base.
     "cor_boot",
+    # E2-RV2 increment 7 (S4): the unaligned DATA access path — mcause 4/6 with
+    # mtval = the address, the faulting instruction writing nothing, the
+    # page-crossing case, and the trap-emulate-resume route the S4 kernel's own
+    # probe takes (OpenSBI's `sbi_misaligned_load_handler`). No earlier corpus
+    # program touched a misaligned datum, which is why five increments of
+    # DiffTest never compared this path against Spike.
+    "cor_misalign",
+    # E2-RV2 increment 7 (S4): the PMP CSR floor the firmware programs — reset
+    # state, write masks, the L-bit lock, and the RV64-absent pmpcfg1/pmpcfg3
+    # staying illegal. Storage semantics only; enforcement is a documented gap.
+    "cor_pmp",
     # E2-RV2 increment 6 (S5): the devices a usable Linux needs — the PLIC with
     # its S-mode external-interrupt path, and the console UART's receive path
     # (RBR/LSR.DR/FCR/loopback/IIR and the RX interrupt as PLIC source 1).

@@ -216,6 +216,19 @@ module tb_eth_rv_core;
 `endif
     localparam int unsigned CLINT_STEP_PRELOAD = `ETH_RV_CLINT_PRELOAD;
 
+    // mtime cadence (see eth_rv_mmio_mux's CLINT_RTC_TICK_* parameters). The default is
+    // Spike's DiffTest cadence (one tick per 100 retired instructions); the Linux/SoC
+    // profile compiles 1/1 so mtime tracks retired instructions 1:1, which is what a
+    // kernel's delay loops assume and is what makes a 40-MiB boot finish.
+`ifndef ETH_RV_CLINT_TICK_STEPS
+`define ETH_RV_CLINT_TICK_STEPS 5000
+`endif
+`ifndef ETH_RV_CLINT_TICK_ADVANCE
+`define ETH_RV_CLINT_TICK_ADVANCE 50
+`endif
+    localparam int unsigned CLINT_RTC_TICK_STEPS   = `ETH_RV_CLINT_TICK_STEPS;
+    localparam int unsigned CLINT_RTC_TICK_ADVANCE = `ETH_RV_CLINT_TICK_ADVANCE;
+
     // Console UART of the SoC data map (rtl/eth_rv/eth_rv_mmio_mux.sv): the same
     // page Spike's ns16550 answers on, with a 16-cycle bit cell, so a queued
     // burst drains at 160 cycles per byte. The receiver below decodes the line
@@ -408,6 +421,14 @@ module tb_eth_rv_core;
     // hundreds of millions of cycles long and prints nothing until its console is
     // up, so without this a slow run and a hung one look identical from outside.
     int unsigned progress_cycles;
+    // `+stop_trap_cause=<n>`: halt at the FIRST trap whose cause IS `n` (with
+    // `+trace_traps=1` the listing then ends at the trap that was not declared).
+    // A long boot takes an unknown number of expected traps before it dies (SBI
+    // ecalls are cause 9); without this, "the kernel panicked somewhere in the
+    // last 10^9 cycles" is the most a log can say, because the trap trace is
+    // hundreds of thousands of lines long and the interesting one is the last.
+    int unsigned stop_trap_cause;
+    bit          stop_trap_cause_en;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -618,6 +639,8 @@ module tb_eth_rv_core;
         .ROM_ENTRY_WORD (ROM_ENTRY_WORD),
         .ROM_STUB_WORD  (ROM_STUB_WORD),
         .CLINT_STEP_PRELOAD (CLINT_STEP_PRELOAD),
+        .CLINT_RTC_TICK_STEPS   (CLINT_RTC_TICK_STEPS),
+        .CLINT_RTC_TICK_ADVANCE (CLINT_RTC_TICK_ADVANCE),
         .PLIC_BASE      (PLIC_BASE),
         .PLIC_SIZE      (PLIC_SIZE),
         .PLIC_NDEV      (PLIC_NDEV),
@@ -1136,6 +1159,12 @@ module tb_eth_rv_core;
                     if (rx_nbytes < UART_MAX_BYTES) begin
                         rx_bytes[rx_nbytes] <= rx_acc;
                         rx_nbytes <= rx_nbytes + 1;
+                        // the live copy: written and flushed per byte, so an abort
+                        // cannot lose the console (see the +uart= open above)
+                        if (uart_fd != 0) begin
+                            $fwrite(uart_fd, "%c", rx_acc);
+                            $fflush(uart_fd);
+                        end
                     end else begin
                         rx_buf_overflow <= 1'b1;
                     end
@@ -1590,6 +1619,17 @@ module tb_eth_rv_core;
                              traps + 1, core_err_pc, core_err_code, core_err_insn,
                              core_err_irq);
                 end
+                // `+stop_trap_cause`: the first trap OF the declared kind
+                // ends the run and is printed whether or not `+trace_traps` is set.
+                // This is the diagnostic that turns a 10^9-cycle boot into a few
+                // dozen lines ending at the trap nobody asked for.
+                if (stop_trap_cause_en && (core_err_code == stop_trap_cause[3:0])) begin
+                    $display("ETH_RV_TB: FAIL halting on cause %0d after %0d commits / %0d cycles: pc=0x%016x insn=0x%08x irq=%0d (%0d trap(s) before it)",
+                             core_err_code, commits, cycle_cnt, core_err_pc,
+                             core_err_insn, core_err_irq, traps + 1);
+                    failed   <= 1'b1;
+                    stop_now <= 1'b1;
+                end
                 traps    <= traps + 1;
                 last_trap_cause <= core_err_code;
                 if (core_err_irq) begin
@@ -1697,6 +1737,24 @@ module tb_eth_rv_core;
         void'($value$plusargs("rom_dtb=%d", rom_dtb));
         void'($value$plusargs("uart_marker=%s", uart_marker_hex));
         void'($value$plusargs("progress=%d", progress_cycles));
+        stop_trap_cause_en = ($value$plusargs("stop_trap_cause=%d", stop_trap_cause) != 0);
+        // `+uart=<file>` is also opened HERE, before anything can abort, and every
+        // received byte is written and flushed as it arrives. The structured record
+        // at the end of the run reopens the same path and replaces this live copy,
+        // so a run that completes is unchanged — but a run that dies (a cycle-budget
+        // FAIL, a trap halt, a `$fatal` anywhere) still leaves the console the DUT
+        // produced on disk. That text is the fastest diagnosis a long boot has, and
+        // losing it because the normal completion path never ran cost one 50-minute
+        // run already.
+        if (uart_path != "") begin
+            uart_fd = $fopen(uart_path, "w");
+            if (uart_fd == 0) begin
+                $display("ETH_RV_TB: FAIL cannot open uart file '%s'", uart_path);
+                $fatal(1);
+            end
+            $fwrite(uart_fd, "# eth_rv uart rx live v1 (replaced by the record on a clean finish)\n");
+            $fflush(uart_fd);
+        end
         stop_pc_en = ($value$plusargs("stop_pc=%h", stop_pc) != 0);
         a1_check_addr = (a1_addr != 64'd0) ? a1_addr : DTB_ADDR;
         trace_on_run = (trace_path != "");

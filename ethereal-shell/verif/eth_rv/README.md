@@ -1111,6 +1111,13 @@ the FDT magic at the address `a1` actually names.
   A milestone in userspace is a console event, not a store, so the stop condition has
   to live on the same receiver that produces `+uart=` (which is already a bit-timing
   assertion: every frame is start + 8 data + stop sampled at cell centres).
+* `+stop_trap_cause=<n>` — halt at the first trap whose cause is not `n` (and print it,
+  with `+trace_traps` forced on). A long boot takes an unknown number of expected traps
+  first — the S4 firmware's SBI ecalls are cause 9 — so `+stop_trap_cause=9` turns "the
+  kernel panicked somewhere in the last 10^9 cycles" into a few dozen lines ending at
+  the trap nobody asked for. The S4 runner exposes it as `--stop-trap-cause=9`; the
+  control is `cor_misalign --tb-plusarg=+stop_trap_cause=4`, which halts at the first
+  cause-6 (misaligned store) trap after 69 commits, 101 cycles — verified.
 * `+progress=<cycles>` — one `ETH_RV_TB_INFO: progress …` line every N cycles. A Linux
   boot is hundreds of millions of cycles and silent until its console is up; without
   this a slow run and a hung one look identical from outside.
@@ -1126,12 +1133,26 @@ the FDT magic at the address `a1` actually names.
 
 ### Boundaries of the S4 profile (read before trusting a number)
 
-* **`mtime` across traps is not a diffable quantity.** Spike returns early from
-  `step()` on a trap (the trap costs it 0 steps) while the DUT's CLINT counts every
-  retired instruction, so a `rdtime`/printk timestamp taken after a trap diverges. The
-  kernel's console *text* is diffable; its timestamps are not. (The DUT's step strobe
-  also drops a pulse on `mem_trap`, which is the second, larger part of the same drift —
-  see the report's finding list.)
+* **`mtime` is not a diffable quantity yet, and the older note that called this a
+  post-trap boundary was WRONG.** The firmware already diverges, with no trap in
+  sight: `cor_misalign`-era measurement of the S4 firmware found the first
+  divergence at commit #714,988 (`pc=0x8000a6dc`, an `mtime` read: Spike `0x1c20`
+  vs DUT `0x1bbc`). The arithmetic says the **DUT is right and Spike is the one that
+  drifts**: with the CLINT's `50`-per-`5000`-step staircase the DUT's value is exactly
+  `50 * floor((714988 - 5) / 5000) = 7100`, i.e. one tick per 100 *retired*
+  instructions, while Spike's `7200` needs at least 720,000 retired instructions when
+  only 714,983 had happened. Spike's CLINT advance is therefore driven by its
+  `idle()`/`step(INTERLEAVE)` loop rather than by the retired-instruction count, and
+  any iteration truncated early makes its `mtime` run *ahead*. No hart-side strobe can
+  reproduce that, so the honest statement is that `mtime`/`time` is not a comparable
+  signal **at all** for a run whose golden is Spike with a bounded or trap-crossing
+  step loop — and that every `rdtime`/`time` value and every printk timestamp of a
+  long run is off accordingly. (`step_o`'s `!mem_trap` term is *correct* for
+  "retired": an instruction squashed by an older trap does not retire.) The S4
+  console's kernel timestamps diverge from Spike's at ~0.0003 s (10 µs) for the same
+  reason: read the console for text, never for the timestamps, and do not ask the
+  firmware DiffTest to compare an `mtime`-derived value (it stops at commit #714,988
+  for exactly this, on the golden side).
 * **Console bit rate.** Spike's ns16550 writes a THR store straight out with LSR
   permanently `TEMT|THRE`; the DUT shifts bytes at 16 cycles/bit and cannot
   back-pressure a writer that trusts THRE, so the S4 build sizes the transmit/receive

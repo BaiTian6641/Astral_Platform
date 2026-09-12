@@ -106,6 +106,16 @@ package eth_rv_pkg;
     localparam logic [11:0] CSR_MEDELEG  = 12'h302;
     localparam logic [11:0] CSR_MIDELEG  = 12'h303;
     localparam logic [11:0] CSR_MCOUNTEREN = 12'h306;
+    // PMP CSRs (E2-RV2 increment 7, S4). RV64 has `pmpcfg0` and `pmpcfg2` only —
+    // each holds EIGHT byte entries, so the odd-numbered cfg registers do not exist
+    // — plus `pmpaddr0..15`. `pmpcfg1`/`pmpcfg3` are therefore deliberately NOT
+    // listed here: `csr_implemented` is what makes them an illegal instruction,
+    // exactly as RV64 (and the pinned golden) does. The firmware programs PMP
+    // before handing a kernel over, so without this storage OpenSBI dies on its
+    // first `csrw pmpcfg0` — which is how the S4 boot found this gap.
+    localparam logic [11:0] CSR_PMPCFG0  = 12'h3A0;
+    localparam logic [11:0] CSR_PMPCFG2  = 12'h3A2;
+    localparam logic [11:0] CSR_PMPADDR0 = 12'h3B0;
     // The floating-point CSRs of the F extension. `fcsr` is a *view*: bits 7:5 are
     // `frm` (write mask 3'h7) and bits 4:0 are `fflags` (write mask 5'h1f), exactly
     // Spike's composite_csr_t over two independent sub-CSRs.
@@ -235,6 +245,19 @@ package eth_rv_pkg;
     localparam logic [63:0] MCOUNTEREN_WMASK    = 64'h0000_0000_0000_0007;
     localparam logic [63:0] SCOUNTEREN_WMASK    = 64'h0000_0000_0000_0007;
     localparam logic [63:0] MCOUNTINHIBIT_WMASK = 64'h0000_0000_0000_0005;
+
+    // ---- PMP storage semantics (S4): the pinned golden's measured values -------
+    // Measured in local://rv10-counter-notes.md §1.6 (probe2/probe3pmp on Spike
+    // commit 1e05ddac): reset `pmpcfg0 = 0x1F` (entry 0 = R|W|X|A=NAPOT, i.e.
+    // "allow everything") and `pmpaddr0 = 0x003fffffffffffff` (`put_csr(~0)` masked
+    // to the 56-bit paddr), every other entry zero; `pmpaddr*` write mask 56 bits,
+    // `pmpcfg*` byte mask 0x9f; and the L bit really LOCKS — a cfg write covering a
+    // locked entry is dropped entirely, and so is that entry's `pmpaddr` write.
+    localparam logic [63:0]  PMPADDR_WMASK     = 64'h003f_ffff_ffff_ffff;
+    localparam logic [7:0]   PMPCFG_BYTE_WMASK = 8'h9f;
+    localparam logic [63:0]  PMPCFG_LOCK_MASK  = 64'h8080_8080_8080_8080;  // bit 7 per byte
+    localparam logic [127:0] PMPCFG_RESET      = 128'h0000_0000_0000_001f;
+    localparam logic [1023:0] PMPADDR_RESET    = 1024'h003f_ffff_ffff_ffff;
     // The user proxies are gated by the bit their own address names (C00/C01/C02 ->
     // bits 0/1/2 of mcounteren and scounteren, see `csr_counter_bit`), so only the
     // two inhibit bits mcountinhibit actually has need a name here.
@@ -360,6 +383,14 @@ package eth_rv_pkg;
         csr_is_mhpmevent = (addr >= 12'h323) && (addr <= 12'h33f);
     endfunction
 
+    // `pmpaddr0..15` (0x3B0..0x3BF): the PMP address registers (S4). The storage
+    // semantics are the golden's, measured; nothing here ENFORCES a region (see
+    // eth_rv_core's PMP header note).
+    function automatic logic csr_is_pmpaddr(input logic [11:0] addr);
+        csr_is_pmpaddr = (addr >= eth_rv_pkg::CSR_PMPADDR0)
+                         && (addr < (eth_rv_pkg::CSR_PMPADDR0 + 12'd16));
+    endfunction
+
     // (Members of the package are spelled `eth_rv_pkg::NAME` on purpose: the
     // yosys frontend the formal flow reads with does not resolve a bare
     // package-local name inside a function body, and the qualified form is the
@@ -371,6 +402,9 @@ package eth_rv_pkg;
             eth_rv_pkg::CSR_MCAUSE, eth_rv_pkg::CSR_MTVAL, eth_rv_pkg::CSR_MIP,
             eth_rv_pkg::CSR_MHARTID, eth_rv_pkg::CSR_MEDELEG, eth_rv_pkg::CSR_MIDELEG,
             eth_rv_pkg::CSR_MCOUNTEREN,
+            // S4: the PMP registers the firmware programs. `pmpcfg1`/`pmpcfg3` are
+            // absent on RV64 and must trap, which is what this list decides.
+            eth_rv_pkg::CSR_PMPCFG0, eth_rv_pkg::CSR_PMPCFG2,
             // E2-RV2 increment 4: the counters, their enables, the inhibit register
             // and the identification/envcfg floor.
             eth_rv_pkg::CSR_MVENDORID, eth_rv_pkg::CSR_MARCHID, eth_rv_pkg::CSR_MIMPID,
@@ -388,7 +422,8 @@ package eth_rv_pkg;
             // write-dropping registers rather than listed one by one: see the two
             // range helpers below, which are the architectural definition anyway.
             default: csr_implemented = eth_rv_pkg::csr_is_mhpmcounter(addr)
-                                       || eth_rv_pkg::csr_is_mhpmevent(addr);
+                                       || eth_rv_pkg::csr_is_mhpmevent(addr)
+                                       || eth_rv_pkg::csr_is_pmpaddr(addr);
         endcase
     endfunction
     // The three user counter proxies: whatever privilege they carry, the golden

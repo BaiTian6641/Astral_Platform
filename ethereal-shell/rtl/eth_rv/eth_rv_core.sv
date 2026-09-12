@@ -1056,6 +1056,24 @@ module eth_rv_core (
     logic [63:0] csr_mscratch_r;
     logic [63:0] csr_medeleg_r;
     logic [63:0] csr_mideleg_r;
+    // ---- PMP CSR floor (E2-RV2 increment 7, S4) -------------------------------
+    // STORAGE AND READ/WRITE SEMANTICS ONLY — **no region is ENFORCED**. This hart
+    // does not consult PMP on any access, before or after this change: that is a
+    // pre-existing, documented boundary of the design (the S2 identity floor lists
+    // PMP enforcement as a known gap), and it is stated here rather than
+    // half-implemented, because a hart that enforces a *partially* mirrored
+    // configuration diverges from the golden in the worst way (it would fault on
+    // accesses the golden allows, or the reverse).
+    //
+    // What IS faithful is what the firmware and a kernel can observe through the
+    // CSRs, which is exactly what the pinned golden was measured to do
+    // (local://rv10-counter-notes.md §1.6): two 8-entry cfg registers on RV64
+    // (`pmpcfg1`/`pmpcfg3` do not exist and stay illegal — see `csr_implemented`),
+    // sixteen address registers, the reset state of region 0 ("allow all"), the
+    // 56-bit address / 0x9f byte write masks, and the L-bit lock rule. Without it
+    // OpenSBI traps on its first `csrw pmpcfg0` and never reaches a kernel.
+    logic [127:0]  csr_pmpcfg_r;    // 16 byte entries: entry i at bits [8i+7:8i]
+    logic [1023:0] csr_pmpaddr_r;   // 16 address registers: entry i at [64i+63:64i]
     logic [63:0] csr_mip_r;         // software-writable pending bits only
     logic [63:0] csr_stvec_r;
     logic [63:0] csr_sepc_r;
@@ -1129,6 +1147,18 @@ module eth_rv_core (
                             ? (csr_mstatus_r | eth_rv_pkg::MSTATUS_SD)
                             : (csr_mstatus_r & ~eth_rv_pkg::MSTATUS_SD);
 
+    // The PMP lock tests (S4), one per write shape: a cfg write is dropped when any
+    // entry it covers is locked, an addr write when ITS entry is locked. Both are
+    // the measured golden rules (local://rv10-counter-notes.md §1.6).
+    function automatic logic pmp_cfg_half_locked(input logic [127:0] cfg, input logic upper);
+        pmp_cfg_half_locked = |((upper ? cfg[127:64] : cfg[63:0])
+                                & eth_rv_pkg::PMPCFG_LOCK_MASK);
+    endfunction
+
+    function automatic logic pmp_entry_locked(input logic [127:0] cfg, input logic [3:0] idx);
+        pmp_entry_locked = cfg[{idx, 3'b000} + 7];
+    endfunction
+
     always_comb begin
         unique case (ex_ctrl_r.csr_addr)
             eth_rv_pkg::CSR_MSTATUS:   csr_rdata = csr_mstatus_rd;
@@ -1164,6 +1194,27 @@ module eth_rv_core (
             eth_rv_pkg::CSR_MCONFIGPTR:   csr_rdata = eth_rv_pkg::MCONFIGPTR_VALUE;
             eth_rv_pkg::CSR_MENVCFG:      csr_rdata = {63'd0, csr_menvcfg_r};
             eth_rv_pkg::CSR_SENVCFG:      csr_rdata = {63'd0, csr_senvcfg_r};
+            // S4: the PMP registers. `pmpcfg0` is entries 0..7 (bits [63:0]) and
+            // `pmpcfg2` entries 8..15 (bits [127:64]) — RV64 packs eight bytes per
+            // register, which is why the odd cfgs do not exist.
+            eth_rv_pkg::CSR_PMPCFG0:  csr_rdata = csr_pmpcfg_r[63:0];
+            eth_rv_pkg::CSR_PMPCFG2:  csr_rdata = csr_pmpcfg_r[127:64];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd0:  csr_rdata = csr_pmpaddr_r[63:0];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd1:  csr_rdata = csr_pmpaddr_r[127:64];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd2:  csr_rdata = csr_pmpaddr_r[191:128];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd3:  csr_rdata = csr_pmpaddr_r[255:192];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd4:  csr_rdata = csr_pmpaddr_r[319:256];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd5:  csr_rdata = csr_pmpaddr_r[383:320];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd6:  csr_rdata = csr_pmpaddr_r[447:384];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd7:  csr_rdata = csr_pmpaddr_r[511:448];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd8:  csr_rdata = csr_pmpaddr_r[575:512];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd9:  csr_rdata = csr_pmpaddr_r[639:576];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd10: csr_rdata = csr_pmpaddr_r[703:640];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd11: csr_rdata = csr_pmpaddr_r[767:704];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd12: csr_rdata = csr_pmpaddr_r[831:768];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd13: csr_rdata = csr_pmpaddr_r[895:832];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd14: csr_rdata = csr_pmpaddr_r[959:896];
+            eth_rv_pkg::CSR_PMPADDR0 + 12'd15: csr_rdata = csr_pmpaddr_r[1023:960];
             // mhpmcounter3..31 and mhpmevent3..31 fall through to the default: both
             // read zero (Spike's const_csr_t counters and its zero-mask mevent
             // registers), and a write to either is legal and drops.
@@ -1293,9 +1344,20 @@ module eth_rv_core (
     // preempted — it is at most four cycles long, so a deferred fetch walk costs
     // nothing but time.
     assign mmu_on       = (csr_satp_r[63:60] == 4'd8);
+    // MPRV (`mstatus` bit 17): while it is set and the hart is in M-mode, DATA
+    // accesses take the privilege in MPP for translation and access control.
+    // That is how an M-mode emulator (OpenSBI's misaligned-load handler) reaches
+    // an S/U-mode address with the lower mode's translation and permission rules
+    // — the kernel's `check_unaligned_access_emulated` walks straight into it,
+    // and without MPRV the emulated load runs untranslated against the physical
+    // address and the kernel dies. Fetches are never affected by MPRV, so
+    // `mmu_priv` below is consulted only on a data walk.
+    logic [1:0] mmu_priv;
+    assign mmu_priv     = (csr_mstatus_r[17] && csr_priv_r == eth_rv_pkg::PRV_M)
+                          ? csr_mstatus_r[12:11] : csr_priv_r;
     assign mmu_xlate    = mmu_on && (csr_priv_r != eth_rv_pkg::PRV_M);
     assign mmu_fetch_on = mmu_xlate;
-    assign mmu_data_on  = mmu_xlate;
+    assign mmu_data_on  = mmu_on && (mmu_priv != eth_rv_pkg::PRV_M);
 
     // The MEM stage enters its sequence as soon as the walker is free: with
     // translation off it goes straight to the access, with it on it walks first.
@@ -1322,7 +1384,7 @@ module eth_rv_core (
         .start_i    (mmu_start),
         .vaddr_i    (mmu_vaddr),
         .acc_i      (mmu_acc),
-        .priv_s_i   (csr_priv_r == eth_rv_pkg::PRV_S),
+        .priv_s_i   ((mem_walk_start ? mmu_priv : csr_priv_r) == eth_rv_pkg::PRV_S),
         .sum_i      (csr_mstatus_r[18]),
         .mxr_i      (csr_mstatus_r[19]),
         .ppn_i      (csr_satp_r[43:0]),
@@ -1672,6 +1734,8 @@ module eth_rv_core (
             csr_mscratch_r <= 64'd0;
             csr_medeleg_r  <= 64'd0;
             csr_mideleg_r  <= 64'd0;
+            csr_pmpcfg_r   <= eth_rv_pkg::PMPCFG_RESET;
+            csr_pmpaddr_r  <= eth_rv_pkg::PMPADDR_RESET;
             csr_mip_r      <= 64'd0;
             csr_stvec_r    <= 64'd0;
             csr_sepc_r     <= 64'd0;
@@ -1829,11 +1893,38 @@ module eth_rv_core (
                 eth_rv_pkg::CSR_SENVCFG: begin
                     csr_senvcfg_r <= csr_wdata[0] & eth_rv_pkg::SENVCFG_WMASK[0];
                 end
+                // S4: the PMP cfg registers. A write is dropped ENTIRELY when any
+                // entry it covers is locked (L set) — the measured golden rule; note
+                // this is the write-shaped half of "the L bit really locks", the
+                // other half being the `pmpaddr` drop below.
+                eth_rv_pkg::CSR_PMPCFG0: begin
+                    if (!pmp_cfg_half_locked(csr_pmpcfg_r, 1'b0)) begin
+                        csr_pmpcfg_r[63:0] <= csr_wdata[63:0]
+                                              & {8{eth_rv_pkg::PMPCFG_BYTE_WMASK}};
+                    end
+                end
+                eth_rv_pkg::CSR_PMPCFG2: begin
+                    if (!pmp_cfg_half_locked(csr_pmpcfg_r, 1'b1)) begin
+                        csr_pmpcfg_r[127:64] <= csr_wdata[63:0]
+                                                & {8{eth_rv_pkg::PMPCFG_BYTE_WMASK}};
+                    end
+                end
+                // ... and the sixteen address registers, each dropped when its own
+                // cfg entry is locked (Spike: after `pmpcfg0 = -1`, a `pmpaddr1`
+                // write reads back unchanged).
+                default: begin
+                    if (eth_rv_pkg::csr_is_pmpaddr(ex_ctrl_r.csr_addr)
+                        && !pmp_entry_locked(csr_pmpcfg_r, ex_ctrl_r.csr_addr[3:0])) begin
+                        csr_pmpaddr_r[{ex_ctrl_r.csr_addr[3:0], 6'b000000} +: 64]
+                            <= csr_wdata & eth_rv_pkg::PMPADDR_WMASK;
+                    end
+                end
                 // misa is WARL read-only in practice, a write to the read-only
                 // mhartid/mvendorid/marchid/mimpid/mconfigptr never gets here (it
                 // traps as an illegal instruction), and a write to a mhpm counter or
-                // event register is legal and drops.
-                default: ;
+                // event register is legal and drops. The PMP address registers are
+                // handled in the `default` arm above; `pmpcfg1`/`pmpcfg3` never
+                // reach this case (unimplemented => illegal instruction).
             endcase
         end else if (ex_fpu_ff_we) begin
             // an FP operation accrued flags: fflags |= raised (SoftFloat's
