@@ -257,6 +257,13 @@ module tb_eth_rv_core;
     logic [63:0] core_err_pc;
     logic [31:0] core_err_insn;
     logic [3:0]  core_err_code;
+    logic        core_err_irq;
+
+    // CLINT interrupt lines (MSIP/MTIP) and the hart's executed-instruction
+    // strobe that ticks the CLINT's mtime on Spike's cadence.
+    logic        msip;
+    logic        mtip;
+    logic        step_strobe;
 
     eth_rv_core u_dut (
         .clk_i           (clk),
@@ -275,6 +282,9 @@ module tb_eth_rv_core;
         .dmem_ready_i    (core_dmem_ready),
         .dmem_rdata_i    (core_dmem_rdata),
         .dmem_err_i      (core_dmem_err),
+        .msip_i          (msip),
+        .mtip_i          (mtip),
+        .meip_i          (1'b0),          // no PLIC in the golden model either
         .rvfi_valid_o    (rvfi_valid),
         .rvfi_order_o    (rvfi_order),
         .rvfi_pc_o       (rvfi_pc),
@@ -290,7 +300,9 @@ module tb_eth_rv_core;
         .err_o           (core_err),
         .err_pc_o        (core_err_pc),
         .err_insn_o      (core_err_insn),
-        .err_code_o      (core_err_code)
+        .err_code_o      (core_err_code),
+        .err_irq_o       (core_err_irq),
+        .step_o          (step_strobe)
     );
 
     // ------------------------------------------------------------- SoC MMIO decode
@@ -324,7 +336,10 @@ module tb_eth_rv_core;
         .mem_err_i      (dmem_err),
         .uart_tx_o      (uart_tx),
         .uart_busy_o    (uart_busy),
-        .uart_overflow_o(uart_overflow)
+        .uart_overflow_o(uart_overflow),
+        .msip_o         (msip),
+        .mtip_o         (mtip),
+        .step_i         (step_strobe)
     );
 
     // ------------------------------------------------------------------ I port
@@ -715,7 +730,8 @@ module tb_eth_rv_core;
     int unsigned n_loads;
     int unsigned n_stores;
     int unsigned traps;
-    int unsigned n_access_faults;   // traps taken with mcause 1/5/7
+    int unsigned n_access_faults;   // EXCEPTIONS taken with mcause 1/5/7
+    int unsigned n_interrupts;      // traps that were interrupts
 
     // ---- WEDGE GUARD: a port request must be answered ----------------------
     // The RV-B D port used to hang on an access it could not serve (an
@@ -807,6 +823,7 @@ module tb_eth_rv_core;
             n_stores        <= 0;
             traps           <= 0;
             n_access_faults <= 0;
+            n_interrupts    <= 0;
             dport_wait      <= 0;
             iport_wait      <= 0;
             dport_wait_max  <= 0;
@@ -900,8 +917,12 @@ module tb_eth_rv_core;
             end else if (core_err && !stop_now) begin
                 traps    <= traps + 1;
                 last_trap_cause <= core_err_code;
-                if ((core_err_code == 4'd1) || (core_err_code == 4'd5)
-                    || (core_err_code == 4'd7)) begin
+                if (core_err_irq) begin
+                    // Same small cause codes (SSI/MSI/... ), different class: the
+                    // interrupt bit is what tells them apart, so count them apart.
+                    n_interrupts <= n_interrupts + 1;
+                end else if ((core_err_code == 4'd1) || (core_err_code == 4'd5)
+                             || (core_err_code == 4'd7)) begin
                     n_access_faults <= n_access_faults + 1;
                 end
                 if (traps >= max_traps) begin
@@ -1055,16 +1076,16 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response that never became an access fault");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 n_interrupts, n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_store_data, last_insn,
                  n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
-                 n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
+                 n_interrupts, n_access_faults, last_trap_cause, dport_wait_max, iport_wait_max,
                  last_mem_addr, last_store_data, last_insn,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `endif

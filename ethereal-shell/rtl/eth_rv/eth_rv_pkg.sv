@@ -85,27 +85,86 @@ package eth_rv_pkg;
     localparam logic [11:0] CSR_MTVAL    = 12'h343;
     localparam logic [11:0] CSR_MIP      = 12'h344;
     localparam logic [11:0] CSR_MHARTID  = 12'hf14;
+    localparam logic [11:0] CSR_MEDELEG  = 12'h302;
+    localparam logic [11:0] CSR_MIDELEG  = 12'h303;
+    localparam logic [11:0] CSR_MCOUNTEREN = 12'h306;
 
-    // Read-only CSR values. `misa` advertises exactly what RV-B implements
-    // (MXL=64, I, M, C) and the mstatus XL fields are the RV64 values, so a
-    // program that reads them sees the same bit pattern as the Spike golden
-    // model (see verif/eth_rv/README.md). `mip` has no interrupt source yet —
-    // the CLINT/PLIC are a later increment — so it reads as zero.
+    // S-mode CSR set (C14 §3; E2-RV1 increment 6). The S-mode trap CSRs are
+    // registers of their own — unlike mstatus/sstatus, they are not a view of a
+    // machine register. `satp` is deliberately NOT implemented: this slice has no
+    // MMU, so paging is a documented boundary (see verif/eth_rv/README.md
+    // "Privilege modes and trap delegation").
+    localparam logic [11:0] CSR_SSTATUS    = 12'h100;
+    localparam logic [11:0] CSR_SIE        = 12'h104;
+    localparam logic [11:0] CSR_STVEC      = 12'h105;
+    localparam logic [11:0] CSR_SCOUNTEREN = 12'h106;
+    localparam logic [11:0] CSR_SSCRATCH   = 12'h140;
+    localparam logic [11:0] CSR_SEPC       = 12'h141;
+    localparam logic [11:0] CSR_SCAUSE     = 12'h142;
+    localparam logic [11:0] CSR_STVAL      = 12'h143;
+    localparam logic [11:0] CSR_SIP        = 12'h144;
+
+    // ------------------------------------------------------- privilege levels
+    // The hart supports U, S and M: `misa` advertises S and U, and the golden
+    // model's `--isa=rv64imc` enables both. PRV_M = 2'b11 is the architectural
+    // encoding; 2'b10 (HS) never occurs without the H extension.
+    typedef enum logic [1:0] {
+        PRV_U = 2'd0,
+        PRV_S = 2'd1,
+        PRV_M = 2'd3
+    } priv_e;
+
+    // Read-only CSR values. `misa` advertises exactly what this hart implements
+    // (MXL=64, I, M, C, S, U) and the mstatus XL fields are the RV64 values, so a
+    // program that reads them sees the same bit pattern as the Spike golden model
+    // (see verif/eth_rv/README.md). `mip` is a real register as of increment 6.
     localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_1104;
     localparam logic [63:0] MSTATUS_XL    = 64'h0000_000a_0000_0000;  // SXL = UXL = 2
-    localparam logic [63:0] MIP_VALUE     = 64'd0;
     localparam logic [63:0] MHARTID_VALUE = 64'd0;
 
-    // Write masks / field selectors of the writable CSRs.
-    localparam logic [63:0] MIE_WMASK     = 64'h0000_0000_0000_0aaa;  // SSIE MSIE STIE MTIE SEIE MEIE
-    localparam logic [63:0] MSTATUS_WMASK = 64'h0000_0000_0000_1888;  // MIE, MPIE, MPP
+    // Write masks of the writable CSRs, each one exactly the golden model's WARL
+    // mask — the DiffTest compares CSR round trips, so a mask that differs by one
+    // bit is a visible failure, not a silent one.
+    //
+    // mstatus: with S/U implemented and the golden model carrying an MMU, Spike's
+    // writable set is SIE|SPIE|SPP|FS|MPP|MPIE|MIE|MPRV|SUM|MXR|TVM|TW|TSR. eth_rv
+    // has no MMU and implements none of the MMU/TW/TSR *behaviour*, but the bits are
+    // WARL storage here too: a corpus round trip through mstatus must reproduce the
+    // golden value bit for bit. `mstatus.SD` is derived from FS (Spike's
+    // adjust_sd()), and sstatus is the S-mode view: its write mask is the S-owned
+    // subset, its read mask adds UXL (read-only 2) and SD.
+    localparam logic [63:0] MSTATUS_WMASK = 64'h0000_0000_007e_79aa;
+    localparam logic [63:0] SSTATUS_WMASK = 64'h0000_0000_000c_6122;  // SIE|SPIE|SPP|FS|SUM|MXR
+    localparam logic [63:0] SSTATUS_RMASK = 64'h8000_0002_000c_6122;  // | UXL | SD
+    localparam logic [63:0] MSTATUS_FS    = 64'h0000_0000_0000_6000;  // FS = 2'b11 -> SD
+    localparam logic [63:0] MSTATUS_SD    = 64'h8000_0000_0000_0000;
     localparam logic [63:0] MSTATUS_MIE   = 64'h0000_0000_0000_0008;
     localparam logic [63:0] MSTATUS_MPIE  = 64'h0000_0000_0000_0080;
-    localparam logic [63:0] MSTATUS_MPP_M = 64'h0000_0000_0000_1800;  // MPP = M
-    // mtvec is fully writable: the golden model keeps the MODE bits verbatim and
-    // masks bit 0 only when it computes the trap target. mepc[0] is read-only zero
-    // (IALIGN = 16).
+    localparam logic [63:0] MSTATUS_SIE   = 64'h0000_0000_0000_0002;
+    localparam logic [63:0] MSTATUS_SPIE  = 64'h0000_0000_0000_0020;
+    localparam logic [63:0] MSTATUS_SPP   = 64'h0000_0000_0000_0100;
+    localparam logic [63:0] MSTATUS_MPP   = 64'h0000_0000_0000_1800;
+    localparam logic [63:0] MSTATUS_MPRV  = 64'h0000_0000_0002_0000;
+    // Interrupt pending/enable/delegation masks. Spike (rv64imc, no AIA) has six
+    // interrupt sources: SSI(1), MSI(3), STI(5), MTI(7), SEI(9), MEI(11). The
+    // machine bits are hardware-driven; the supervisor bits are software-writable
+    // through `mip`, and `sip` can write only SSIP (Spike's generic accessor
+    // ip_write_mask = MIP_SSIP | MIP_LCOFIP). mideleg is writable for the three
+    // supervisor bits; medeleg for causes 1..9 plus the three page faults Spike's
+    // MMU defines (12/13/15), which are WARL storage here because eth_rv never
+    // raises them.
+    localparam logic [63:0] MIP_MSIP      = 64'h0000_0000_0000_0008;
+    localparam logic [63:0] MIP_MTIP      = 64'h0000_0000_0000_0080;
+    localparam logic [63:0] MIP_MEIP      = 64'h0000_0000_0000_0800;
+    localparam logic [63:0] MIP_SW_WMASK  = 64'h0000_0000_0000_0222;  // mip: SSIP|STIP|SEIP
+    localparam logic [63:0] MIP_SIP_WMASK = 64'h0000_0000_0000_0002;  // sip: SSIP only
+    localparam logic [63:0] MIE_WMASK     = 64'h0000_0000_0000_0aaa;  // SSIE MSIE STIE MTIE SEIE MEIE
+    localparam logic [63:0] MEDELEG_WMASK = 64'h0000_0000_0000_b3fe;  // 1..9, 12, 13, 15
+    localparam logic [63:0] MIDELEG_WMASK = 64'h0000_0000_0000_0222;  // SSI, STI, SEI
+    // mtvec/stvec keep MODE bit 0 and clear bit 1 (Spike's tvec_csr_t); mepc/sepc[0]
+    // is read-only zero (IALIGN = 16).
     localparam logic [63:0] MEPC_MASK     = 64'hffff_ffff_ffff_fffe;
+    localparam logic [63:0] MTVEC_MASK    = 64'hffff_ffff_ffff_fffd;
 
     // ------------------------------------------------------ exception causes
     // The architectural `mcause` values of the exceptions RV-B can raise
@@ -129,8 +188,27 @@ package eth_rv_pkg;
         CAUSE_LOAD_ACCESS    = 4'd5,   // load access fault (unmapped / rejected / DECERR)
         CAUSE_STORE_MISALIGN = 4'd6,   // store address misaligned
         CAUSE_STORE_ACCESS   = 4'd7,   // store access fault (unmapped / rejected / DECERR)
+        CAUSE_ECALL_U        = 4'd8,   // ecall from U-mode
+        CAUSE_ECALL_S        = 4'd9,   // ecall from S-mode
         CAUSE_ECALL_M        = 4'd11   // ecall from M-mode
     } trap_cause_e;
+
+    // Interrupt cause codes (the low bits of `mcause`/`scause` when bit 63 is
+    // set). The names are the architectural ones; the values are Spike's IRQ_*
+    // numbering, and the priority order below is Spike's
+    // select_an_interrupt_with_default_priority().
+    localparam logic [3:0] IRQ_SSI = 4'd1;
+    localparam logic [3:0] IRQ_MSI = 4'd3;
+    localparam logic [3:0] IRQ_STI = 4'd5;
+    localparam logic [3:0] IRQ_MTI = 4'd7;
+    localparam logic [3:0] IRQ_SEI = 4'd9;
+    localparam logic [3:0] IRQ_MEI = 4'd11;
+
+    // The architectural cause word: bit 63 marks an interrupt, exactly as both
+    // mcause and scause are written on trap entry.
+    function automatic logic [63:0] cause_word(input logic is_irq, input logic [3:0] code);
+        cause_word = {is_irq, 59'd0, code};
+    endfunction
 
     // True when `addr` names a CSR this core implements. Anything else is an
     // illegal instruction (C14 §3: unimplemented CSR access NEVER succeeds
@@ -144,10 +222,20 @@ package eth_rv_pkg;
             eth_rv_pkg::CSR_MSTATUS, eth_rv_pkg::CSR_MISA, eth_rv_pkg::CSR_MIE,
             eth_rv_pkg::CSR_MTVEC, eth_rv_pkg::CSR_MSCRATCH, eth_rv_pkg::CSR_MEPC,
             eth_rv_pkg::CSR_MCAUSE, eth_rv_pkg::CSR_MTVAL, eth_rv_pkg::CSR_MIP,
-            eth_rv_pkg::CSR_MHARTID: csr_implemented = 1'b1;
-            default:                 csr_implemented = 1'b0;
+            eth_rv_pkg::CSR_MHARTID, eth_rv_pkg::CSR_MEDELEG, eth_rv_pkg::CSR_MIDELEG,
+            eth_rv_pkg::CSR_MCOUNTEREN,
+            eth_rv_pkg::CSR_SSTATUS, eth_rv_pkg::CSR_SIE, eth_rv_pkg::CSR_STVEC,
+            eth_rv_pkg::CSR_SCOUNTEREN, eth_rv_pkg::CSR_SSCRATCH, eth_rv_pkg::CSR_SEPC,
+            eth_rv_pkg::CSR_SCAUSE, eth_rv_pkg::CSR_STVAL, eth_rv_pkg::CSR_SIP:
+                csr_implemented = 1'b1;
+            default: csr_implemented = 1'b0;
         endcase
     endfunction
+
+    // The privilege level a CSR belongs to is address bits [9:8] (00 = U, 01 =
+    // S/HS, 10 = H, 11 = M) and a read-only CSR is one whose [11:10] field is 11
+    // — the decode Spike's csr_t::verify_permissions() uses. eth_rv_core applies
+    // both checks directly on the decoded address.
 
     // ------------------------------------------------ M-extension operation
     typedef enum logic [3:0] {
@@ -203,6 +291,7 @@ package eth_rv_pkg;
         logic       is_ecall;
         logic       is_ebreak;
         logic       is_mret;
+        logic       is_sret;     // sret (S-mode return; legal in M when TSR = 0)
     } ctrl_t;
 
     // The error strobe's code type is `trap_cause_e`: the core no longer halts on

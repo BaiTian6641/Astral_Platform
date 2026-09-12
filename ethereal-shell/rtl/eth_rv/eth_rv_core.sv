@@ -144,6 +144,11 @@ module eth_rv_core (
     input  logic [63:0] dmem_rdata_i,
     input  logic        dmem_err_i,      // with dmem_ready_i: this access faulted
 
+    // ---- interrupt lines (C14 §3; the CLINT in eth_rv_mmio_mux drives them) ----
+    input  logic        msip_i,          // machine software interrupt (CLINT msip[0])
+    input  logic        mtip_i,          // machine timer interrupt (mtime >= mtimecmp)
+    input  logic        meip_i,          // machine external interrupt (no PLIC: tied 0)
+
     // ---- RVFI-style commit trace (C14 §4) ----
     output logic        rvfi_valid_o,
     output logic [63:0] rvfi_order_o,
@@ -162,7 +167,11 @@ module eth_rv_core (
     output logic        err_o,
     output logic [63:0] err_pc_o,
     output logic [31:0] err_insn_o,
-    output logic [3:0]  err_code_o
+    output logic [3:0]  err_code_o,
+    output logic        err_irq_o,   // with err_o: this trap is an interrupt
+
+    // ---- executed-instruction strobe (the SoC CLINT's mtime cadence) ----
+    output logic        step_o
 );
 
     // ---- package names used unqualified in this module --------------------
@@ -319,6 +328,8 @@ module eth_rv_core (
     logic        ex_trap;        // instruction-side exception, taken in EX
     logic        mem_trap;       // data-side exception, taken in MEM
     logic        trap_hit;
+    logic        trap_is_irq;    // this trap is an interrupt (bit 63 of the cause)
+    logic        trap_to_s;      // ... and it is delegated to S-mode
     logic [63:0] trap_pc;
     logic [63:0] trap_mtval;
     logic [31:0] trap_insn;
@@ -326,6 +337,24 @@ module eth_rv_core (
     logic [63:0] trap_target;
     logic [3:0]  ex_cause;
     logic [63:0] ex_trap_value;
+
+    // privilege-aware legality of SYSTEM instructions and CSR accesses (the
+    // decoder classifies the encoding; the *current* mode decides legality)
+    logic        ex_csr_write_form;
+    logic        ex_csr_priv_ok;
+    logic        ex_csr_illegal;
+    logic        ex_mret_illegal;
+    logic        ex_sret_illegal;
+    logic [1:0]  priv_eff;
+
+    // interrupt lines and selection
+    logic [63:0] mip_eff;        // mip as the CSR/read path sees it
+    logic [11:0] irq_pending;    // mip & mie, restricted to the six IRQ bits
+    logic        irq_m_enabled;
+    logic        irq_s_enabled;
+    logic        irq_take;       // an interrupt is deliverable in this cycle
+    logic [3:0]  irq_code;
+    logic        ex_irq;         // ... and it is taken for the instruction in EX
 
     assign md_wait  = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv && !md_valid;
     // A misaligned access is a trap, not a stall: it never asserts `dmem_req_o`, so
@@ -348,11 +377,77 @@ module eth_rv_core (
     assign mem_misaligned = mem_valid_r && !mem_ctrl_r.illegal
                             && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && lsu_misaligned;
 
+    // ---- SYSTEM legality under the current privilege ------------------------
+    // The decoder classifies the encoding; whether the *current* mode may execute
+    // it is decided here, exactly as Spike's require_privilege()/validate_csr():
+    //   * mret requires M;
+    //   * sret requires S (or M) and requires M when mstatus.TSR = 1;
+    //   * a CSR access requires the CSR's own privilege ([9:8] of the address) not
+    //     to exceed the current one, and a write to a read-only CSR (mhartid) is
+    //     illegal even from M;
+    //   * ecall is legal everywhere; only its cause depends on the mode.
+    // In S-mode the comparison is against PRV_HS (2): Spike's S-mode *is* HS
+    // without the H extension, so an S-owned CSR is one level below the current
+    // mode. csr_priv = 2'b10 (H-owned) is never legal here — the address decode
+    // rejects it.
+    assign priv_eff = (csr_priv_r == eth_rv_pkg::PRV_S) ? 2'd2 : csr_priv_r;
+    assign ex_csr_write_form = ex_ctrl_r.is_csr
+                               && ((ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW)
+                                   || ((ex_ctrl_r.csr_imm ? (ex_imm_r[4:0] != 5'd0)
+                                                          : (ex_rs1_r != 5'd0))));
+    assign ex_csr_priv_ok = (ex_ctrl_r.csr_addr[9:8] != 2'b10)
+                            && (ex_ctrl_r.csr_addr[9:8] <= priv_eff);
+    assign ex_csr_illegal = ex_ctrl_r.is_csr
+                            && (!ex_csr_priv_ok
+                                || ((ex_ctrl_r.csr_addr[11:10] == 2'b11)
+                                    && ex_csr_write_form));
+    assign ex_mret_illegal = ex_ctrl_r.is_mret && (csr_priv_r != eth_rv_pkg::PRV_M);
+    // TSR (mstatus bit 22): when set, sret is an M-only instruction.
+    assign ex_sret_illegal = ex_ctrl_r.is_sret
+                             && ((csr_priv_r == eth_rv_pkg::PRV_U)
+                                 || ((csr_priv_r == eth_rv_pkg::PRV_S) && csr_mstatus_r[22]));
+
+    // ---- interrupt selection (Spike's take_interrupt/priority order) --------
+    // pending = mip & mie; M-eligible = pending & ~mideleg while an M interrupt
+    // can be taken (in any mode below M, or in M with mstatus.MIE); S-eligible =
+    // pending & mideleg while an S interrupt can be taken (below S, or in S with
+    // sstatus.SIE). The M set wins wholesale, and within a set Spike's priority
+    // is MEI, MSI, MTI, SEI, SSI, STI. MEIP has no source in this platform (there
+    // is no PLIC), so it stays 0 — exactly like the golden model's default.
+    assign mip_eff = csr_mip_r
+                     | (msip_i ? eth_rv_pkg::MIP_MSIP : 64'd0)
+                     | (mtip_i ? eth_rv_pkg::MIP_MTIP : 64'd0)
+                     | (meip_i ? eth_rv_pkg::MIP_MEIP : 64'd0);
+    assign irq_pending   = mip_eff[11:0] & csr_mie_r[11:0];
+    assign irq_m_enabled = (csr_priv_r != eth_rv_pkg::PRV_M) || csr_mstatus_r[3];
+    assign irq_s_enabled = (csr_priv_r != eth_rv_pkg::PRV_S) || csr_mstatus_r[1];
+
+    always_comb begin
+        logic [11:0] m_elig;
+        logic [11:0] s_elig;
+        logic [11:0] sel;
+        // The two eligibility sets are disjoint by construction (one takes
+        // ~mideleg, the other mideleg), so the union IS the selection, and the
+        // reduction below is "is anything deliverable".
+        m_elig = irq_m_enabled ? (irq_pending & ~csr_mideleg_r[11:0]) : 12'd0;
+        s_elig = irq_s_enabled ? (irq_pending &  csr_mideleg_r[11:0]) : 12'd0;
+        sel      = m_elig | s_elig;
+        irq_take = |sel;
+        if      (sel[11]) irq_code = eth_rv_pkg::IRQ_MEI;
+        else if (sel[3])  irq_code = eth_rv_pkg::IRQ_MSI;
+        else if (sel[7])  irq_code = eth_rv_pkg::IRQ_MTI;
+        else if (sel[9])  irq_code = eth_rv_pkg::IRQ_SEI;
+        else if (sel[1])  irq_code = eth_rv_pkg::IRQ_SSI;
+        else if (sel[5])  irq_code = eth_rv_pkg::IRQ_STI;
+        else              irq_code = 4'd0;
+    end
+
     // ---- exception detection -------------------------------------------
     // Instruction-side exceptions are recognised in EX: an unimplemented
-    // encoding, ecall/ebreak, a control transfer to an odd address, or a fetch
-    // the instruction port answered with an error (`ex_fault_r`, the same class
-    // as a data-side error response — see `mem_access_err`). The misaligned
+    // encoding, an illegal SYSTEM operation (CSR privilege/read-only, mret/sret
+    // in the wrong mode), ecall/ebreak, a control transfer to an odd address, or
+    // a fetch the instruction port answered with an error (`ex_fault_r`, the same
+    // class as a data-side error response — see `mem_access_err`). The misaligned
     // target check is structurally unreachable while IALIGN = 16 and JALR clears
     // bit 0 — it is kept so a future IALIGN = 32 config (or a JALR that stopped
     // masking) cannot silently fetch from a misaligned address.
@@ -363,12 +458,25 @@ module eth_rv_core (
     // it), so the fault marker — not the (void) fetched bytes — decides. It still
     // needs `!ex_stall`, exactly like every other EX-side trap: the trap is taken
     // in the first cycle the instruction can leave EX.
+    //
+    // INTERRUPTS are checked one stage earlier in *time*: Spike calls
+    // take_pending_interrupt() before it fetches each instruction, so an
+    // interrupt pre-empts the next instruction before that instruction starts.
+    // Here the instruction in EX is that "next instruction" — it is taken in the
+    // cycle it can first leave EX, and `md_start` is suppressed in the same cycle,
+    // so a mul/div is pre-empted before it starts rather than after it finishes.
+    // A fetch fault is deliberately NOT pre-empted: the fetch already failed, and
+    // in Spike that trap is raised at fetch time, before any later interrupt
+    // check. A MEM-side trap outranks everything (its instruction is older).
     assign ex_target_misaligned = ex_valid_r && !ex_ctrl_r.illegal && !ex_fault_r && ex_next_pc[0];
     assign ex_trap = ex_valid_r && !ex_stall
                      && (ex_fault_r || ex_ctrl_r.illegal || ex_ctrl_r.is_ecall
-                         || ex_ctrl_r.is_ebreak || ex_target_misaligned);
+                         || ex_ctrl_r.is_ebreak || ex_target_misaligned
+                         || ex_csr_illegal || ex_mret_illegal || ex_sret_illegal);
+    assign ex_irq = ex_valid_r && !ex_fault_r && !md_started_r && !mem_trap && irq_take;
     assign mem_trap = mem_misaligned || mem_access_err;
-    assign trap_hit = mem_trap || ex_trap;
+    assign trap_is_irq = !mem_trap && ex_irq;
+    assign trap_hit = mem_trap || ex_irq || ex_trap;
     assign trap_pc   = mem_trap ? mem_pc_r   : ex_pc_r;
     assign trap_insn = mem_trap ? mem_insn_r : ex_insn_r;
 
@@ -378,12 +486,18 @@ module eth_rv_core (
         if (ex_fault_r) begin
             ex_cause = eth_rv_pkg::CAUSE_INSN_ACCESS;
         end else if (ex_ctrl_r.is_ecall) begin
-            ex_cause = eth_rv_pkg::CAUSE_ECALL_M;
+            // Environment call: the cause names the mode that issued it.
+            ex_cause = (csr_priv_r == eth_rv_pkg::PRV_M) ? eth_rv_pkg::CAUSE_ECALL_M
+                       : (csr_priv_r == eth_rv_pkg::PRV_S) ? eth_rv_pkg::CAUSE_ECALL_S
+                                                           : eth_rv_pkg::CAUSE_ECALL_U;
         end else if (ex_ctrl_r.is_ebreak) begin
             ex_cause = eth_rv_pkg::CAUSE_BREAKPOINT;
         end else if (ex_target_misaligned) begin
             ex_cause = eth_rv_pkg::CAUSE_INSN_MISALIGN;
         end else begin
+            // Every remaining EX-side trap is an illegal instruction: an
+            // unimplemented encoding, a CSR the current mode may not touch, a
+            // write to a read-only CSR, or mret/sret in a mode that forbids it.
             ex_cause = eth_rv_pkg::CAUSE_ILLEGAL;
         end
     end
@@ -408,17 +522,28 @@ module eth_rv_core (
     // The MEM-side cause tells the two trap classes apart: misaligned (4/6) is
     // decided before the access is issued, an access fault (5/7) is the port's
     // error response to the issued access. Both report `mtval` = the address.
+    // An interrupt carries its IRQ code with bit 63 set in the cause word and
+    // `tval` = 0 (Spike: `trap_t::get_tval()` is 0 for every interrupt).
     assign trap_cause = mem_misaligned
                         ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_MISALIGN
                                                : eth_rv_pkg::CAUSE_LOAD_MISALIGN)
                         : mem_access_err
                           ? (mem_ctrl_r.is_store ? eth_rv_pkg::CAUSE_STORE_ACCESS
                                                  : eth_rv_pkg::CAUSE_LOAD_ACCESS)
-                          : ex_cause;
-    assign trap_mtval = mem_trap ? mem_addr_r : ex_trap_value;
-    // Exceptions always go to the direct base, exactly like Spike — mtvec MODE is
-    // kept as a data bit but only interrupts would vector, and RV-B has none.
-    assign trap_target = csr_mtvec_r & ~64'd1;
+                          : trap_is_irq ? irq_code : ex_cause;
+    assign trap_mtval = mem_trap ? mem_addr_r : (trap_is_irq ? 64'd0 : ex_trap_value);
+    // Delegation: an exception is handled in S-mode when medeleg[i] is set, an
+    // interrupt when mideleg[i] is set — but only for a trap taken below M-mode,
+    // exactly like Spike's `state.prv <= PRV_S` guard (a trap raised while in
+    // M-mode is never delegated, whatever the delegation registers say).
+    assign trap_to_s  = (csr_priv_r != eth_rv_pkg::PRV_M)
+                        && ((((trap_is_irq ? csr_mideleg_r : csr_medeleg_r)
+                              >> trap_cause) & 64'd1) == 64'd1);
+    // Vectoring: Spike vectors only interrupts (`(tvec & 1) && interrupt`), and
+    // only on MODE bit 0. Exceptions always take the direct base.
+    assign trap_target = ((trap_to_s ? csr_stvec_r : csr_mtvec_r) & ~64'd1)
+                         + ((trap_is_irq && (trap_to_s ? csr_stvec_r[0] : csr_mtvec_r[0]))
+                            ? {58'd0, trap_cause, 2'b00} : 64'd0);
 
     assign ex_stall    = md_wait || mem_wait;
     assign front_stall = ex_stall || load_use;
@@ -497,10 +622,12 @@ module eth_rv_core (
 
     always_comb begin
         if (ex_ctrl_r.is_mret) begin
-            // mret is not predicted as a jump (the decoder leaves it to the
-            // fall-through), so the redirect below catches it exactly like any
+            // mret/sret are not predicted as jumps (the decoder leaves them to the
+            // fall-through), so the redirect below catches them exactly like any
             // other mispredicted transfer.
             ex_next_pc = csr_mepc_r;
+        end else if (ex_ctrl_r.is_sret) begin
+            ex_next_pc = csr_sepc_r;
         end else if (ex_ctrl_r.is_jump) begin
             // direct: pc + imm; indirect (jalr family): (rs1 + imm) with bit 0 cleared
             ex_next_pc = ex_ctrl_r.is_indirect ? (ex_alu_res & ~64'd1) : ex_alu_res;
@@ -533,13 +660,16 @@ module eth_rv_core (
     end
 
     // =====================================================================
-    // M-mode CSR file (C14 §3)
+    // CSR file: M-mode set + the S-mode trap set (C14 §3, increment 6)
     // =====================================================================
-    // Only the writable CSRs have state; misa/mip/mhartid are read-only constants
-    // (their values live in the package so the golden model and the RTL cannot
-    // drift apart). The reset value of mstatus (`MSTATUS_XL`) and `misa` match
-    // Spike's for RV64IMC, which is what makes a corpus program that reads them
-    // compare clean against the golden stream.
+    // `csr_mstatus_r` holds the whole mstatus register bar SD, which is derived
+    // from FS on every read (Spike's adjust_sd()). `sstatus` is a *view* of the
+    // same register, so a write through sstatus and a read through mstatus can
+    // never disagree — the DiffTest leans on exactly that. The S-mode trap CSRs
+    // (stvec/sepc/scause/stval/sscratch) are independent registers, and
+    // mcounteren/scounteren have no state at all: with no Zicntr in the ISA the
+    // golden model's write mask is zero, so a write is legal and drops.
+    logic [1:0]  csr_priv_r;        // current privilege, PRV_U/PRV_S/PRV_M
     logic [63:0] csr_mstatus_r;
     logic [63:0] csr_mie_r;
     logic [63:0] csr_mtvec_r;
@@ -547,26 +677,61 @@ module eth_rv_core (
     logic [63:0] csr_mcause_r;
     logic [63:0] csr_mtval_r;
     logic [63:0] csr_mscratch_r;
+    logic [63:0] csr_medeleg_r;
+    logic [63:0] csr_mideleg_r;
+    logic [63:0] csr_mip_r;         // software-writable pending bits only
+    logic [63:0] csr_stvec_r;
+    logic [63:0] csr_sepc_r;
+    logic [63:0] csr_scause_r;
+    logic [63:0] csr_stval_r;
+    logic [63:0] csr_sscratch_r;
 
     logic [63:0] csr_rdata;
     logic [63:0] csr_wdata;
+    logic [63:0] csr_mstatus_rd;
     logic [63:0] ex_csr_src;
     logic        ex_csr_we;
     logic        ex_mret_we;
+    logic        ex_sret_we;
+    logic [63:0] mstatus_wr;
+    logic [1:0]  mpp_wr;
+
+    // mstatus as read: the stored value with SD derived from FS (Spike sets SD on
+    // every write of FS = 11 and clears it otherwise).
+    assign csr_mstatus_rd = ((csr_mstatus_r & eth_rv_pkg::MSTATUS_FS) == eth_rv_pkg::MSTATUS_FS)
+                            ? (csr_mstatus_r | eth_rv_pkg::MSTATUS_SD)
+                            : (csr_mstatus_r & ~eth_rv_pkg::MSTATUS_SD);
 
     always_comb begin
         unique case (ex_ctrl_r.csr_addr)
-            eth_rv_pkg::CSR_MSTATUS:  csr_rdata = csr_mstatus_r;
-            eth_rv_pkg::CSR_MISA:     csr_rdata = eth_rv_pkg::MISA_VALUE;
-            eth_rv_pkg::CSR_MIE:      csr_rdata = csr_mie_r;
-            eth_rv_pkg::CSR_MTVEC:    csr_rdata = csr_mtvec_r;
-            eth_rv_pkg::CSR_MSCRATCH: csr_rdata = csr_mscratch_r;
-            eth_rv_pkg::CSR_MEPC:     csr_rdata = csr_mepc_r;
-            eth_rv_pkg::CSR_MCAUSE:   csr_rdata = csr_mcause_r;
-            eth_rv_pkg::CSR_MTVAL:    csr_rdata = csr_mtval_r;
-            eth_rv_pkg::CSR_MIP:      csr_rdata = eth_rv_pkg::MIP_VALUE;
-            eth_rv_pkg::CSR_MHARTID:  csr_rdata = eth_rv_pkg::MHARTID_VALUE;
-            default:                  csr_rdata = 64'd0;
+            eth_rv_pkg::CSR_MSTATUS:   csr_rdata = csr_mstatus_rd;
+            eth_rv_pkg::CSR_SSTATUS:   csr_rdata = csr_mstatus_rd & eth_rv_pkg::SSTATUS_RMASK;
+            eth_rv_pkg::CSR_MISA:      csr_rdata = eth_rv_pkg::MISA_VALUE;
+            eth_rv_pkg::CSR_MIE:       csr_rdata = csr_mie_r;
+            // sie is mie masked by mideleg (Spike's generic accessor: ie_read =
+            // mie & deleg_mask & read_mask, and only the S bits are delegable).
+            eth_rv_pkg::CSR_SIE:       csr_rdata = csr_mie_r & csr_mideleg_r;
+            eth_rv_pkg::CSR_MTVEC:     csr_rdata = csr_mtvec_r;
+            eth_rv_pkg::CSR_STVEC:     csr_rdata = csr_stvec_r;
+            eth_rv_pkg::CSR_MEDELEG:   csr_rdata = csr_medeleg_r;
+            eth_rv_pkg::CSR_MIDELEG:   csr_rdata = csr_mideleg_r;
+            // mcounteren/scounteren exist but have a zero write mask under
+            // `--isa=rv64imc` (no Zicntr), so they read 0 whatever is written.
+            eth_rv_pkg::CSR_MCOUNTEREN, eth_rv_pkg::CSR_SCOUNTEREN: csr_rdata = 64'd0;
+            eth_rv_pkg::CSR_MIP:       csr_rdata = mip_eff;
+            // sip sees the delegated pending bits: mip & mideleg (Spike's
+            // mip_proxy read through the MIDELEG accessor; MVIP aliasing is off).
+            eth_rv_pkg::CSR_SIP:       csr_rdata = mip_eff & csr_mideleg_r;
+            eth_rv_pkg::CSR_MSCRATCH:  csr_rdata = csr_mscratch_r;
+            eth_rv_pkg::CSR_SSCRATCH:  csr_rdata = csr_sscratch_r;
+            eth_rv_pkg::CSR_MEPC:      csr_rdata = csr_mepc_r;
+            eth_rv_pkg::CSR_SEPC:      csr_rdata = csr_sepc_r;
+            eth_rv_pkg::CSR_MCAUSE:    csr_rdata = csr_mcause_r;
+            eth_rv_pkg::CSR_SCAUSE:    csr_rdata = csr_scause_r;
+            eth_rv_pkg::CSR_MTVAL:     csr_rdata = csr_mtval_r;
+            eth_rv_pkg::CSR_STVAL:     csr_rdata = csr_stval_r;
+            eth_rv_pkg::CSR_MHARTID:   csr_rdata = eth_rv_pkg::MHARTID_VALUE;
+            default:                   csr_rdata = 64'd0;
         endcase
     end
 
@@ -579,24 +744,40 @@ module eth_rv_core (
     // read side effect still happens. A CSR is written on the cycle the
     // instruction LEAVES EX: `!ex_stall` keeps a frozen stage from writing twice,
     // and `!trap_hit` keeps a younger instruction from writing when an older one
-    // traps in MEM.
+    // (or an interrupt) traps.
     assign ex_csr_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_csr
                        && ((ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) || (ex_csr_src != 64'd0));
     assign csr_wdata = (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RW) ? ex_csr_src
                        : (ex_ctrl_r.csr_op == eth_rv_pkg::CSR_RS) ? (csr_rdata | ex_csr_src)
                                                                   : (csr_rdata & ~ex_csr_src);
 
-    // mret restores the interrupt-enable stack and returns to mepc. MPP is left as
-    // the least-privileged mode value (U) exactly as Spike does; the hart does not
-    // implement privilege levels, so MPP/MPIE are maintained as data to keep the
-    // trap bookkeeping bit-exact with the golden model.
+    // mstatus write value: the WARL mask, with MPP legalized (Spike's
+    // legalize_privilege(): 2'b10 is not a mode this hart has, so it becomes U).
+    assign mpp_wr = (csr_wdata[12:11] == 2'b10) ? eth_rv_pkg::PRV_U
+                                                : csr_wdata[12:11];
+    assign mstatus_wr = ((csr_mstatus_r & ~eth_rv_pkg::MSTATUS_WMASK)
+                         | (csr_wdata & eth_rv_pkg::MSTATUS_WMASK
+                            & ~eth_rv_pkg::MSTATUS_MPP))
+                        | {51'd0, mpp_wr, 11'd0};
+
+    // mret restores the interrupt-enable stack and returns to mepc; sret does the
+    // same for the S-mode stack and sepc. Both drop MPRV (Spike clears it unless
+    // the restored mode is M) and return to the least-privileged mode when the
+    // saved field says U — with U implemented, "MPP <= U" means the field is
+    // cleared. Legalizing the restored mode is what makes a stored 2'b10 return
+    // to U rather than to a mode that does not exist.
     assign ex_mret_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_mret;
+    assign ex_sret_we = ex_valid_r && !ex_stall && !trap_hit && ex_ctrl_r.is_sret;
 
     // =====================================================================
 
     // ---- M extension ----
+    // An interrupt taken in this cycle pre-empts the instruction *before* it
+    // starts, so it must also suppress the mul/div launch: Spike checks for
+    // pending interrupts before executing, and a live multiplier would otherwise
+    // finish work the golden model never started.
     assign md_start = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_muldiv
-                      && !md_started_r;
+                      && !md_started_r && !ex_irq;
 
     cor_muldiv u_muldiv (
         .clk_i   (clk_i),
@@ -688,6 +869,16 @@ module eth_rv_core (
     assign err_pc_o   = trap_pc;
     assign err_insn_o = trap_insn;
     assign err_code_o = trap_hit ? trap_cause : 4'd0;
+    // The 4-bit cause code cannot carry bit 63, so the "this is an interrupt"
+    // bit travels beside it: a trap is either an exception or an interrupt, and
+    // only the former can be an access fault.
+    assign err_irq_o  = trap_hit && trap_is_irq;
+
+    // "an instruction left EX this cycle": the hart's executed-instruction count,
+    // which is what Spike's CLINT counts to tick mtime (INSNS_PER_RTC_TICK).
+    // Squashed instructions never appear here (an older MEM trap drops the EX
+    // slot), and a mul/div that is still running is not counted until it leaves.
+    assign step_o = ex_valid_r && !ex_stall && !mem_trap;
 
     // =====================================================================
     // Sequential
@@ -708,8 +899,17 @@ module eth_rv_core (
     assign imem_addr_o = fetch_pc_r;
     assign fetch_hit   = imem_req_o && imem_ready_i;
     // ---- CSR state: trap effects outrank a younger instruction's CSR write ----
+    // Trap entry is split by destination: an M-mode trap writes mepc/mcause/mtval
+    // and the M stack, a delegated trap writes sepc/scause/stval and the S stack.
+    // Both write the *same* mstatus register — sstatus is a view of it — which is
+    // what keeps the two stacks consistent, exactly like Spike's
+    // nonvirtual_sstatus proxy. A trap in M-mode is never delegated.
+    logic [63:0] trap_cause_word;
+    assign trap_cause_word = eth_rv_pkg::cause_word(trap_is_irq, trap_cause);
+
     always_ff @(posedge clk_i or negedge rst_ni) begin
         if (!rst_ni) begin
+            csr_priv_r     <= eth_rv_pkg::PRV_M;
             csr_mstatus_r  <= eth_rv_pkg::MSTATUS_XL;
             csr_mie_r      <= 64'd0;
             csr_mtvec_r    <= 64'd0;
@@ -717,47 +917,132 @@ module eth_rv_core (
             csr_mcause_r   <= 64'd0;
             csr_mtval_r    <= 64'd0;
             csr_mscratch_r <= 64'd0;
+            csr_medeleg_r  <= 64'd0;
+            csr_mideleg_r  <= 64'd0;
+            csr_mip_r      <= 64'd0;
+            csr_stvec_r    <= 64'd0;
+            csr_sepc_r     <= 64'd0;
+            csr_scause_r   <= 64'd0;
+            csr_stval_r    <= 64'd0;
+            csr_sscratch_r <= 64'd0;
         end else if (trap_hit) begin
-            // The trapping instruction is older than whatever sits in EX, so its
-            // effects win; mepc/mcause/mtval follow the ISA and Spike.
-            csr_mepc_r   <= trap_pc;
-            csr_mcause_r <= {60'd0, trap_cause};
-            csr_mtval_r  <= trap_mtval;
-            csr_mstatus_r <= (csr_mstatus_r & ~eth_rv_pkg::MSTATUS_WMASK)
-                             | (csr_mstatus_r[3] ? eth_rv_pkg::MSTATUS_MPIE : 64'd0)
-                             | eth_rv_pkg::MSTATUS_MPP_M;
+            if (trap_to_s) begin
+                // Delegated trap: the S-mode stack. SPIE <= SIE, SPP <= the mode
+                // that trapped, SIE <= 0, and the hart enters S-mode.
+                csr_sepc_r    <= trap_pc;
+                csr_scause_r  <= trap_cause_word;
+                csr_stval_r   <= trap_mtval;
+                csr_mstatus_r <= (csr_mstatus_r
+                                  & ~(eth_rv_pkg::MSTATUS_SIE | eth_rv_pkg::MSTATUS_SPIE
+                                      | eth_rv_pkg::MSTATUS_SPP))
+                                 | (csr_mstatus_r[1] ? eth_rv_pkg::MSTATUS_SPIE : 64'd0)
+                                 | (csr_priv_r[0] ? eth_rv_pkg::MSTATUS_SPP : 64'd0);
+                csr_priv_r    <= eth_rv_pkg::PRV_S;
+            end else begin
+                // M-mode trap: MPIE <= MIE, MPP <= the mode that trapped, MIE <= 0.
+                csr_mepc_r    <= trap_pc;
+                csr_mcause_r  <= trap_cause_word;
+                csr_mtval_r   <= trap_mtval;
+                csr_mstatus_r <= (csr_mstatus_r
+                                  & ~(eth_rv_pkg::MSTATUS_MIE | eth_rv_pkg::MSTATUS_MPIE
+                                      | eth_rv_pkg::MSTATUS_MPP))
+                                 | (csr_mstatus_r[3] ? eth_rv_pkg::MSTATUS_MPIE : 64'd0)
+                                 | ({62'd0, csr_priv_r} << 11);
+                csr_priv_r    <= eth_rv_pkg::PRV_M;
+            end
         end else if (ex_csr_we) begin
             unique case (ex_ctrl_r.csr_addr)
                 eth_rv_pkg::CSR_MSTATUS: begin
-                    csr_mstatus_r <= (csr_mstatus_r & ~eth_rv_pkg::MSTATUS_WMASK)
-                                     | (csr_wdata & eth_rv_pkg::MSTATUS_WMASK);
+                    csr_mstatus_r <= mstatus_wr;
+                end
+                // A write through sstatus touches only the S-owned fields, and the
+                // SD/XL bits keep their derived/read-only values.
+                eth_rv_pkg::CSR_SSTATUS: begin
+                    csr_mstatus_r <= (csr_mstatus_r & ~eth_rv_pkg::SSTATUS_WMASK)
+                                     | (csr_wdata & eth_rv_pkg::SSTATUS_WMASK);
                 end
                 eth_rv_pkg::CSR_MIE: begin
                     csr_mie_r <= csr_wdata & eth_rv_pkg::MIE_WMASK;
                 end
+                // sie is the S-mode view: only bits the delegation register hands
+                // to S-mode can be written through it.
+                eth_rv_pkg::CSR_SIE: begin
+                    csr_mie_r <= (csr_mie_r & ~(csr_mideleg_r & eth_rv_pkg::MIE_WMASK))
+                                 | (csr_wdata & csr_mideleg_r & eth_rv_pkg::MIE_WMASK);
+                end
+                eth_rv_pkg::CSR_MIP: begin
+                    csr_mip_r <= (csr_mip_r & ~eth_rv_pkg::MIP_SW_WMASK)
+                                 | (csr_wdata & eth_rv_pkg::MIP_SW_WMASK);
+                end
+                // sip can only set SSIP, and only while SSIP is delegated.
+                eth_rv_pkg::CSR_SIP: begin
+                    csr_mip_r <= (csr_mip_r & ~(csr_mideleg_r & eth_rv_pkg::MIP_SIP_WMASK))
+                                 | (csr_wdata & csr_mideleg_r & eth_rv_pkg::MIP_SIP_WMASK);
+                end
+                eth_rv_pkg::CSR_MEDELEG: begin
+                    csr_medeleg_r <= csr_wdata & eth_rv_pkg::MEDELEG_WMASK;
+                end
+                eth_rv_pkg::CSR_MIDELEG: begin
+                    csr_mideleg_r <= csr_wdata & eth_rv_pkg::MIDELEG_WMASK;
+                end
                 eth_rv_pkg::CSR_MTVEC: begin
-                    csr_mtvec_r <= csr_wdata;   // MODE kept verbatim; the trap target masks bit 0
+                    csr_mtvec_r <= csr_wdata & eth_rv_pkg::MTVEC_MASK;
+                end
+                eth_rv_pkg::CSR_STVEC: begin
+                    csr_stvec_r <= csr_wdata & eth_rv_pkg::MTVEC_MASK;
                 end
                 eth_rv_pkg::CSR_MEPC: begin
                     csr_mepc_r <= csr_wdata & eth_rv_pkg::MEPC_MASK;
                 end
+                eth_rv_pkg::CSR_SEPC: begin
+                    csr_sepc_r <= csr_wdata & eth_rv_pkg::MEPC_MASK;
+                end
                 eth_rv_pkg::CSR_MCAUSE: begin
                     csr_mcause_r <= csr_wdata;
+                end
+                eth_rv_pkg::CSR_SCAUSE: begin
+                    csr_scause_r <= csr_wdata;
                 end
                 eth_rv_pkg::CSR_MTVAL: begin
                     csr_mtval_r <= csr_wdata;
                 end
+                eth_rv_pkg::CSR_STVAL: begin
+                    csr_stval_r <= csr_wdata;
+                end
                 eth_rv_pkg::CSR_MSCRATCH: begin
                     csr_mscratch_r <= csr_wdata;
                 end
-                // misa / mip / mhartid are read-only: the access is legal and the
-                // write is dropped (WARL), never a trap and never silent damage.
+                eth_rv_pkg::CSR_SSCRATCH: begin
+                    csr_sscratch_r <= csr_wdata;
+                end
+                // misa is WARL read-only in practice, mcounteren/scounteren have a
+                // zero write mask without Zicntr, and a write to the read-only
+                // mhartid never gets here (it traps as an illegal instruction).
                 default: ;
             endcase
         end else if (ex_mret_we) begin
-            csr_mstatus_r <= (csr_mstatus_r & ~eth_rv_pkg::MSTATUS_WMASK)
+            // xRET: MIE <= MPIE, MPIE <= 1, MPP <= U (the least-privileged mode),
+            // MPRV cleared unless the restored mode is M, and the hart returns to
+            // the restored (legalized) mode.
+            csr_mstatus_r <= (csr_mstatus_r
+                              & ~(eth_rv_pkg::MSTATUS_MIE | eth_rv_pkg::MSTATUS_MPIE
+                                  | eth_rv_pkg::MSTATUS_MPP | eth_rv_pkg::MSTATUS_MPRV))
                              | eth_rv_pkg::MSTATUS_MPIE
-                             | (csr_mstatus_r[7] ? eth_rv_pkg::MSTATUS_MIE : 64'd0);
+                             | (csr_mstatus_r[7] ? eth_rv_pkg::MSTATUS_MIE : 64'd0)
+                             // MPRV survives only when the restored mode is M
+                             // (Spike's mret.h: `if (prev_prv != PRV_M)`).
+                             | ((csr_mstatus_r[12:11] == 2'b11)
+                                ? (csr_mstatus_r & eth_rv_pkg::MSTATUS_MPRV) : 64'd0);
+            csr_priv_r    <= (csr_mstatus_r[12:11] == 2'b10) ? eth_rv_pkg::PRV_U
+                                                             : csr_mstatus_r[12:11];
+        end else if (ex_sret_we) begin
+            // sret: SIE <= SPIE, SPIE <= 1, SPP <= U, MPRV cleared, return to SPP.
+            csr_mstatus_r <= (csr_mstatus_r
+                              & ~(eth_rv_pkg::MSTATUS_SIE | eth_rv_pkg::MSTATUS_SPIE
+                                  | eth_rv_pkg::MSTATUS_SPP | eth_rv_pkg::MSTATUS_MPRV))
+                             | eth_rv_pkg::MSTATUS_SPIE
+                             | (csr_mstatus_r[5] ? eth_rv_pkg::MSTATUS_SIE : 64'd0);
+            csr_priv_r    <= csr_mstatus_r[8] ? eth_rv_pkg::PRV_S : eth_rv_pkg::PRV_U;
         end
     end
 
@@ -821,7 +1106,15 @@ module eth_rv_core (
             end else if (!ex_stall) begin
                 md_started_r <= 1'b0;
             end
-            if (ex_stall) begin
+            // A trap outranks the stall: an interrupt is taken in the EX slot's
+            // first cycle (before the instruction starts), even while `ex_stall`
+            // freezes the stage, and the pre-empted instruction must be discarded
+            // rather than held. No other trap can coincide with a stall — a
+            // MEM-side trap needs a completed beat, and an EX-side exception is
+            // itself gated by `!ex_stall`.
+            if (trap_hit) begin
+                ex_valid_r <= 1'b0;
+            end else if (ex_stall) begin
                 ex_valid_r <= ex_valid_r;
             end else if (flush_all) begin
                 ex_valid_r <= 1'b0;
@@ -1038,10 +1331,20 @@ module eth_rv_core (
             if ($past(flush_all)) begin
                 assert(!id_valid_r);
             end
-            // ... a trap clears MEM, so the trapping instruction and everything
-            // behind it can never commit ...
-            if ($past(trap_hit)) begin
+            // ... a MEM-side trap clears the MEM slot, so the trapping
+            // instruction and everything behind it can never commit. An EX-side
+            // trap (exception or interrupt) does NOT: the instruction in MEM is
+            // OLDER and must keep committing — only the EX slot is dropped, which
+            // the chain below states.
+            if ($past(mem_trap)) begin
                 assert(!mem_valid_r);
+            end
+            // ... and an EX-side trap drops the EX slot in the same cycle, even
+            // when a stall was freezing it (an interrupt is taken in the EX
+            // instruction's first cycle, before it starts), so the trapped
+            // instruction can never be re-executed out of a held slot.
+            if ($past(trap_hit) && !$past(mem_trap)) begin
+                assert(!ex_valid_r);
             end
             // ... a stalled D-port access FREEZES the MEM slot, so the
             // instruction it holds across the stall is the same one ...

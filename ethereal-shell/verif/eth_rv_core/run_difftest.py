@@ -94,6 +94,12 @@ CORPUS_PROGRAMS = [
     "cor_model",
     "cor_csr",
     "cor_trap",
+    # E2-RV1 increment 6: privilege modes, S-mode CSRs, trap delegation and the
+    # program-driven interrupt sources (see verif/eth_rv/README.md).
+    "cor_priv",
+    "cor_deleg",
+    "cor_intr",
+    "cor_time",
     "cor_hello",
     "cor_fault",
 ]

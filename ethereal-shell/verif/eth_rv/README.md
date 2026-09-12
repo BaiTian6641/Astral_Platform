@@ -481,13 +481,101 @@ python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_di
 
 The root `Makefile` carries both halves already: `make verif-rv` (build the corpus +
 run this suite) and `make verif-rv-rtl` (run the corpus on the Verilated RTL — all
-eight programs, both D-port builds with `--dram`, and the console assertion). The
+twelve programs, both D-port builds with `--dram`, and the console assertion). The
 corpus step needs `riscv64-unknown-elf-gcc`, the RTL step needs Verilator, and the
 tests self-skip when a tool is missing.
 
-The two console peripherals (`eth_rv_uart.sv`, `eth_rv_mmio_mux.sv`) are linted
-with the same strict command `make lint` uses per module
-(`verilator --lint-only -Wall --top-module <m>`, no waivers needed); adding them to
-`RTL_CLEAN` and giving `eth_rv_mmio_mux` its `eth_rv_uart.sv` dependency is a
-one-line Makefile edit that this increment's scope excludes — see the increment
-notes for the exact lines.
+The console peripherals (`eth_rv_uart.sv`, `eth_rv_mmio_mux.sv`) are linted with
+the same strict command `make lint` uses per module
+(`verilator --lint-only -Wall --top-module <m>`); `eth_rv_uart.sv` needs no
+waiver and `eth_rv_mmio_mux.sv` (which now carries the CLINT as a second module)
+keeps the single scoped, justified `DECLFILENAME` waiver described above. Neither
+needs a `Makefile` change.
+
+## Privilege modes, trap delegation and interrupts (E2-RV1 increment 6)
+
+The RV-B core grows the M/S/U privilege machine and the trap machinery RV-C needs.
+Everything below is DiffTest-verified against the pinned Spike
+(`--isa=rv64imc`, which enables S and U), not asserted.
+
+**What is implemented**
+
+* **Privilege state**: `mstatus.MPP/MPIE/MIE/SPP/SPIE/SIE` (plus the WARL bits
+  Spike carries: `MPRV`, `SUM`, `MXR`, `TVM`, `TW`, `TSR`, `FS`, and `SD`
+  derived from `FS`), `mret`, `sret`. `mstatus`/`sstatus` are one register with
+  an S-mode *view*, exactly like Spike's `sstatus` proxy: `SSTATUS_WMASK` is the
+  S-owned subset carried in the package.
+* **`ecall` per mode**: cause 11 (M), 9 (S), 8 (U). `mret` is M-only (illegal
+  from S/U), `sret` needs S or M and needs M when `TSR = 1`.
+* **CSR access rules**: a CSR's privilege is its address field `[9:8]` (00 = U,
+  01 = S, 10 = H, 11 = M), a write to a read-only CSR is illegal even from M
+  (Spike's `if (write && csr_read_only)` — `mhartid` is the one such CSR here),
+  and in S-mode the comparison is against HS (2). `sie`/`sip`/`sstatus` are
+  views: `sie` writes are masked by `mideleg`, `sip` can set only SSIP.
+* **Trap delegation**: `medeleg` (writable mask `0xb3fe`) routes an exception
+  raised *below M* to `stvec` with `scause`/`sepc`/`stval`/`sstatus`; `mideleg`
+  (mask `0x222`) does the same for interrupts. A trap raised in M-mode is never
+  delegated, whatever the registers say.
+* **CLINT** (inside `eth_rv_mmio_mux.sv`, so no build-file change is needed):
+  Spike's MSIP (`0x0200_0000`) / MTIMECMP (`0x0200_4000`) / MTIME (`0x0200_bff8`)
+  window, size `0xc000`, with Spike's byte-lane behaviour. `msip`/`mtimecmp`
+  write-through is combinational: a store is accepted in MEM in the same cycle
+  the *next* instruction is in EX, which is precisely the boundary Spike uses, so
+  without the bypass the interrupt would land one instruction late.
+* **Interrupts**: `mip`/`mie`/`sip`/`sie` with Spike's masks (MIP = SSIP/STIP/
+  SEIP writable, `mideleg` = SSI/STI/SEI), Spike's priority (MEI, MSI, MTI, SEI,
+  SSI, STI), vectored `mtvec`/`stvec` (`base + 4 * cause` for interrupts only,
+  MODE bit 0), and delegation of the S bits.
+
+**Corpus** (the four programs added here; the counts are the beats compared on
+the behavioral and AXI/DRAM D-port builds):
+
+| program | coverage | commits |
+|---|---|---|
+| `cor_priv.S` | mstatus/sstatus WARL and the view, tvec/epc WARL, delegation masks, `mip` at reset (MTIP pending), `mret` to S, S-mode CSR legality, `sret` to U, U-mode legality, mstatus on trap entry | 604 |
+| `cor_deleg.S` | medeleg delegation of ecall-S/ecall-U/a load access fault, the S-mode stack (SPP/SPIE/SIE + sret), an undelegated cause still going to M, an M-mode trap never delegated | 244 |
+| `cor_intr.S` | MTI via MTIP, MSI via the CLINT's MSIP, MSI > MTI priority, pending bits armed through `mip`, a NEGATIVE CONTROL (pending + enabled but MIE = 0 ⇒ no interrupt), vectored `mtvec` (the stub at `base+28` proves the vector), S-delegated SSI armed through `sip` | 491 |
+| `cor_time.S` | the MTIME staircase read in a trap-free loop across two RTC ticks (0 → 50 → 100) | 6517 |
+
+Every `cor_intr`/`cor_deleg` handler pins the exact instruction the trap must
+land on with a label, so the interrupt/trap *boundary* is compared, not just the
+architectural effect.
+
+**Boundaries — what is deliberately NOT compared** (each with its reason, so no
+comparison is silently weakened):
+
+* **MMU / paging**: `satp` and `sfence.vma` are not implemented (illegal), and
+  the MMU-related `mstatus` bits are WARL storage with no translation behaviour.
+  No corpus program touches them. `mstatus`'s MMU bits are still stored so a
+  `mstatus` round trip reproduces Spike's value bit for bit.
+* **`wfi`** is not implemented (illegal). Spike's `wfi` waits for an interrupt
+  and never commits; it has no place in a commit-stream DiffTest.
+* **Counters**: `cycle`/`time`/`instret` do **not exist** in Spike under
+  `--isa=rv64imc` (no Zicntr) — the RTL rejects them as illegal too, which is
+  why `mcounteren`/`scounteren` exist with a zero write mask and read 0. Spike's
+  *machine* `mcycle`/`minstret` do exist under that ISA; they are its own
+  step/cycle counters and are not implemented.
+* **MEIP** has no source: Spike's default configuration has no PLIC, so the core's
+  `meip_i` is tied low and `mip.MEIP` stays 0. The other five sources are all
+  exercised.
+* **MTIME after a trap**: the staircase read path *is* proved (`cor_time`), but a
+  program that traps is out of scope — Spike ends its step early on a trap
+  (`n = instret`), which shifts the tick phase in a way no hart-side counter can
+  reproduce. `cor_intr` therefore arms the timer only with `mtimecmp = 0` (MTIP
+  permanently pending) and `= -1` (never), which are phase-independent.
+* **Interrupt-taking boundary**: the RTL takes a pending, enabled interrupt at the
+  next instruction boundary; Spike only breaks its loop at a *serialization*
+  point (the barrier before a CSR instruction, or the boundary right after a
+  CSR/xRET — `riscv/decode_macros.h` `validate_csr`/`serialize`). The two agree
+  whenever the source is armed by a CSR write, or the enabling write is the
+  instruction right before the intended trap point — which is how every `cor_intr`
+  test is written. A program that arms a source with a store while enabled and
+  then runs non-serializing instructions would diverge; that window is not
+  compared, and `cor_intr.S` documents it at the top of the file.
+
+**Lint/build note**: the CLINT lives in `eth_rv_mmio_mux.sv` as a second module
+on purpose — the project lint rule resolves a module's dependencies by filename,
+so a separate `eth_rv_clint.sv` would need a `Makefile` dependency line that this
+increment's scope excludes. The one resulting `DECLFILENAME` warning is waived
+with the written justification in the file; every other `-Wall` warning still
+fails. No `Makefile` edit is required by this increment.

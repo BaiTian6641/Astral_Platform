@@ -16,11 +16,14 @@
 //              Coverage is the corpus subset: RV64I (LUI/AUIPC/JAL/JALR/branch/
 //              load/store/OP-IMM/OP-IMM-32/OP/OP-32, FENCE as a no-op), RV64M
 //              (all eight mul/div plus the four W forms), the integer RV64C
-//              forms and the M-mode SYSTEM subset (CSRRW/CSRRS/CSRRC + the
-//              immediate forms on the implemented CSRs, ecall, ebreak, mret).
-//              Any other SYSTEM encoding (wfi/sret/…) and any CSR number this
+//              forms and the SYSTEM subset (CSRRW/CSRRS/CSRRC + the immediate
+//              forms on the implemented CSRs, ecall, ebreak, mret, sret).
+//              Any other SYSTEM encoding (wfi/sfence/…) and any CSR number this
 //              core does not implement decodes to illegal — never to a no-op
-//              (C14 §3).
+//              (C14 §3). The *privilege* rules of SYSTEM (which mode may execute
+//              mret/sret, which may touch a given CSR, and which ecall cause a
+//              mode raises) depend on runtime state, so they are enforced in
+//              eth_rv_core, not here.
 //
 //              Immediate bit mappings were cross-checked field by field against
 //              the reference interpreter in the DiffTest harness (rv_model.py),
@@ -376,13 +379,18 @@ module cor_decoder (
                     ctrl_o.alu_a = eth_rv_pkg::OP_A_ZERO;
                     ctrl_o.alu_b = eth_rv_pkg::OP_B_IMM;
                 end
-                // SYSTEM (C14 §3): the M-mode trap/CSR instructions, and nothing
-                // else — wfi/sret/… are not in RV-B and must not become no-ops.
+                // SYSTEM: the trap/CSR instructions of the M/S/U machine. The
+                // privilege rules of mret/sret (and of every CSR access) depend on
+                // the *current* privilege, so the decoder only classifies the
+                // encoding; eth_rv_core raises the illegal-instruction trap when
+                // the mode forbids it. Anything else stays illegal — wfi/sfence are
+                // not implemented and must never become unnoticed no-ops.
                 OP_SYSTEM: begin
                     if (funct3 == 3'b000) begin
                         unique case (insn_i[31:20])
                             12'h000: ctrl_o.is_ecall  = 1'b1;
                             12'h001: ctrl_o.is_ebreak = 1'b1;
+                            12'h102: ctrl_o.is_sret   = 1'b1;
                             12'h302: ctrl_o.is_mret   = 1'b1;
                             default: ctrl_o.illegal   = 1'b1;
                         endcase

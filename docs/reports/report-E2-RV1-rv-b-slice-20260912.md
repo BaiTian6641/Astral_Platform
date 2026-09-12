@@ -113,3 +113,14 @@
 - **两条负控（本人复核的机制）**：`+starve_dmem=1`（复制旧卡死）→ 看门狗式 FAIL「the D port never answered … wedge」；
   `+no_dmem_err=1`（静默成功）→ DiffTest 在 commit #20 抓到分歧（golden 已在陷阱处理程序、DUT 仍在退休故障指令）⇒ 比对确实"活着"。
 - **顺带修复的仓库卫生**：`sby -f` 会重写 `*_cover/` 下约 46 个**被追踪**文件（`.gitignore` 原只覆盖 `*_prove/`）⇒ 已加规则并取消追踪其可再生内容（`.sby` 源仍追踪，7 个）。
+
+## 9. 增量 6（同日完成）：M/S/U 特权、陷阱委托与中断（RV-C 前置）
+
+- **特权模型**：`priv_e`（U/S/M）+ `mret`/`sret` + 各模式 `ecall`（cause 11/9/8，`mtval=0`）；`sstatus` 是 `mstatus` 的**视图**（SD 由 FS 派生）；S 模式 CSR 子集与**按模式**的合法性（`ex_csr_illegal`/`ex_sret_illegal`/`ex_mret_illegal`）。
+- **陷阱委托**：`medeleg`(`0xb3fe`)/`mideleg`(`0x222`) + 委托后的 `scause/sepc/stval/sstatus`（SPP/SPIE/SIE 语义）+ 向量化 `stvec/mtvec`；**M 模式陷阱永不委托**。
+- **WARL 掩码全部取自 Spike 探针**（先探后改）：`mstatus=0x7e79aa`、`sstatus=0xc6122`+UXL/SD、`mtvec` 清 bit1、`sepc/mepc` 清 bit0、`mip` 复位 `0x80`（MTIP pending）。
+- **CLINT**（同文件内 `eth_rv_clint`）：MSIP/MTIMECMP/MTIME，字节通道规则照 `clint.cc`，**写透传**使"存后下一条指令即见 pending"；`mtime = 50*floor((5+steps)/5000)` 对齐 Spike 固定 boot-ROM 预载 ⇒ **时间可比对**（`cor_time.S` 6517 commits 跨两个 RTC 台阶，0→50→100）。
+- **中断**：资格判定按 `mideleg`，优先级照 Spike（MEI>MSI>MTI>SEI>SSI>STI），在 EX 准入边界取中断并抑制 `md_start`；负控含"pending+使能但 MIE=0 不取"。
+- **语料**：`cor_priv`(604)/`cor_deleg`(244)/`cor_intr`(491)/`cor_time`(6517) ⇒ **12/12 程序 MATCH**（拍路径与 AXI/DRAM 路径各一遍；cor_intr 在 DRAM 路径 33 次 AW 突发）。
+- **验证（本人复跑）**：`run_difftest.py` → **`OK: 12 corpus program(s), MATCH vs Spike + console asserted`**；`make verif-rv` 181 passed；lint 干净；`eth_rv_core.sby` prove/cover 见下。
+- **负控（agent）**：`--fault 100:value=0xdeadbeef`（cor_intr）与 `--fault 30:...`（cor_priv）均被抓；既有 UART/内存流/卡死/静默成功负控不变。
