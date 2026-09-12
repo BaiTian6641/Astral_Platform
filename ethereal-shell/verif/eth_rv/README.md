@@ -72,7 +72,7 @@ Spike is installed elsewhere, point the harness at it with `--spike PATH` or
 | `rv_dut.py` | DUT adapters (`dump:` / `model:` / `callback:`) + fault injection |
 | `rv_model.py` | Worked-example DUT: RV64IMC interpreter (RV64I + M + integer C subset) |
 | `rv_difftest.py` | CLI + comparator: first divergence with pc/rd/cycle, exit codes |
-| `corpus/` | Bare-metal RV64IMC corpus: `crt0.S`, `link.ld`, eight `cor_*.S` programs, builder |
+| `corpus/` | Bare-metal RV64IMAFDC corpus: `crt0.S`, `link.ld`, eighteen `cor_*.S` programs, builder |
 | `tests/` | pytest suite; `tests/fixtures/` holds the checked-in golden fixtures |
 
 ## The trace protocol
@@ -81,7 +81,7 @@ One retired instruction per line, in the order the core retires them:
 
 ```
 # rv_difftest trace v1
-# generator: spike[rv64imc] cor_model.elf (Spike RISC-V ISA Simulator 1.1.1-dev)
+# generator: spike[rv64imafdc_zicsr] cor_model.elf (Spike RISC-V ISA Simulator 1.1.1-dev)
 # fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]]
 1 0x0000000080000000 x2 0x000000008000a000
 2 0x0000000080000004 x2 0x000000008000a000
@@ -133,7 +133,7 @@ debugging.
 ## Golden side: Spike
 
 `--elf ELF` runs Spike as
-`spike --isa=rv64imc -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
+`spike --isa=rv64imafdc_zicsr -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
 Two details matter and are handled for you:
 
 * **A trapping instruction is not committed.** Spike logs the exception
@@ -194,9 +194,13 @@ produce, memory stream included.
 
 ## Corpus
 
-Eight self-checking bare-metal programs (`-march=rv64imc_zicsr -mabi=lp64 -nostdlib
+The corpus grew program by program; the eighteen self-checking bare-metal programs
+below are built the same way (`-march=rv64imafdc_zicsr -mabi=lp64 -nostdlib
 -mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
-`corpus/crt0.S`):
+`corpus/crt0.S`). The eight this section started with are tabulated here; the ten
+added by later increments each have their own section below (`cor_priv`,
+`cor_deleg`, `cor_intr`, `cor_time`; `cor_sv39`, `cor_pgfault`; `cor_fp`,
+`cor_fptrap`; `cor_atomic`, `cor_wfi`):
 
 | program | coverage |
 |---|---|
@@ -215,16 +219,20 @@ Spike exit status *and* as a divergent trace. `-mcmodel=medany` is required:
 absolute `lui` addressing cannot materialize `0x8000_xxxx` on RV64, where `lui`
 sign-extends from bit 31.
 
-The corpus is built with `-march=rv64imc_zicsr` (binutils no longer implies
-`Zicsr` from `I`, and `cor_csr`/`cor_trap` need the CSR instructions). Spike
-enables `zicsr` for `--isa=rv64imc` by default, so nothing on the golden side
-changes — and the RV64I/M/C programs assemble to the same bytes either way.
+The corpus is built with `-march=rv64imafdc_zicsr`: the RTL implements `I`, `M`,
+`A` (lr/sc/amo — `cor_atomic`), `F`/`D` (`cor_fp`, `cor_fptrap`) and `C`, plus
+`wfi`, and `Zicsr` is no longer implied by `I` in binutils (`cor_csr`/`cor_trap`
+need it spelled out). Spike enables `zicsr` for that string by default, so the
+golden side needs no switch, and the pure-integer programs assemble to the same
+bytes either way. The ISA string is the one the core advertises in `misa`
+(`0x8000_0000_0014_112d`: I|M|A|F|D|C|S|U).
 
 Toolchain note: `riscv64-unknown-elf-gcc 13.2.0` is a full RV64 toolchain
 (`--print-multi-lib` offers `rv64i`/`rv64im`/`rv64imac`/`rv64imafdc`/…), but there
-is **no `rv64imc` multilib** — C is folded into `rv64imac`/`rv64imafc`. That does
+is **no `rv64imafdc` multilib distinct from `rv64gc`** — C rides along with the
+atomic/FP strings. That does
 not matter here because the corpus is `-nostdlib -nostartfiles -ffreestanding`:
-`-march=rv64imc -mabi=lp64` compiles and links as-is. If a future corpus program
+`-march=rv64imafdc_zicsr -mabi=lp64` compiles and links as-is. If a future corpus program
 needs libc/libgcc, build it for `rv64imac` (or add a multilib) — Spike and the
 harness take the ISA string from `--isa`, so nothing else changes.
 
@@ -418,7 +426,7 @@ rv_difftest.py (--elf ELF | --golden TRACE) --dut SPEC [options]
   --dut SPEC              dump:PATH | model:PATH | callback:MODULE:FUNC
   --dut-path DIR          extra sys.path entry for callback: adapters (repeatable)
   --inject INDEX:FIELD=VALUE   corrupt one DUT commit (pc|rd|value|cycle; repeatable)
-  --isa NAME              Spike --isa string (default rv64imc)
+  --isa NAME              Spike --isa string (default rv64imafdc_zicsr)
   --spike PATH            Spike binary (default: $RV_DIFFTEST_SPIKE, repo build, $PATH)
   --timeout SECONDS       Spike run timeout (default 300)
   --max-commits N         compare only the first N commits
@@ -461,7 +469,9 @@ error.
   RTL implements fewer regions than Spike's model (no ROM, no CLINT/PLIC, and a
   smaller DRAM window) — the deliberate deviations are listed at the end of that
   section.
-* **Single hart, no MMU, no atomics/floating point** in the model; clock-domain
+* **Single hart.** The RTL core implements Sv39 translation, F/D and the A
+  extension; the *example* DUT (`rv_model.py`) is a deliberate subset (RV64IMC,
+  no MMU/FP/atomics) and raises `UnsupportedInstruction` outside it. Clock-domain
   and reset behaviour are out of scope for a commit diff.
 * **Not a lockstep co-sim yet.** This is a post-hoc commit diff (the standard
   DiffTest shape): Spike runs first and produces the golden stream, then the DUT
@@ -481,7 +491,7 @@ python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_di
 
 The root `Makefile` carries both halves already: `make verif-rv` (build the corpus +
 run this suite) and `make verif-rv-rtl` (run the corpus on the Verilated RTL — all
-twelve programs, both D-port builds with `--dram`, and the console assertion). The
+eighteen programs, both D-port builds with `--dram`, and the console assertion). The
 corpus step needs `riscv64-unknown-elf-gcc`, the RTL step needs Verilator, and the
 tests self-skip when a tool is missing.
 
@@ -496,7 +506,7 @@ needs a `Makefile` change.
 
 The RV-B core grows the M/S/U privilege machine and the trap machinery RV-C needs.
 Everything below is DiffTest-verified against the pinned Spike
-(`--isa=rv64imc`, which enables S and U), not asserted.
+(`--isa=rv64imafdc_zicsr`, which enables S and U), not asserted.
 
 **What is implemented**
 
@@ -548,10 +558,17 @@ comparison is silently weakened):
   the MMU-related `mstatus` bits are WARL storage with no translation behaviour.
   No corpus program touches them. `mstatus`'s MMU bits are still stored so a
   `mstatus` round trip reproduces Spike's value bit for bit.
-* **`wfi`** is not implemented (illegal). Spike's `wfi` waits for an interrupt
-  and never commits; it has no place in a commit-stream DiffTest.
+* **`wfi`** is implemented since E2-RV2 increment 3 (see "`wfi`" below): it
+  commits as a no-effect instruction and the hart waits while `mip & mie` is
+  zero, which is the rule the pinned Spike's `take_pending_interrupt()` uses.
+  What a single-hart DiffTest cannot drive is the *wait* itself — waking needs a
+  source that becomes pending with no instruction executing, and both simulators
+  tick `mtime` from the hart's own instruction count — so the corpus pins the two
+  boundaries the wait has (a pending-but-masked source still ends it; a WFI whose
+  boundary already has a deliverable interrupt never commits) and the RTL's stall
+  is covered formally (`cover(wfi_wait)`) instead.
 * **Counters**: `cycle`/`time`/`instret` do **not exist** in Spike under
-  `--isa=rv64imc` (no Zicntr) — the RTL rejects them as illegal too, which is
+  `--isa=rv64imafdc_zicsr` (no Zicntr) — the RTL rejects them as illegal too, which is
   why `mcounteren`/`scounteren` exist with a zero write mask and read 0. Spike's
   *machine* `mcycle`/`minstret` do exist under that ISA; they are its own
   step/cycle counters and are not implemented.
@@ -641,3 +658,119 @@ superpage alignment, non-canonical VAs) is in `'/home/polar/.omp/agent/sessions/
 | `+dmem_corrupt_addr=A +dmem_corrupt_xor=X` | corrupting a page-table word changes the DUT's translation (and its fault), i.e. the DiffTest catches a wrong PTE *interpretation* — the corpus's own checks fail first (`a0` = the failing check index) |
 | `+no_dmem_err=1` | a PTE read answered as a silent success is caught: the DUT retires (and traps) where Spike faults |
 | `+trace_traps=1` | prints every trap the core reports (pc, cause, instruction), which is how a run's trap sequence is read back |
+
+## The A extension (E2-RV2 increment 3)
+
+Firmware cannot run without it: OpenSBI, the kernel's atomics/refcounts/spinlocks and
+libgcc's `__atomic_*` all lower to LR/SC or to an AMO. The core now implements the whole
+RV64A set — `lr.w/d`, `sc.w/d`, and the nine `amo*.{w,d}` read-modify-write forms — in a
+single-hart, cacheless shape: the MEM stage issues the read beat and then the write beat of
+the same address inside one MEM_ACC phase, `amo_result()` in `eth_rv_pkg.sv` computes the
+operation with Spike's operand widths, and the reservation is one `(valid, physical
+address)` pair (E2-RV2 increment 3 also adds `misa` bit 0, so `misa` reads
+`0x8000_0000_0014_112d`).
+
+`cor_atomic.S` (65 checks) is the program: all nine AMOs in both widths (including the `.w`
+sign-extended `rd`, the upper half of a `.w` word surviving untouched, high bits of `rs2`
+ignored by a `.w` operation, and signed vs unsigned `min`/`max` differing only because the
+sign bit is set), `rd = x0` forms, `lr`/`sc` success in both widths, the reservation rules
+below, the `aq`/`rl` forms, and six misaligned traps whose `(mcause, mtval)` pairs the
+program records and compares, with the memory checked unchanged.
+
+```
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_atomic
+# -> [rv-rtl] cor_atomic: PASS 916 commits (307 compressed), 6 traps ...
+#    MATCH: 916 commits compared, 0 divergence — pc, rd, value and the memory stream agree
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_atomic --dram
+# -> [rv-rtl] cor_atomic: PASS 916 commits, 83 AR / 664 R beats, 134 AW / 134 W beats
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_atomic --memlat 3
+# -> [rv-rtl] cor_atomic: PASS 916 commits, port wait max D 4 cycles
+```
+
+**The AMO's trace record is its WRITE.** Spike logs an AMO as *two* `mem` fields (the read
+of the old value, then the write of the result, at one address). The canonical trace carries
+one access per commit and rejects an access that is both a read and a write, so the
+convention is "report the write": `mem_addr`/`mem_wdata` are the address and the value
+stored back, `rd` carries the old value, and `rv_spike.iter_spike_commits` keeps the write
+field of a two-field line (anything else with more than one access is still an error). No
+format version change was needed; an `lr` reports its read, an `sc` that stores reports its
+write, and an `sc` whose reservation is gone reports **no** memory access at all — which is
+why the commit record carries a `mem_ok` bit.
+
+**Boundaries — deliberately not compared** (each with its reason):
+
+* **What breaks a reservation.** Spike's single-hart model keeps
+  `mmu_t::load_reservation_address`: `lr` sets it, `sc` compares the *physical* address and
+  then always consumes it, and nothing else invalidates it — not an ordinary store, not an
+  AMO, not a trap. The RTL mirrors that pair exactly, and the corpus pins the interesting
+  cases as *successes* (a load, a store to another word, and an AMO to the same word between
+  the `lr` and the `sc` all leave the reservation intact). The reservation *set* size and
+  the granularity of its address compare are microarchitectural, so a real cache/SMP
+  implementation may fail an `sc` this model succeeds; the corpus only pins the outcomes on
+  which the pinned Spike and this RTL agree by construction (exact-address match, armed
+  immediately before the `sc`).
+* **Misalignment.** A misaligned `lr` is cause 4 (load address misaligned) and a misaligned
+  `amo`/`sc` is cause 6 (store address misaligned), both with `mtval` = the address and
+  neither performing a memory access nor a register write — Spike's
+  `store_slow_path(...)`/`load_reserved(...)` with `require_alignment`. The corpus records
+  all six.
+* **`aq`/`rl`** are accepted and ignored: they order accesses against other harts, and this
+  is a single-hart, single-outstanding-access core whose program order *is* its memory
+  order. (The bus-level AXI ATOP transaction in `ethereal-spec/control/eth-axi-v0.md` is a
+  separate, still-deferred SMP concern.)
+
+## `wfi` (E2-RV2 increment 3)
+
+`wfi` is decoded (the full-word `0x10500073` form, `MASK_WFI` in Spike's encoding table is
+`0xffffffff`), commits as an instruction with no architectural effect, and then the hart
+waits while `mip & mie` is **zero** — exactly Spike's rule: `take_pending_interrupt()` clears
+`in_wfi` as soon as `mip & mie` is non-zero, so a *locally enabled* source is enough, the
+global `mstatus.MIE` plays no part, and the trap that ends the wait is an ordinary interrupt
+taken at the boundary after the WFI. `cor_wfi.S` (10 checks) pins the two boundaries:
+
+| case | what happens |
+|---|---|
+| MTIP armed (`mtimecmp = 0`) + `mie.MTIE`, `mstatus.MIE = 0` | the WFI **commits** and the next instruction runs (`mip & mie != 0`); unmasking with `csrs mstatus` then takes the timer interrupt at the next boundary, `mcause` = MTI, `mepc` = the pre-empted instruction |
+| MSIP armed + `mie.MSIE`, `mstatus.MIE = 0` | the same rule with the software source: `mcause` = MSI at `after_enable2` |
+
+```
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_wfi
+# -> [rv-rtl] cor_wfi: PASS 130 commits (30 compressed), 2 traps (2 interrupts), last mcause=3
+python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_wfi --dram
+# -> [rv-rtl] cor_wfi: PASS 130 commits, 4 AR / 32 R beats, 7 AW / 7 W beats
+```
+
+**Boundaries** (the honest statement of what this DiffTest cannot see):
+
+* **The wait itself is unobservable here.** Entering it needs `mip & mie == 0` and leaving it
+  needs a source that becomes pending with no instruction executing; on a single hart the
+  only sources are `mtime` (which both simulators tick from the hart's *own* instruction
+  count, so a stopped hart advances neither) and `msip` (armed by a store, which a stopped
+  hart cannot execute). The corpus therefore never enters the wait, the RTL implements it
+  (`ex_stall`/`wfi_wait` holds the MEM slot while `mip & mie == 0`), and the formal cover
+  `wfi_wait` witnesses the state.
+* **Spike samples interrupts at serializing instructions, WFI and its step-chunk ends**
+  (`execute.cc` calls `take_pending_interrupt()` once per step re-entry; CSR writes
+  serialize). A cycle-accurate core samples every boundary, so an interrupt *armed by a plain
+  store while `mstatus.MIE` is already set* is noticed by the core at the next instruction
+  but by Spike one or more instructions later. Real firmware arms a source with interrupts
+  masked and enables it with a CSR write, which is commit-identical on both sides — that is
+  the pattern every corpus program uses, `cor_wfi` included, and the reason the program does
+  not arm MTIP with MIE already set.
+* **`mstatus.TW` is not trapped on** (the RTL stores the bit but has no hypervisor to
+  virtualize for); the pinned Spike's `wfi.h` *does* check it, so no corpus program sets TW
+  before an S-mode `wfi`.
+* **U-mode `wfi`** is an illegal instruction in the RTL (the architectural rule once S is
+  implemented), while the pinned Spike does not trap it: its check is guarded by
+  `extension_enabled('S')`, and `rv64imafdc_zicsr` does not enable S. The corpus never runs
+  U-mode `wfi`, and the difference is stated rather than hidden.
+* **`mtime` after a trap** remains the documented boundary from `cor_time`: the corpus only
+  ever arms MTIP with 0 (always pending) or all-ones (never pending).
+
+**Negative controls for this slice** (`--fault`, see the CLI reference):
+
+| control | result |
+|---|---|
+| `--fault 30:value=0xdeadbeef` | `DIVERGENCE (value_mismatch) at commit #30` — the register stream is live on the new program |
+| `--fault 30:mem_wdata=0xdeadbeef` | `DIVERGENCE (mem_addr_mismatch) at commit #30` — the memory stream is live |
+| `--fault 213:mem_wdata=0x1234` | `DIVERGENCE (mem_wdata_mismatch) at commit #213`, pc `0x…34e` — an **AMO's** written value is compared, not just a store's |

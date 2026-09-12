@@ -5,7 +5,7 @@
  * Every check is a pure read/write round trip, so this program takes no trap at
  * all: it pins the WARL behaviour of the CSRs the core implements. The values it
  * compares against are the ones the Spike golden model produces for RV64IMFDC —
- * including `misa` (MXL=64 | I | M | F | D | C | S | U) and the mstatus XL fields
+ * including `misa` (MXL=64 | I | M | A | F | D | C | S | U) and the mstatus XL fields
  * — which is what makes reading a CSR a *comparable* event in the DiffTest (the
  * value lands in a register and the commit record carries it).
  *
@@ -84,7 +84,7 @@ main:
   li      t0, -1
   csrw    misa, t0
   csrr    t1, misa
-  CK      t1, 0x800000000014112c, 13   /* MXL=64, I|M|F|D|C|S|U */
+  CK      t1, 0x800000000014112d, 13   /* MXL=64, I|M|A|F|D|C|S|U (A since E2-RV2 increment 3) */
 
   /* ---- 5. mie: only the interrupt-enable bits are writable -------------- */
   csrw    mie, zero

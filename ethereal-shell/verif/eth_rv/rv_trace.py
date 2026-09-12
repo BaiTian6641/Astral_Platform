@@ -2,7 +2,7 @@
 """Canonical commit-trace format for the ``eth_rv`` DiffTest harness (S15 §2.2).
 
     # rv_difftest trace v2
-    # generator: spike 1e05ddac (rv64imfdc_zicsr)
+    # generator: spike 1e05ddac (rv64imafdc_zicsr)
     # fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] [fflags=0x.. frm=0x..]
     1 0x0000000080000000 x02 0x0000000080001000
     2 0x0000000080000004 - -
@@ -30,6 +30,16 @@ Field semantics
     address, and for a store the *low* ``size`` bytes of the stored register
     (unshifted, size-truncated). ``-``/``-`` means "no memory access"; a load
     carries an address but ``mem_wdata`` is ``-``.
+  * an **A-extension AMO** (``amoadd.w`` …) is one architectural memory access
+    that reads and writes the same address, and it is reported as its **write**:
+    ``mem_addr``/``mem_wdata`` are the address and the value stored back, and the
+    old value is in ``rd`` (the instruction's destination). Spike logs such an
+    instruction as two ``mem`` fields — the read of the old value, then the write
+    of the result — and the golden normalizer keeps the second one, so both sides
+    of a DiffTest agree on the single-access record without a format version
+    change (see ``rv_spike.iter_spike_commits`` and verif/eth_rv/README.md). An
+    ``lr`` reports its read, an ``sc`` that stores reports its write, and an ``sc``
+    whose reservation was lost reports **no** memory access at all.
   * ``mem_rmask`` / ``mem_wmask`` — byte lanes of the 8-byte-aligned window at
     ``mem_addr & ~7`` that the access reads/writes (the RVFI convention), or
     ``-`` when the producer does not report masks. Spike has no mask field, so

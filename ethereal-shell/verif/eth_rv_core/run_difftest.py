@@ -117,6 +117,12 @@ CORPUS_PROGRAMS = [
     # on FP instructions, FP loads/stores and the FP CSRs (see verif/eth_rv/README.md).
     "cor_fp",
     "cor_fptrap",
+    # E2-RV2 increment 3: the ISA floor firmware needs — the A extension
+    # (lr/sc/amo in both widths, the reservation rules, the misaligned traps) and
+    # `wfi` with its `mip & mie` wake rule (see verif/eth_rv/README.md "The A
+    # extension" and "wfi").
+    "cor_atomic",
+    "cor_wfi",
 ]
 
 HELLO_STRING = b"hello, eth_rv!\n"

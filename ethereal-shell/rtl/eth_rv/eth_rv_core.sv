@@ -498,6 +498,34 @@ module eth_rv_core (
     logic        mem_is_access;
     logic        mem_xlate_fault;
 
+    // ---- A extension (RV64A) + wfi (E2-RV2 increment 3) ---------------------
+    // An AMO is the one access that needs TWO D-port beats (read, then write), so
+    // MEM_ACC has a sub-phase: `amo_write_r` is low for the read beat and high for
+    // the write beat. Every other access — a load, a store, an lr, an sc that will
+    // store — stays a single-beat MEM_ACC, exactly as before.
+    logic        amo_write_r;       // MEM_ACC is issuing the AMO's write beat
+    logic [63:0] amo_old_r;         // the memory operand the AMO's read beat returned
+    logic        mem_amo_read;      // this beat is an AMO's read
+    logic        mem_amo_write;     // this beat is an AMO's write
+    logic [63:0] amo_result_w;      // op(old, rs2) the write beat stores
+    logic [63:0] lsu_store_data;    // what cor_lsu treats as the store data
+    logic        mem_beat_off;      // this MEM_ACC issues no beat at all (failing SC)
+    logic        mem_beat_err;      // the beat was answered with a port error
+    logic        mem_beat_last;     // this beat finishes the access (an AMO's write)
+    logic        mem_acc_done;      // the access's last beat is accepted this cycle
+    logic [63:0] mem_late_rd;       // the rd value of a late-rd instruction
+    // The reservation: a single (valid, address) pair, exactly Spike's
+    // `mmu_t::load_reservation_address`. lr arms it, sc consumes it.
+    logic        resv_valid_r;
+    logic [63:0] resv_addr_r;       // Spike compares PHYSICAL addresses
+    logic        sc_have_resv;      // the SC's reservation matches its address
+    logic        lr_beat;           // the LR's beat is accepted this cycle
+    logic        sc_exec;           // the SC ends its access this cycle (consumes the reservation)
+    // wfi: MEM holds the instruction until `mip & mie` is non-zero (see the
+    // interrupt section: that is Spike's exact "exit WFI" condition).
+    logic        wfi_wait;
+    logic        ex_wfi_illegal;    // U-mode wfi
+
     // the D port, muxed between the MEM stage and the walker's PTE read
     logic        dmem_we_core;
     logic [63:0] dmem_addr_core;
@@ -530,7 +558,60 @@ module eth_rv_core (
     // so waiting for `dmem_ready_i` would wedge the pipeline.
     assign mem_is_access = mem_valid_r && !mem_ctrl_r.illegal
                            && (mem_ctrl_r.is_load || mem_ctrl_r.is_store) && !lsu_misaligned;
-    assign mem_wait = mem_is_access && !((mem_phase_r == MEM_ACC) && dmem_ready_i);
+    // ---- A extension: the two-beat AMO, the conditional store, and the
+    //      reservation the lr/sc pair shares (E2-RV2 increment 3) --------------
+    // The AMO's read beat is a plain read of the addressed window; its write beat
+    // stores `amo_result_w` through the same cor_lsu lane logic a store uses. The
+    // read value is latched (`amo_old_r`) because the D port is busy with the
+    // write when the commit happens.
+    assign mem_amo_read  = mem_ctrl_r.is_amo && !amo_write_r;
+    assign mem_amo_write = mem_ctrl_r.is_amo && amo_write_r;
+    assign amo_result_w  = eth_rv_pkg::amo_result(
+        mem_ctrl_r.amo_op, amo_old_r, mem_store_data_r,
+        (mem_ctrl_r.mem_size == eth_rv_pkg::SZ_WORD));
+    // The store data the D port sees: rs2 for every store, the AMO's result on an
+    // AMO's write beat. cor_lsu derives the beat data, the strobes and the
+    // unshifted trace value from it, so both paths share one lane/offset rule.
+    assign lsu_store_data = mem_amo_write ? amo_result_w : mem_store_data_r;
+    // An sc whose reservation is gone performs NO access at all: Spike's
+    // `store_conditional()` checks the reservation before it stores, and the
+    // architectural effect is rd = 1 with no memory traffic and no bus beat.
+    assign sc_have_resv = resv_valid_r && (resv_addr_r == mem_paddr_r);
+    assign mem_beat_off = mem_ctrl_r.is_sc && !sc_have_resv;
+    assign lr_beat      = (mem_phase_r == MEM_ACC) && mem_ctrl_r.is_lr && dmem_ready_i;
+    // Spike's store_conditional() consumes the reservation exactly when the sc
+    // COMPLETES: it yields on the store's way out (or, for a lost reservation,
+    // without storing at all). It must NOT be keyed on "the sc is in MEM_ACC":
+    // with a multi-cycle D port (memlat > 0, the AXI/DRAM path) MEM_ACC spans
+    // several cycles, and clearing on the first of them made the sc lose its own
+    // reservation before its store beat — it then took the lost-reservation path
+    // and stored nothing (caught by the DiffTest on the slow D-port path).
+    // A store beat answered with an error propagates BEFORE the yield, so it does
+    // not consume the reservation either.
+    assign sc_exec      = (mem_phase_r == MEM_ACC) && mem_ctrl_r.is_sc
+                          && (mem_beat_off || (dmem_ready_i && !dmem_err_i));
+    // The access is over when its LAST beat is accepted: an AMO's read beat is
+    // not the last one, and a suppressed sc has no beat to wait for.
+    assign mem_beat_last = !mem_amo_read;
+    assign mem_acc_done  = (mem_phase_r == MEM_ACC)
+                           && (mem_beat_off || (dmem_ready_i && mem_beat_last));
+    assign mem_wait = mem_is_access && !mem_acc_done;
+    // The rd value of every late-rd instruction (see `rd_late` in the package):
+    // a load or lr writes the loaded value, an amo writes the OLD value (Spike's
+    // `WRITE_RD(sext32(MMU.amo<...>))`), an sc writes 0 on success and 1 on
+    // failure. All three are read at the commit edge, which is why they are one
+    // signal: the WB register simply carries whichever this access produced.
+    assign mem_late_rd = mem_ctrl_r.is_amo ? amo_old_r
+                       : mem_ctrl_r.is_sc  ? {63'd0, !sc_have_resv}
+                                           : mem_load_data;
+    // WFI holds the MEM slot until `mip & mie` is non-zero — Spike's exact
+    // "exit WFI" condition (processor.cc: take_pending_interrupt() clears
+    // in_wfi as soon as `mip & mie` is non-zero, so a LOCALLY ENABLED source is
+    // enough and the global mstatus.MIE plays no part). A hart with nothing
+    // pending then waits, which on this single-hart SoC is exactly what the
+    // idle path of OpenSBI/Linux needs.
+    assign wfi_wait = mem_valid_r && !mem_ctrl_r.illegal && mem_ctrl_r.is_wfi
+                      && (irq_pending == 12'd0);
     // A port ERROR RESPONSE is a trap too, and for the same reason: the beat is
     // accepted (`dmem_ready_i`) and the error arrives with it, so nothing waits.
     // An error beat means the platform cannot serve the access — an unmapped
@@ -539,13 +620,17 @@ module eth_rv_core (
     // `mtval` = the access address. Never a silent success, never a wedge.
     assign mem_xlate_fault = (mem_phase_r == MEM_WALK) && mmu_done
                              && !walk_is_fetch_r && (mmu_fault != 4'd0);
-    assign mem_access_err = (mem_phase_r == MEM_ACC) && mem_is_access
-                            && dmem_ready_i && dmem_err_i;
+    // A suppressed sc drives no request, so a ready/error seen in that cycle is
+    // the environment's answer to somebody else's access and must not be read as
+    // this one's (the guard is what keeps "no beat" from becoming "failed beat").
+    assign mem_beat_err = (mem_phase_r == MEM_ACC) && mem_is_access && !mem_beat_off
+                          && dmem_ready_i && dmem_err_i;
+    assign mem_access_err = mem_beat_err;
     // An FP load's destination is an FP register, `f0` included, so the hazard
     // rule differs per class: the integer side keeps the x0 exclusion and matches
     // only integer operands, the FP side matches FP operands (including `f0`) and
     // the fused forms' third source.
-    assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.is_load && id_valid_r
+    assign load_use = ex_valid_r && !ex_ctrl_r.illegal && ex_ctrl_r.rd_late && id_valid_r
                       && (ex_ctrl_r.fp_we
                           ? (((ex_rd_r == id_rs1_r) && id_ctrl_r.fp_rs1_fp)
                              || ((ex_rd_r == id_rs2_r) && id_ctrl_r.fp_rs2_fp)
@@ -614,6 +699,13 @@ module eth_rv_core (
                                && ((csr_priv_r == eth_rv_pkg::PRV_U)
                                    || ((csr_priv_r == eth_rv_pkg::PRV_S)
                                        && ((csr_mstatus_r & eth_rv_pkg::MSTATUS_TVM) != 64'd0)));
+    // wfi is a privileged instruction: U-mode wfi is an illegal instruction
+    // (Spike's `require_privilege(PRV_S)`, from wfi.h's S-extension branch). The
+    // privileged forms are legal in S and M, and `mstatus.TW` is NOT trapped on:
+    // TW's trap exists to virtualize WFI for a hypervisor, this hart has no
+    // hypervisor, and the phenomenon the bit guards (a wait the hart never leaves)
+    // is a scheduling question for the kernel, not an architectural one.
+    assign ex_wfi_illegal = ex_ctrl_r.is_wfi && (csr_priv_r == eth_rv_pkg::PRV_U);
 
     // ---- interrupt selection (Spike's take_interrupt/priority order) --------
     // pending = mip & mie; M-eligible = pending & ~mideleg while an M interrupt
@@ -683,7 +775,7 @@ module eth_rv_core (
                          || ex_ctrl_r.is_ebreak || ex_target_misaligned
                          || ex_csr_illegal || ex_mret_illegal || ex_sret_illegal
                          || ex_sfence_illegal || ex_fp_illegal || ex_fp_rm_illegal
-                         || ex_fp_csr_off);
+                         || ex_fp_csr_off || ex_wfi_illegal);
      assign ex_irq = ex_valid_r && (ex_fault_r == 4'd0) && !md_started_r
                     && !fp_started_r && !mem_trap && irq_take;
     assign mem_trap = mem_misaligned || mem_xlate_fault || mem_access_err;
@@ -767,7 +859,7 @@ module eth_rv_core (
                          + ((trap_is_irq && (trap_to_s ? csr_stvec_r[0] : csr_mtvec_r[0]))
                             ? {58'd0, trap_cause, 2'b00} : 64'd0);
 
-     assign ex_stall    = md_wait || mem_wait || fp_wait;
+     assign ex_stall    = md_wait || mem_wait || fp_wait || wfi_wait;
     assign front_stall = ex_stall || load_use;
     assign flush_all   = ex_redirect || trap_hit;
     assign id_consumed = id_valid_r && !front_stall && !flush_all;
@@ -792,7 +884,10 @@ module eth_rv_core (
         if (wb_valid_r && wb_ctrl_r.rf_we && (wb_rd_r != 5'd0) && (wb_rd_r == ex_rs1_r)) begin
             ex_fwd_a = wb_data_r;
         end
-        if (mem_valid_r && mem_ctrl_r.rf_we && !mem_ctrl_r.is_load
+        // ... but only for a producer whose value was ready when it left EX: a
+        // late-rd instruction (a load, or an lr/sc/amo) still has no value in MEM,
+        // so its consumer waits for the WB bypass instead (the `rd_late` hazard).
+        if (mem_valid_r && mem_ctrl_r.rf_we && !mem_ctrl_r.rd_late
             && (mem_rd_r != 5'd0) && (mem_rd_r == ex_rs1_r)) begin
             ex_fwd_a = mem_wb_pre_r;      // younger producer in MEM wins
         end
@@ -803,14 +898,14 @@ module eth_rv_core (
         if (wb_valid_r && wb_ctrl_r.rf_we && (wb_rd_r != 5'd0) && (wb_rd_r == ex_rs2_r)) begin
             ex_fwd_b = wb_data_r;
         end
-        if (mem_valid_r && mem_ctrl_r.rf_we && !mem_ctrl_r.is_load
+        if (mem_valid_r && mem_ctrl_r.rf_we && !mem_ctrl_r.rd_late
             && (mem_rd_r != 5'd0) && (mem_rd_r == ex_rs2_r)) begin
             ex_fwd_b = mem_wb_pre_r;
         end
     end
 
     always_comb begin
-        ex_alu_a = ex_fwd_a;
+        ex_alu_a = ex_op1_eff;
         if (ex_ctrl_r.alu_a == OP_A_PC) begin
             ex_alu_a = ex_pc_r;
         end else if (ex_ctrl_r.alu_a == OP_A_ZERO) begin
@@ -818,7 +913,7 @@ module eth_rv_core (
         end
     end
 
-    assign ex_alu_b = (ex_ctrl_r.alu_b == OP_B_IMM) ? ex_imm_r : ex_fwd_b;
+    assign ex_alu_b = (ex_ctrl_r.alu_b == OP_B_IMM) ? ex_imm_r : ex_op2_eff;
 
     cor_alu u_alu (
         .op_i (ex_ctrl_r.alu_op),
@@ -832,12 +927,12 @@ module eth_rv_core (
     always_comb begin
         ex_taken = 1'b0;
         unique case (ex_ctrl_r.br_f3)
-            3'b000:  ex_taken = (ex_fwd_a == ex_fwd_b);
-            3'b001:  ex_taken = (ex_fwd_a != ex_fwd_b);
-            3'b100:  ex_taken = ($signed(ex_fwd_a) < $signed(ex_fwd_b));
-            3'b101:  ex_taken = !($signed(ex_fwd_a) < $signed(ex_fwd_b));
-            3'b110:  ex_taken = (ex_fwd_a < ex_fwd_b);
-            3'b111:  ex_taken = !(ex_fwd_a < ex_fwd_b);
+            3'b000:  ex_taken = (ex_op1_eff == ex_op2_eff);
+            3'b001:  ex_taken = (ex_op1_eff != ex_op2_eff);
+            3'b100:  ex_taken = ($signed(ex_op1_eff) < $signed(ex_op2_eff));
+            3'b101:  ex_taken = !($signed(ex_op1_eff) < $signed(ex_op2_eff));
+            3'b110:  ex_taken = (ex_op1_eff < ex_op2_eff);
+            3'b111:  ex_taken = !(ex_op1_eff < ex_op2_eff);
             default: ex_taken = 1'b0;
         endcase
     end
@@ -1123,8 +1218,8 @@ module eth_rv_core (
         .rst_ni  (rst_ni),
         .start_i (md_start),
         .op_i    (ex_ctrl_r.md_op),
-        .a_i     (ex_fwd_a),
-        .b_i     (ex_fwd_b),
+        .a_i     (ex_op1_eff),
+        .b_i     (ex_op2_eff),
         .result_o(md_result),
         .valid_o (md_valid)
     );
@@ -1178,12 +1273,57 @@ module eth_rv_core (
     assign ex_op1 = ex_ctrl_r.fp_rs1_fp ? ex_fwd_a_fp : ex_fwd_a;
     assign ex_op2 = ex_ctrl_r.fp_rs2_fp ? ex_fwd_b_fp : ex_fwd_b;
     assign ex_op3 = ex_fwd_c_fp;
+
+    // ---- the operands a STALLED EX instruction executes with ------------------
+    // A stall freezes the EX slot but not the stages ahead of it: the MEM and WB
+    // slots keep draining, so the forwarding network can lose the producer while
+    // the stalled instruction is still in EX, and the re-evaluated operands fall
+    // back to the stale register-file values the ID stage read. That is a real
+    // divergence, not a corner case: `addi sp,sp,-64; sd ..,0(sp); sd ..,8(sp)`
+    // puts the second store one MEM stall away from its producer (the first store
+    // still finds it in MEM, the second needed it in WB, which the stall had
+    // already drained into a bubble) — the DiffTest caught it on cor_atomic's
+    // trap handler.
+    //
+    // The operands are therefore latched on the FIRST frozen cycle and used until
+    // the slot advances: whatever the forwarding resolved in the cycle the stall
+    // began is what the instruction must execute with. (The mul/div and FPU
+    // launches read these same values in that cycle — each captures its inputs
+    // with its own start strobe — so freezing them changes nothing there.)
+    logic        ex_op_hold_r;
+    logic [63:0] ex_op1_hold_r;
+    logic [63:0] ex_op2_hold_r;
+    logic [63:0] ex_op3_hold_r;
+    logic [63:0] ex_op1_eff;
+    logic [63:0] ex_op2_eff;
+    logic [63:0] ex_op3_eff;
+
+    assign ex_op1_eff = ex_op_hold_r ? ex_op1_hold_r : ex_op1;
+    assign ex_op2_eff = ex_op_hold_r ? ex_op2_hold_r : ex_op2;
+    assign ex_op3_eff = ex_op_hold_r ? ex_op3_hold_r : ex_op3;
+
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            ex_op_hold_r <= 1'b0;
+        end else if (!(ex_valid_r && ex_stall)) begin
+            // the slot flows, drains, or is claimed by a trap: nothing stays
+            // frozen past this edge (a trap is taken out of a stalled slot, and
+            // the handler's first instruction must not inherit its operands)
+            ex_op_hold_r <= 1'b0;
+        end else if (!ex_op_hold_r) begin
+            ex_op_hold_r  <= 1'b1;
+            ex_op1_hold_r <= ex_op1;
+            ex_op2_hold_r <= ex_op2;
+            ex_op3_hold_r <= ex_op3;
+        end
+    end
+
     // The FPU's third operand port is the ADDEND: rs3 for the fused forms, and the
     // second source for add/subtract (whose encode has no rs3 field at all — the
     // fused `b` port is the unit multiplier there).
     logic [63:0] fp_opc;
     assign fp_opc = ((ex_ctrl_r.fp_op == eth_rv_pkg::FP_ADD)
-                     || (ex_ctrl_r.fp_op == eth_rv_pkg::FP_SUB)) ? ex_op2 : ex_op3;
+                     || (ex_ctrl_r.fp_op == eth_rv_pkg::FP_SUB)) ? ex_op2_eff : ex_op3_eff;
 
     cor_fpu u_fpu (
         .clk_i        (clk_i),
@@ -1194,8 +1334,8 @@ module eth_rv_core (
         .src_single_i (ex_ctrl_r.fp_src_single),
         .iw_i         (ex_ctrl_r.fp_iw),
         .rm_i         (ex_fp_rm_eff),
-        .a_i          (ex_op1),
-        .b_i          (ex_op2),
+        .a_i          (ex_op1_eff),
+        .b_i          (ex_op2_eff),
         .c_i          (fp_opc),
         .result_o     (fp_result),
         .fflags_o     (fp_fflags),
@@ -1223,7 +1363,7 @@ module eth_rv_core (
         .signed_i    (mem_ctrl_r.mem_signed),
         .size_i      (mem_ctrl_r.mem_size),
         .byte_off_i  (mem_addr_r[2:0]),
-        .store_data_i(mem_store_data_r),
+        .store_data_i(lsu_store_data),
         .rdata_i     (dmem_rdata_i),
         .load_data_o (lsu_load_data),
         .wdata_o     (lsu_wdata),
@@ -1239,10 +1379,12 @@ module eth_rv_core (
     // presents is PHYSICAL (`mem_paddr_r`); the byte lanes and the store data
     // come from the virtual address, whose low 12 bits — and therefore whose
     // lane and offset — the walk preserves.
-    assign dmem_we_core    = mem_ctrl_r.is_store;
+    // An AMO's read beat is a read: `we`/`wdata`/`wstrb` stay low while the old
+    // value is fetched, and only the second beat writes.
+    assign dmem_we_core    = mem_ctrl_r.is_store && !mem_amo_read;
     assign dmem_addr_core  = mem_paddr_r;
-    assign dmem_wdata_core = mem_ctrl_r.is_store ? lsu_wdata : 64'd0;
-    assign dmem_wstrb_core = mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
+    assign dmem_wdata_core = (mem_ctrl_r.is_store && !mem_amo_read) ? lsu_wdata : 64'd0;
+    assign dmem_wstrb_core = (mem_ctrl_r.is_store && !mem_amo_read) ? lsu_wstrb : 8'd0;
     assign dmem_size_core  = mem_ctrl_r.mem_size;
 
     // Exactly one client at a time, and which one is a function of the phase
@@ -1252,7 +1394,14 @@ module eth_rv_core (
     // the walker's request is what lets the formal proof tie a committed record
     // to the transfer it came from: at the commit edge the phase IS MEM_ACC, so
     // `dmem_addr_o`/`dmem_wstrb_o` are exactly the values the record latched.
-    assign dmem_req_o   = (mem_phase_r == MEM_ACC) || mmu_pte_req;
+    // A failing sc is the one MEM_ACC cycle that drives nothing at all.
+    // ... and the MEM stage drives it only while it really holds an access: an
+    // EX-side trap empties `mem_valid_r` in the middle of a multi-cycle access,
+    // and the phase then lingers for the one cycle it takes the state machine to
+    // notice — driving the port from a dead slot would repeat the beat (or, after
+    // a translation, hand the walker's request the stale address).
+    assign dmem_req_o   = (mem_owns_dport && (mem_phase_r == MEM_ACC) && !mem_beat_off)
+                          || mmu_pte_req;
     assign dmem_we_o    = (mem_phase_r == MEM_ACC) && dmem_we_core;
     assign dmem_addr_o  = (mem_phase_r == MEM_ACC) ? dmem_addr_core : mmu_pte_addr;
     assign dmem_wdata_o = (mem_phase_r == MEM_ACC) ? dmem_wdata_core : 64'd0;
@@ -1314,14 +1463,23 @@ module eth_rv_core (
     assign rvfi_frm_o       = wb_frm_r;
     assign rvfi_rd_addr_o   = wb_rd_r;
     assign rvfi_rd_wdata_o  = wb_data_r;
+    // ... and a record reports a memory access only when the access really went
+    // to the port: a failing `sc` commits (rd = 1) with no memory traffic at all,
+    // which is what Spike's log shows for it (no `mem` field on the commit line).
     assign rvfi_mem_valid_o = wb_valid_r && !wb_ctrl_r.illegal
-                              && (wb_ctrl_r.is_load || wb_ctrl_r.is_store);
+                              && (wb_ctrl_r.is_load || wb_ctrl_r.is_store)
+                              && wb_ctrl_r.mem_ok;
     assign rvfi_mem_addr_o  = wb_addr_r;
     // The trace records what the golden model records: the address, the stored
     // value truncated to the access size and unshifted (Spike's `mem` field), and
     // the byte lanes of the aligned window at `addr & ~7` (RVFI) — the D-port's
     // own lane-shifted beat data is `dmem_wdata_o`/`dmem_wstrb_o` and is used to
     // drive the bus, not to describe the architectural effect.
+    // An AMO reports its WRITE (address, result, write mask) — the "report the
+    // write" convention the harness's golden normalizer shares: Spike logs the
+    // read and the write of an AMO as two `mem` fields, and the canonical trace's
+    // one-access record keeps the write, because rd (the old value) and this data
+    // (the new one) together pin the whole read-modify-write.
     assign rvfi_mem_wdata_o = wb_ctrl_r.is_store ? wb_store_data_r : 64'd0;
     assign rvfi_mem_wmask_o = wb_wmask_r;
     assign rvfi_mem_rmask_o = wb_rmask_r;
@@ -1618,8 +1776,11 @@ module eth_rv_core (
         if (!rst_ni) begin
             mem_phase_r <= MEM_IDLE;
             mem_paddr_r <= 64'd0;
+            amo_write_r <= 1'b0;
+            amo_old_r   <= 64'd0;
         end else if (mem_start) begin
             mem_phase_r <= mmu_data_on ? MEM_WALK : MEM_ACC;
+            amo_write_r <= 1'b0;      // a new access always starts at its read beat
             if (!mmu_data_on) begin
                 // no translation: the physical address IS the virtual one, and
                 // recording it here keeps `mem_paddr_r` the single answer to
@@ -1629,10 +1790,47 @@ module eth_rv_core (
         end else if ((mem_phase_r == MEM_WALK) && mmu_done && !walk_is_fetch_r) begin
             mem_paddr_r <= mmu_paddr;
             mem_phase_r <= (mmu_fault == 4'd0) ? MEM_ACC : MEM_IDLE;
-        end else if ((mem_phase_r == MEM_ACC) && dmem_ready_i) begin
-            mem_phase_r <= MEM_IDLE;
+        end else if ((mem_phase_r == MEM_ACC) && (mem_beat_off || dmem_ready_i)) begin
+            // An AMO's read beat is followed by its write beat inside the SAME
+            // MEM_ACC phase: the address, the size and the memoized translation
+            // are already right, only the direction changes. An error response on
+            // the read abandons the pair (the trap owns the pipeline), exactly
+            // like every other access that is refused. The old value the read
+            // returned is latched here — it is what the AMO's rd reports (a `.w`
+            // form's `mem_signed` makes it the sign-extended word, which is the
+            // `sext32` Spike's `WRITE_RD(...)` applies) and what the operation
+            // combines with rs2.
+            if (mem_is_access && mem_amo_read && !dmem_err_i && !mem_beat_off) begin
+                amo_write_r <= 1'b1;
+                amo_old_r   <= mem_load_data;
+            end else begin
+                amo_write_r <= 1'b0;
+                mem_phase_r <= MEM_IDLE;
+            end
         end else if (!mem_is_access) begin
             mem_phase_r <= MEM_IDLE;
+        end
+    end
+
+    // ---- the lr/sc reservation (E2-RV2 increment 3) -------------------------
+    // Spike's single-hart reservation is one (valid, physical address) pair:
+    // `lr` sets it (`mmu_t::load_reserved` -> `load_reservation_address = paddr`),
+    // `sc` consumes it (`store_conditional` compares, and then ALWAYS calls
+    // `yield_load_reservation()`), and nothing else touches it — an ordinary
+    // store or an AMO does NOT break a reservation in this model, which is what
+    // the corpus pins (see verif/eth_rv/README.md "LR/SC: the boundary").
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            resv_valid_r <= 1'b0;
+            resv_addr_r  <= 64'd0;
+        end else begin
+            if (lr_beat && !dmem_err_i) begin
+                resv_valid_r <= 1'b1;
+                resv_addr_r  <= mem_paddr_r;
+            end
+            if (sc_exec && !(mem_beat_err)) begin
+                resv_valid_r <= 1'b0;
+            end
         end
     end
 
@@ -1767,7 +1965,9 @@ module eth_rv_core (
             // stage is waiting for the walker), and if the stall won the trapping
             // access would simply be re-issued from the frozen slot.
             mem_valid_r <= 1'b0;
-        end else if (mem_wait) begin
+        end else if (mem_wait || wfi_wait) begin
+            // ... and a wfi waiting for an interrupt freezes the stage the same
+            // way, so the instruction it holds is still the wfi when the wait ends
             mem_valid_r <= mem_valid_r;
         end else begin
             mem_valid_r <= ex_valid_r && !ex_stall && !ex_ctrl_r.illegal
@@ -1782,10 +1982,16 @@ module eth_rv_core (
                 mem_ctrl_r.mem_size   <= ex_ctrl_r.mem_size;
                  mem_ctrl_r.mem_signed <= ex_ctrl_r.mem_signed;
                 mem_ctrl_r.fp_we      <= ex_ctrl_r.fp_we;
+                mem_ctrl_r.is_amo     <= ex_ctrl_r.is_amo;
+                mem_ctrl_r.is_lr      <= ex_ctrl_r.is_lr;
+                mem_ctrl_r.is_sc      <= ex_ctrl_r.is_sc;
+                mem_ctrl_r.amo_op     <= ex_ctrl_r.amo_op;
+                mem_ctrl_r.rd_late    <= ex_ctrl_r.rd_late;
+                mem_ctrl_r.is_wfi     <= ex_ctrl_r.is_wfi;
                 mem_rd_r         <= ex_rd_r;
                 mem_wb_pre_r     <= ex_wb_pre;
                 mem_addr_r       <= ex_alu_res;      // load/store address
-                 mem_store_data_r <= ex_op2;          // store data (rs2, FP-aware)
+                 mem_store_data_r <= ex_op2_eff;      // store data (rs2, FP-aware)
                 mem_fflags_we_r  <= ex_fflags_wr_we;
                 mem_fflags_val_r <= ex_fflags_wr_val;
                 mem_frm_we_r     <= ex_frm_wr_we;
@@ -1816,8 +2022,8 @@ module eth_rv_core (
         end else begin
             // a trapping MEM instruction must not reach WB: no commit record, no
             // register write and (for a store) no bus transaction
-            wb_valid_r      <= (mem_wait || mem_trap) ? 1'b0 : mem_valid_r;
-            if (mem_valid_r && !mem_wait && !mem_trap) begin
+            wb_valid_r      <= (mem_wait || wfi_wait || mem_trap) ? 1'b0 : mem_valid_r;
+            if (mem_valid_r && !mem_wait && !wfi_wait && !mem_trap) begin
                 wb_pc_r         <= mem_pc_r;
                 wb_insn_r       <= mem_insn_r;
                 wb_ctrl_r.illegal  <= mem_ctrl_r.illegal;
@@ -1825,13 +2031,16 @@ module eth_rv_core (
                 wb_ctrl_r.is_load  <= mem_ctrl_r.is_load;
                  wb_ctrl_r.is_store <= mem_ctrl_r.is_store;
                 wb_ctrl_r.fp_we    <= mem_ctrl_r.fp_we;
+                // ... and whether the access it describes really happened (a
+                // failing sc commits without one): see rvfi_mem_valid_o.
+                wb_ctrl_r.mem_ok   <= !mem_beat_off;
                 wb_rd_r         <= mem_rd_r;
-                 wb_data_r       <= mem_ctrl_r.is_load ? mem_load_data : mem_wb_pre_r;
+                 wb_data_r       <= mem_ctrl_r.rd_late ? mem_late_rd : mem_wb_pre_r;
                 wb_addr_r       <= mem_addr_r;
                 wb_paddr_r      <= mem_paddr_r;
                 // Spike logs the stored data truncated to the access size, so the
                 // trace carries exactly that (see the RVFI block above)
-                wb_store_data_r <= eth_rv_pkg::store_wdata(mem_store_data_r,
+                wb_store_data_r <= eth_rv_pkg::store_wdata(lsu_store_data,
                                                            mem_ctrl_r.mem_size);
                  wb_wmask_r      <= mem_ctrl_r.is_store ? lsu_wstrb : 8'd0;
                 wb_rmask_r      <= mem_ctrl_r.is_load  ? lsu_rmask : 8'd0;
@@ -2137,6 +2346,13 @@ module eth_rv_core (
             // a store's write-enable and address away from it (a store would go
             // out as a read of the walker's address).
             assert(!(mmu_pte_req && (mem_phase_r == MEM_ACC)));
+            // (No helper invariant is needed: the MEM_ACC state machine is gated
+            // on `mem_is_access` — an EX-side trap can empty `mem_valid_r`
+            // mid-access, and both the AMO's self-loop and the D-port request
+            // below are held off while that is true, so a MEM_ACC that holds no
+            // access cannot outlive its cycle. Stating "phase == MEM_ACC implies a
+            // live access" as an assertion would instead be FALSE in exactly that
+            // trap cycle.)
             // ... a walk that faults never leaves its instruction with a
             // translation it can use: the MEM slot is dropped by the trap, so the
             // trapping access cannot be re-issued from a frozen slot ...
@@ -2221,6 +2437,19 @@ module eth_rv_core (
             cover(trap_hit && (trap_cause == eth_rv_pkg::CAUSE_INSN_PAGE));
             cover(mem_xlate_fault);
             cover(rvfi_valid_o && rvfi_mem_valid_o && (rvfi_mem_addr_o != rvfi_mem_paddr_o));
+            // A extension + wfi (E2-RV2 increment 3): a committed AMO (the record
+            // is its write beat) and a committed wfi (the hart waited for nothing
+            // because a locally enabled source was already pending). Both are
+            // stated as "the record, and the MEM slot the cycle before", which is
+            // the commit relation the whole proof uses.
+            cover(rvfi_valid_o && $past(mem_amo_write) && $past(dmem_ready_i));
+            cover(rvfi_valid_o && $past(mem_ctrl_r.is_wfi));
+            cover(wfi_wait);
+            // ... and the lr/sc pair's two outcomes: an sc that stores and an sc
+            // that reports a lost reservation without touching the bus.
+            cover(mem_ctrl_r.is_lr && (mem_phase_r == MEM_ACC) && dmem_ready_i);
+            cover(mem_ctrl_r.is_sc && (mem_phase_r == MEM_ACC) && !mem_beat_off);
+            cover(mem_ctrl_r.is_sc && mem_beat_off);
         end
     end
 `endif

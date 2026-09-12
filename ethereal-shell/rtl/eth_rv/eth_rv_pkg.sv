@@ -1,11 +1,12 @@
 `default_nettype none
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      eth_rv_pkg
-// Description: Frozen parameter pack + decode/writeback control types for eth_rv (RV64IMFC, RV-C).
+// Description: Frozen parameter pack + decode/writeback control types for eth_rv (RV64IMAFDC, RV-C).
 // Details:     Single blessed configuration (C14 §2): XLEN = 64, one hart. As of
 //              E2-RV2 increment 2 the MMU is Sv39-only (cor_mmu) and the F/D
 //              floating-point extensions are implemented (cor_fpu), so `misa`
-//              advertises I/M/F/D/C. The M-mode CSR + trap path is the minimal set
+//              advertises I/M/A/F/D/C, and `wfi` plus the A extension (lr/sc/amo) are implemented
+//              (E2-RV2 increment 3). The M-mode CSR + trap path is the minimal set
 //              of C14 §3. Every
 //              pipeline-control field travels as one packed struct (`ctrl_t`) so the
 //              IF->ID->EX->MEM->WB registers stay flat vectors and the core lints
@@ -21,7 +22,7 @@
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §2 (frozen parameter pack),
 //              §3 (micro-architecture), §4 (RVFI trace port)
 //              ethereal-plan/subsystems/S15-应用处理器子系统.md §2.2
-// Notes:       RV-B v0 scope: RV64I + M + C integer subset, plus the M-mode CSR/trap
+// Notes:       RV-B v0 scope: RV64I + M + A + C integer subset, plus the M-mode CSR/trap
 //              path (`mstatus/misa/mie/mip/mtvec/mepc/mcause/mtval/mscratch/mhartid`,
 //              ecall/ebreak/illegal/misaligned). An unimplemented encoding or CSR
 //              number sets `ctrl_t.illegal` and raises the error strobe — it NEVER
@@ -127,7 +128,7 @@ package eth_rv_pkg;
     // (MXL=64, I, M, C, S, U) and the mstatus XL fields are the RV64 values, so a
     // program that reads them sees the same bit pattern as the Spike golden model
     // (see verif/eth_rv/README.md). `mip` is a real register as of increment 6.
-    localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_112c;
+    localparam logic [63:0] MISA_VALUE    = 64'h8000_0000_0014_112d;
     localparam logic [63:0] MSTATUS_XL    = 64'h0000_000a_0000_0000;  // SXL = UXL = 2
     localparam logic [63:0] MHARTID_VALUE = 64'd0;
 
@@ -394,6 +395,63 @@ package eth_rv_pkg;
         endcase
     endfunction
 
+    // -------------------------------------------------- A extension (RV64A)
+    // The nine AMO read-modify-write forms of `amo_op_e`. `lr.w/d` and `sc.w/d`
+    // are not here: they have no operation — LR is a load that also arms the
+    // reservation and SC is a conditional store — so the decoder marks them with
+    // their own `is_lr`/`is_sc` bits and this select is only inspected when
+    // `is_amo` is set.
+    typedef enum logic [3:0] {
+        AMO_ADD  = 4'd0,   // amoadd.{w,d}
+        AMO_SWAP = 4'd1,   // amoswap.{w,d}
+        AMO_XOR  = 4'd2,   // amoxor.{w,d}
+        AMO_AND  = 4'd3,   // amoand.{w,d}
+        AMO_OR   = 4'd4,   // amoor.{w,d}
+        AMO_MIN  = 4'd5,   // amomin.{w,d}   signed
+        AMO_MAX  = 4'd6,   // amomax.{w,d}   signed
+        AMO_MINU = 4'd7,   // amominu.{w,d}  unsigned
+        AMO_MAXU = 4'd8    // amomaxu.{w,d}  unsigned
+    } amo_op_e;
+
+    // The value an AMO writes back to memory: `op(old, rs2)` at the access width.
+    //
+    // `word` selects the `.w` form: Spike instantiates its `mmu.amo<uint32_t>`
+    // for those, so the operands are the LOW 32 BITS of both registers (the old
+    // value as loaded, rs2 as read) and the result is that 32-bit value
+    // zero-extended — a `.w` amoadd that carries out of bit 31 wraps there, which
+    // is exactly `uint32_t` arithmetic, not the 64-bit sum truncated afterwards.
+    // `old_v` is the loaded memory operand (its low bits are the memory word),
+    // `src_v` is rs2.
+    function automatic logic [63:0] amo_result(input amo_op_e   op,
+                                              input logic [63:0] old_v,
+                                              input logic [63:0] src_v,
+                                              input logic        word);
+        logic [63:0] o;
+        logic [63:0] s;
+        logic [63:0] so;
+        logic [63:0] ss;
+        logic [63:0] res;
+        o  = word ? {32'd0, old_v[31:0]} : old_v;
+        s  = word ? {32'd0, src_v[31:0]} : src_v;
+        // the compare operands of the signed min/max forms: Spike's
+        // `std::min(int32_t(lhs), int32_t(RS2))` sign-extends the truncated word
+        so = word ? {{32{old_v[31]}}, old_v[31:0]} : old_v;
+        ss = word ? {{32{src_v[31]}}, src_v[31:0]} : src_v;
+        unique case (op)
+            eth_rv_pkg::AMO_ADD:  res = o + s;                        // wraps at the width
+            eth_rv_pkg::AMO_SWAP: res = s;
+            eth_rv_pkg::AMO_XOR:  res = o ^ s;
+            eth_rv_pkg::AMO_AND:  res = o & s;
+            eth_rv_pkg::AMO_OR:   res = o | s;
+            eth_rv_pkg::AMO_MIN:  res = ($signed(so) < $signed(ss)) ? o : s;
+            eth_rv_pkg::AMO_MAX:  res = ($signed(so) > $signed(ss)) ? o : s;
+            eth_rv_pkg::AMO_MINU: res = (o < s) ? o : s;
+            eth_rv_pkg::AMO_MAXU: res = (o > s) ? o : s;
+            default:              res = o;                            // unreachable: !is_amo
+        endcase
+        amo_result = word ? {32'd0, res[31:0]} : res;
+    endfunction
+
     // ------------------------------------------------- memory access size
     typedef enum logic [1:0] {
         SZ_BYTE = 2'd0,
@@ -444,6 +502,25 @@ package eth_rv_pkg;
         logic [1:0] fp_iw;       // cvt integer form: 0 = w, 1 = wu, 2 = l, 3 = lu
         logic       fp_rs1_fp;   // rs1 is read from the FP register file
         logic       fp_rs2_fp;   // rs2 is read from the FP register file
+        // ---- A extension (RV64A, E2-RV2 increment 3) ----
+        // `is_load`/`is_store` still say which DIRECTION the instruction's memory
+        // access is, because that is what the misalignment cause (4 vs 6), the
+        // D-port write-enable and the trace's mask class each key off:
+        //   * lr.w/d  -> is_load  (a read; a misaligned LR is cause 4)
+        //   * sc.w/d  -> is_store (a conditional write; a misaligned SC is cause 6)
+        //   * amo.*   -> is_store (a read-modify-WRITE; a misaligned AMO is cause 6)
+        // An AMO therefore never sets both bits, which keeps P3b's "a record is
+        // exactly one direction" invariant true.
+        logic       is_amo;      // one of the nine amo.* read-modify-write forms
+        logic       is_lr;       // lr.w / lr.d: load + arm the reservation
+        logic       is_sc;       // sc.w / sc.d: conditional store (rd = 0/1)
+        amo_op_e    amo_op;      // which amo.* operation (read only when is_amo)
+        logic       rd_late;     // rd becomes available only at the END of MEM
+                                 // (any load, and every A-extension instruction):
+                                 // the consumer hazard rule and the MEM->EX
+                                 // bypass are keyed off this, not off is_load
+        // ---- WFI ----
+        logic       is_wfi;      // wfi: commit, then hold the hart until mip & mie
     } ctrl_t;
 
     // The error strobe's code type is `trap_cause_e`: the core no longer halts on
@@ -472,6 +549,9 @@ package eth_rv_pkg;
         logic is_load;
         logic is_store;
         logic fp_we;      // the destination is an FP register (trace record class)
+        logic mem_ok;     // the D-port access of this load/store really happened:
+                          // a failing `sc` commits with no memory traffic at all,
+                          // so the record must carry no `mem` field for it
     } commit_ctrl_t;
 
     // ------------------------------------------------ memory-stage control
@@ -484,6 +564,12 @@ package eth_rv_pkg;
         mem_size_e mem_size;
         logic      mem_signed;
         logic      fp_we;        // the load destination is an FP register
+        logic      is_amo;       // amo.*: MEM issues a read beat THEN a write beat
+        logic      is_lr;        // lr.w/d: arm the reservation when the beat lands
+        logic      is_sc;        // sc.w/d: consult/clear the reservation
+        amo_op_e   amo_op;       // which amo.* operation the write beat stores
+        logic      rd_late;      // see ctrl_t: MEM->EX bypass of a late rd
+        logic      is_wfi;       // wfi: MEM holds the instruction until mip & mie
     } mem_ctrl_t;
 
 endpackage

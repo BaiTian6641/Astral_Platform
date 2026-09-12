@@ -105,9 +105,48 @@ def test_multi_register_commit_line_is_rejected() -> None:
         normalize_spike_log(text, source="synthetic.log")
 
 
+def test_amo_commit_line_keeps_the_write_of_the_read_modify_write() -> None:
+    """An AMO is TWO `mem` fields in Spike's log — the normalizer keeps the write.
+
+    `amoadd.w` of 0x55667788 to 0x11223344 logs the read (address only) and then
+    the write (address + data); the canonical record carries one access, so the
+    write is what survives, with the old value in `rd`. A two-field line that is
+    not a read-then-write at one address is still a hard error.
+    """
+    text = (
+        "core   0: 3 0x000000008000003c (0x00c526af) x13 0x0000000011223344 "
+        "mem 0x0000000080001000 mem 0x0000000080001000 0x000000006688aacc\n"
+    )
+    (commit,) = normalize_spike_log(text, source="amo.log")
+    assert commit.rd == 13
+    assert commit.value == 0x11223344
+    assert commit.mem_addr == 0x80001000
+    assert commit.mem_wdata == 0x6688AACC
+
+
+def test_two_memory_accesses_that_are_not_an_amo_are_rejected() -> None:
+    text = (
+        "core   0: 3 0x000000008000003c (0x00c526af) x13 0x0000000011223344 "
+        "mem 0x0000000080001000 mem 0x0000000080001008 0x000000006688aacc\n"
+    )
+    with pytest.raises(TraceFormatError, match="not an AMO's read-then-write"):
+        normalize_spike_log(text, source="bad.log")
+
+
+def test_wfi_commits_with_no_register_and_no_memory() -> None:
+    """`wfi` is an ordinary commit with no architectural effect (E2-RV2 incr. 3)."""
+    text = "core   0: 3 0x0000000080000070 (0x10500073)\n"
+    (commit,) = normalize_spike_log(text, source="wfi.log")
+    assert commit.pc == 0x80000070
+    assert commit.insn == 0x10500073
+    assert commit.rd is None
+    assert commit.mem_addr is None
+
+
 def test_spike_command_is_pinned_to_the_corpus_flags(tmp_path: Path) -> None:
     argv = build_spike_command("/opt/spike", "prog.elf", isa=DEFAULT_ISA, log_path=tmp_path / "l.log")
-    assert DEFAULT_ISA == "rv64imfdc_zicsr"  # the ISA whose misa advertises I|M|F|D|C|S|U
+    # the ISA whose misa advertises I|M|A|F|D|C|S|U (0x8000_0000_0014_112d)
+    assert DEFAULT_ISA == "rv64imafdc_zicsr"
     assert argv[1] == f"--isa={DEFAULT_ISA}"
     assert "--log-commits" in argv
     assert argv[0] == "/opt/spike"

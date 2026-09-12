@@ -1,7 +1,7 @@
 `default_nettype none
 // SPDX-License-Identifier: CERN-OHL-S-2.0
 // Module:      cor_decoder
-// Description: RV64IMC instruction decoder for eth_rv (32-bit + compressed 16-bit forms).
+// Description: RV64IMAFDC instruction decoder for eth_rv (32-bit + compressed 16-bit forms).
 // Details:     Combinational, stateless: one 32-bit instruction image in, one
 //              `ctrl_t` + register addresses + 64-bit immediate out. The core
 //              instantiates exactly one decoder and drives it from the IF stage,
@@ -61,6 +61,7 @@ module cor_decoder (
     localparam logic [6:0] OP_REG     = 7'h33;
     localparam logic [6:0] OP_REG32   = 7'h3b;
     localparam logic [6:0] OP_MISC    = 7'h0f;
+    localparam logic [6:0] OP_AMO     = 7'h2f;   // lr.w/d, sc.w/d, amo*.{w,d} (A)
     localparam logic [6:0] OP_SYSTEM  = 7'h73;
     // floating point (E2-RV2 increment 2): the F/D opcodes
     localparam logic [6:0] OP_LOADFP  = 7'h07;   // flw / fld
@@ -237,6 +238,7 @@ module cor_decoder (
                         ctrl_o.rf_we      = 1'b1;
                         ctrl_o.wb_sel     = eth_rv_pkg::WB_MEM;
                         ctrl_o.is_load    = 1'b1;
+                        ctrl_o.rd_late    = 1'b1;
                         ctrl_o.mem_signed = (funct3[2] == 1'b0);
                         ctrl_o.mem_size   = mem_size_of(funct3[1:0]);
                         ctrl_o.alu_op     = eth_rv_pkg::ALU_ADD;
@@ -259,6 +261,83 @@ module cor_decoder (
                         rs1_addr_o      = rs1;
                         rs2_addr_o      = rs2;
                         imm_o           = s_imm;
+                    end
+                end
+                // ----------------------------------------------------
+                // A extension (RV64A, E2-RV2 increment 3): lr/sc/amo. The single
+                // memory operand is `(rs1)` — the encoding has an rs1 field and NO
+                // immediate — so the address comes straight from the ALU like a
+                // register-register op (`alu_b` stays the zeroed OP_B_RS2 default
+                // and `imm_o` is 0, so `rs1 + 0` is the address).
+                //
+                // Width: funct3 = 010 is the .w form (4 bytes, sign-extended into
+                // rd) and 011 the .d form (8 bytes), exactly like a load/store of
+                // that width, so the misalignment rule and the byte-lane masks are
+                // cor_lsu's and need no A-extension special case. Any other funct3
+                // is reserved and illegal.
+                //
+                // `aq` (bit 26) and `rl` (bit 25) are accepted and ignored: they
+                // order accesses against *other* harts, and this core is a
+                // single-hart, single-outstanding-access machine whose program
+                // order IS the memory order (see verif/eth_rv/README.md).
+                OP_AMO: begin
+                    // The width is funct3 = 010 (.w) or 011 (.d) — the same two
+                    // encodings the load/store group uses, and the same
+                    // `mem_size_of(funct3[1:0])` decode: 10 -> SZ_WORD, 11 ->
+                    // SZ_DWRD. (`funct3 == 3'b011` is the .d form, so the low bit
+                    // is what selects the width; testing the HIGH bit instead
+                    // marks every .d form illegal.)
+                    if ((funct3 == 3'b010) || (funct3 == 3'b011)) begin
+                        ctrl_o.mem_size = mem_size_of(funct3[1:0]);
+                        // the .w forms extend the loaded word into rd (LR) / hold
+                        // the 32-bit memory word (AMO); .d is a full doubleword
+                        ctrl_o.mem_signed = (funct3 == 3'b010);
+                        ctrl_o.alu_op     = eth_rv_pkg::ALU_ADD;
+                        ctrl_o.alu_a      = eth_rv_pkg::OP_A_RS1;
+                        ctrl_o.alu_b      = eth_rv_pkg::OP_B_IMM;   // rs1 + 0 = rs1: the encoding has no offset
+                        ctrl_o.wb_sel     = eth_rv_pkg::WB_MEM;
+                        rs1_addr_o        = rs1;
+                        imm_o             = 64'd0;
+                        unique case (insn_i[31:27])
+                            // lr.w / lr.d: a load that also arms the reservation.
+                            // Spike's encoding mask (MASK_LR_W = 0xf9f0707f) holds
+                            // rs2 to zero in the match, so an lr with rs2 != 0 is
+                            // not an lr at all and stays illegal.
+                            5'b00010: begin
+                                if (rs2 == 5'd0) begin
+                                    ctrl_o.is_load = 1'b1;
+                                    ctrl_o.is_lr   = 1'b1;
+                                    ctrl_o.rd_late = 1'b1;
+                                    ctrl_o.rf_we   = 1'b1;
+                                    rd_addr_o      = rd;
+                                end else begin
+                                    ctrl_o.illegal = 1'b1;
+                                end
+                            end
+                            // sc.w / sc.d: a conditional store; rd reports success
+                            5'b00011: begin
+                                ctrl_o.is_store = 1'b1;
+                                ctrl_o.is_sc    = 1'b1;
+                                ctrl_o.rd_late  = 1'b1;
+                                ctrl_o.rf_we    = 1'b1;
+                                rs2_addr_o      = rs2;
+                                rd_addr_o       = rd;
+                            end
+                            // the nine amo.* read-modify-write forms
+                            5'b00000, 5'b00001, 5'b00100, 5'b01000, 5'b01100,
+                            5'b10000, 5'b10100, 5'b11000, 5'b11100: begin
+                                ctrl_o.is_store = 1'b1;
+                                ctrl_o.is_amo   = 1'b1;
+                                ctrl_o.rd_late  = 1'b1;
+                                ctrl_o.rf_we    = 1'b1;
+                                ctrl_o.amo_op   = amo_op_of(insn_i[31:27]);
+                                rs2_addr_o      = rs2;
+                                rd_addr_o       = rd;
+                            end
+                            default: ctrl_o.illegal = 1'b1;   // reserved funct5
+                        endcase
+                    end else begin
+                        ctrl_o.illegal = 1'b1;   // reserved width / funct3
                     end
                 end
                 // ----------------------------------------------------
@@ -400,6 +479,7 @@ module cor_decoder (
                         ctrl_o.fp_single   = (funct3 == 3'b010);
                         ctrl_o.wb_sel      = eth_rv_pkg::WB_MEM;
                         ctrl_o.is_load     = 1'b1;
+                        ctrl_o.rd_late     = 1'b1;
                         ctrl_o.mem_size    = (funct3 == 3'b010) ? eth_rv_pkg::SZ_WORD
                                                                 : eth_rv_pkg::SZ_DWRD;
                         ctrl_o.alu_op      = eth_rv_pkg::ALU_ADD;
@@ -562,11 +642,11 @@ module cor_decoder (
                     end
                 end
                 // SYSTEM: the trap/CSR instructions of the M/S/U machine. The
-                // privilege rules of mret/sret (and of every CSR access) depend on
-                // the *current* privilege, so the decoder only classifies the
+                // privilege rules of mret/sret/wfi (and of every CSR access) depend
+                // on the *current* privilege, so the decoder only classifies the
                 // encoding; eth_rv_core raises the illegal-instruction trap when
-                // the mode forbids it. Anything else stays illegal — wfi/sfence are
-                // not implemented and must never become unnoticed no-ops.
+                // the mode forbids it. Anything else stays illegal and must never
+                // become an unnoticed no-op.
                 OP_SYSTEM: begin
                     if (funct3 == 3'b000) begin
                         // sfence.vma (E2-RV2 increment 1) is decoded FIRST: its
@@ -586,6 +666,24 @@ module cor_decoder (
                                 12'h001: ctrl_o.is_ebreak = 1'b1;
                                 12'h102: ctrl_o.is_sret   = 1'b1;
                                 12'h302: ctrl_o.is_mret   = 1'b1;
+                                // wfi (E2-RV2 increment 3). Spike's encoding table
+                                // masks the whole word (MASK_WFI is 0xffffffff), so
+                                // only the exact 0x10500073 form is the
+                                // architectural wfi: the 12-bit `imm` here carries
+                                // the 0x105 (its low five bits land in bits 24:20,
+                                // which are an IMMEDIATE field for funct3 = 000 —
+                                // NOT an rs2), leaving rd and rs1 as the only
+                                // register fields, which must both be zero. The
+                                // privilege rule (S or M; U-mode wfi is an illegal
+                                // instruction) is applied in eth_rv_core, where the
+                                // current mode is known.
+                                12'h105: begin
+                                    if ((rd == 5'd0) && (rs1 == 5'd0)) begin
+                                        ctrl_o.is_wfi = 1'b1;
+                                    end else begin
+                                        ctrl_o.illegal = 1'b1;
+                                    end
+                                end
                                 default: ctrl_o.illegal   = 1'b1;
                             endcase
                         end
@@ -645,6 +743,7 @@ module cor_decoder (
                             ctrl_o.rf_we      = 1'b1;
                             ctrl_o.wb_sel     = eth_rv_pkg::WB_MEM;
                             ctrl_o.is_load    = 1'b1;
+                            ctrl_o.rd_late    = 1'b1;
                             ctrl_o.mem_signed = (insn_i[13] == 1'b0);
                             ctrl_o.mem_size   = (insn_i[13] == 1'b0) ? eth_rv_pkg::SZ_WORD
                                                                     : eth_rv_pkg::SZ_DWRD;
@@ -674,6 +773,7 @@ module cor_decoder (
                                 ctrl_o.fp_we  = 1'b1;
                                 ctrl_o.wb_sel = eth_rv_pkg::WB_MEM;
                                 ctrl_o.is_load = 1'b1;
+                                ctrl_o.rd_late = 1'b1;
                                 rd_addr_o     = rd_p;
                             end else begin
                                 // C.FSD: an FP source
@@ -845,6 +945,7 @@ module cor_decoder (
                                 ctrl_o.fp_we  = 1'b1;
                                 ctrl_o.wb_sel = eth_rv_pkg::WB_MEM;
                                 ctrl_o.is_load = 1'b1;
+                                ctrl_o.rd_late = 1'b1;
                                 rd_addr_o     = c_rd;
                                 imm_o         = cldsp_imm;
                             end else begin
@@ -862,6 +963,7 @@ module cor_decoder (
                                 ctrl_o.rf_we      = 1'b1;
                                 ctrl_o.wb_sel     = eth_rv_pkg::WB_MEM;
                                 ctrl_o.is_load    = 1'b1;
+                                ctrl_o.rd_late    = 1'b1;
                                 ctrl_o.mem_signed = 1'b0;
                                 ctrl_o.mem_size   = (insn_i[13] == 1'b0) ? eth_rv_pkg::SZ_WORD
                                                                         : eth_rv_pkg::SZ_DWRD;
@@ -953,6 +1055,24 @@ module cor_decoder (
             2'b01:   mem_size_of = eth_rv_pkg::SZ_HALF;
             2'b10:   mem_size_of = eth_rv_pkg::SZ_WORD;
             default: mem_size_of = eth_rv_pkg::SZ_DWRD;
+        endcase
+    endfunction
+
+    // funct5 of the AMO encodings (insn[31:27], with aq/rl in 26:25 ignored) ->
+    // the operation the MEM stage's read-modify-write datapath applies. Only
+    // called for the nine forms the decode case accepts, so the default arm is
+    // unreachable.
+    function automatic eth_rv_pkg::amo_op_e amo_op_of(input logic [4:0] funct5);
+        unique case (funct5)
+            5'b00000: amo_op_of = eth_rv_pkg::AMO_ADD;
+            5'b00001: amo_op_of = eth_rv_pkg::AMO_SWAP;
+            5'b00100: amo_op_of = eth_rv_pkg::AMO_XOR;
+            5'b01000: amo_op_of = eth_rv_pkg::AMO_OR;
+            5'b01100: amo_op_of = eth_rv_pkg::AMO_AND;
+            5'b10000: amo_op_of = eth_rv_pkg::AMO_MIN;
+            5'b10100: amo_op_of = eth_rv_pkg::AMO_MAX;
+            5'b11000: amo_op_of = eth_rv_pkg::AMO_MINU;
+            default:  amo_op_of = eth_rv_pkg::AMO_MAXU;   // 5'b11100
         endcase
     endfunction
 

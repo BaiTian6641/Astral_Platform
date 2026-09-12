@@ -39,11 +39,13 @@ REPO_ROOT = HERE.parents[2]
 DEFAULT_OUT_DIR = REPO_ROOT / "generated" / "rv_difftest" / "corpus"
 
 TOOLCHAIN_PREFIX = "riscv64-unknown-elf-"
-MARCH = "rv64imfdc_zicsr"
-"""ISA the corpus is built for: RV64IMFDC + the CSR instructions.
+MARCH = "rv64imafdc_zicsr"
+"""ISA the corpus is built for: RV64IMAFDC + the CSR instructions.
 
-``I``/``M``/``F``/``D``/``C`` are what the core implements and advertises in
-``misa`` (0x800000000014112c); ``Zicsr`` is not implied by ``I`` in binutils any
+``I``/``M``/``A``/``F``/``D``/``C`` are what the core implements and advertises in
+``misa`` (0x800000000014112d) — ``A`` being lr/sc/amo, which ``cor_atomic.S``
+exercises, and ``wfi`` (which needs no extension letter) in ``cor_wfi.S``;
+``Zicsr`` is not implied by ``I`` in binutils any
 more, so the CSR/FP-control programs need it spelled out. It changes nothing for
 the integer programs — they contain no FP or CSR instruction and assemble to the
 same bytes. Spike enables ``zicsr`` by default for this ISA string, and the whole

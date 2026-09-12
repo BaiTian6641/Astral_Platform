@@ -19,7 +19,7 @@
  * model bit for bit. Example:
  *
  *   PATH=$PWD/generated/rv_difftest/dtc:$PATH \
- *   generated/rv_difftest/spike/install/bin/spike --isa=rv64imfdc_zicsr \
+ *   generated/rv_difftest/spike/install/bin/spike --isa=rv64imafdc_zicsr \
  *     --log-commits cor_fp_probe.elf 2>&1 | grep -n ' x26 '
  *
  * Register conventions inside this file: t0 holds CSR staging, t3 the raw
