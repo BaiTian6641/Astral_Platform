@@ -672,7 +672,7 @@ tasks:
     est_days: 15
     deliverable: service tiles + 推理 demo
     acceptance: 吞吐/能效报告；多容器分时复用无状态泄漏
-    status: todo
+    status: in_progress   # 2026-09-13 启动: 依赖 E2-FAB4 已完成；本轮交付 INT8 8x8 systolic NPU 瓦片 + 金模型逐位比对 + 两区域分时且无状态泄漏（含故意泄漏的负控）+ 用既有综合流报告 LUT/FF/DSP 与 Fmax（LUT 映射与 DSP 强制两档，方法学同 FAB2/FAB2b）+ TinyML 端到端推理；Makefile 由主控接线
 
   - id: E3-SCH1
     title: 配置调度器（镜像分组 + 预取 + 缓存，BMC 执行）
