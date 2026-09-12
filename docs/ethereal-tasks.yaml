@@ -644,7 +644,7 @@ tasks:
     est_days: 45
     deliverable: ethereal-shell/rtl/dma/eth_dma_2d.sv
     acceptance: 2D block move + blit/fill TB 通过（VDMA 风格寄存器模型）
-    status: todo
+    status: in_progress   # 2026-09-13 启动: 依赖 E2-DMA1（eth_dma_mc，绿）已完成；本轮为可纯本机验证的下一项（ND-strided + blit/fill/ROP + VDMA 风格寄存器模型 + 自检 TB 与负控；Makefile 由主控接线）
 
   - id: E2-AXI2
     title: eth_axi_xbar v0.1 burst 扩展（AxLEN/AxSIZE/AxBURST/WLAST/RLAST 贯通）
