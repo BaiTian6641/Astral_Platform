@@ -1,0 +1,27 @@
+#!/bin/busybox sh
+# SPDX-License-Identifier: MIT
+#
+# eth_rv S4 initramfs /init (E2-RV2 increment 7: OpenSBI -> Linux).
+#
+# This is the first userspace process the S4 kernel runs (PID 1, executed directly
+# because the kernel's `Run /init as init process` path finds it in the unpacked
+# initramfs). It exists for one reason: to print the milestone line, which is the
+# evidence that the boot reached the initramfs/userspace handoff — the kernel's own
+# console output alone only proves the kernel got as far as starting init.
+#
+# The marker is substituted at build time from `rv_platform.LINUX_MILESTONE`, so
+# this script and the testbench's `+uart_marker=` stop condition cannot drift apart
+# (the S4 runner reads both from that one constant). The trailing sleep loop keeps
+# PID 1 alive: if it exits, the kernel panics, and the console would then carry a
+# panic nobody asked about.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+mkdir -p /proc /sys
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+echo "eth_rv S4: initramfs /init is running as pid 1"
+cat /proc/version
+echo "@MILESTONE@"
+
+while true; do sleep 3600; done

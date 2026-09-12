@@ -160,6 +160,94 @@ TIMEBASE_FREQUENCY = CLOCK_HZ // 100
 DEFAULT_BOOTARGS = "console=ttyS0 earlycon"
 """Spike's kernel bootargs default, so a golden run matches Spike with no flag."""
 
+# --- the S4 Linux-boot profile (E2-RV2 increment 7) --------------------------------
+#
+# Everything above is the S3/S5 *DiffTest corpus* contract: a 1 MiB window with the
+# corpus linked at RAM_BASE and the DTB right above it. The S4 milestone boots a
+# real kernel, which needs a different profile for one reason only — the kernel is
+# 22.4 MiB before the device tree and initramfs are placed. These are the numbers
+# the S4 boot uses on BOTH sides (the BootROM's a1, the `+mem` image the testbench
+# preloads, and Spike's `-m`/`--dtb`/`--kernel`/`--initrd`).
+
+LINUX_RAM_WINDOW_BYTES = 40 * (1 << 20)
+"""The S4 RAM window (40 MiB) — the kernel's own footprint plus room for the DT,
+initramfs and firmware: OpenSBI 0x8000_0000..0x8004_2000, kernel
+0x8020_0000..0x817D_6000 (``text_offset`` 0x200000, ``image_size`` 0x15D6000),
+DTB 0x8220_0000, initramfs at the top. Recorded in ``core.yaml`` as
+``linux_ram_window_bytes``."""
+
+LINUX_FW_ADDR = RAM_BASE
+"""Where the OpenSBI ``fw_jump`` image is loaded: the RAM base, which is also its
+link address (``FW_TEXT_START``) and the BootROM's handoff target."""
+
+LINUX_FW_ENTRY = RAM_BASE
+"""The OpenSBI entry the S4 BootROM's entry word holds (``fw_jump.elf`` e_entry)."""
+
+LINUX_KERNEL_ADDR = RAM_BASE + 0x20_0000
+"""The kernel ``Image`` load address: ``FW_JUMP_OFFSET`` (OpenSBI's jump target)
+and the image's own ``text_offset`` — the two have to agree, which is exactly what
+the first field of the RISC-V image header states."""
+
+LINUX_KERNEL_TEXT_OFFSET = 0x20_0000
+"""The ``text_offset`` the S4 kernel image header must declare (checked at build)."""
+
+LINUX_DTB_ADDR = RAM_BASE + 0x220_0000
+"""The device tree address the *kernel* is given: ``FW_JUMP_FDT_ADDR``, the stock
+OpenSBI slot, which ``fw_jump`` relocates the tree to (``fw_base.S`` copies from
+the incoming a1 to ``fw_next_arg1()``) before entering the kernel."""
+
+LINUX_ROM_DTB_ADDR = ROM_BASE + 0x20
+"""Where the S4 *BootROM* keeps the device tree: 0x1020, Spike's own reset-ROM slot.
+
+The S4 BootROM is Spike's reset vector byte for byte — five instructions that load
+the payload entry from offset 24, leave a1 = this address and jump — followed by the
+tree. Aligning the two sides' a1 is what makes the firmware portion diffable at all
+(Spike's a1 is this value, and it is not configurable); the firmware then relocates
+the tree to :data:`LINUX_DTB_ADDR` on its own. The S4 ROM is 4096 B, so the tree has
+4064 B; the build fails if it does not fit.
+"""
+
+LINUX_ROM_STEP_WORD = 5
+"""The S4 ROM word holding the stub's instruction count (the CLINT's step skip).
+
+Word 7 is the stub step-count word in the S3 layout, but the S4 stub takes its
+entry from words 6/7 (Spike's position), so its count moves up to word 5 — the
+first word the five-instruction stub never executes.
+"""
+
+LINUX_ROM_ENTRY_WORD = 6
+"""The S4 ROM word holding the 64-bit payload entry (Spike's word 6)."""
+
+LINUX_ROM_STUB_STEPS = 5
+"""Instructions the S4 stub retires before the handoff (Spike's reset vector)."""
+
+LINUX_INITRD_END = RAM_BASE + LINUX_RAM_WINDOW_BYTES - 0x1000
+"""Top of the initramfs window (last 4 KiB page reserved), Spike's ``--initrd``
+convention: ``initrd_end = mem_base + mem_size - 0x1000``. ``initrd_start`` is
+``initrd_end - <initramfs size>``, which is why :file:`eth_rv_linux.dts` is a
+template: the S4 build substitutes the two addresses it computes."""
+
+LINUX_MILESTONE = b"eth_rv S4: MILESTONE-REACHED"
+"""The console line that ends the S4 run: the initramfs's ``/init`` announcing
+itself *after* the kernel has handed control to userspace. The testbench decodes
+the UART line and stops on this byte string (`+uart_marker=`), so the milestone is
+a byte-exact console assertion and not a wall-clock guess. It is substituted into
+the checked-in init script at build time, so the script and the assertion cannot
+drift apart."""
+
+LINUX_DTS_PATH_REL = Path("ethereal-shell/verif/eth_rv/eth_rv_linux.dts")
+"""The checked-in S4 device tree *template* (its ``@INITRD_*@`` tokens are filled
+in with :data:`LINUX_INITRD_END` and ``LINUX_INITRD_END - size``)."""
+
+LINUX_INIT_PATH_REL = Path("ethereal-shell/verif/eth_rv/s4/init")
+"""The checked-in initramfs ``/init`` script (the milestone marker's source)."""
+
+LINUX_BUILD_DIR_REL = Path("generated/rv_difftest/s4")
+"""Where the S4 build writes its images and manifest (gitignored)."""
+
+LINUX_WORK_DIR_REL = Path("build/s4-linux")
+"""Where the S4 build keeps its checkout, downloads and unpacked trees."""
+
 _INT_RE = re.compile(r"^[+-]?(?:0[xX][0-9a-fA-F]+|\d+)$")
 
 

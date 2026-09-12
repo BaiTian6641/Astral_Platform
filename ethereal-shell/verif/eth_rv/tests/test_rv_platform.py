@@ -77,6 +77,14 @@ def test_core_yaml_matches_the_platform_module() -> None:
         "uart_irq": rv_platform.UART_IRQ,
         "clock_hz": rv_platform.CLOCK_HZ,
         "timebase_frequency": rv_platform.TIMEBASE_FREQUENCY,
+        # the S4 Linux-boot profile (E2-RV2 increment 7): the same file, a second
+        # address plan — see rv_platform's S4 section and eth_rv_linux.dts
+        "linux_ram_window_bytes": rv_platform.LINUX_RAM_WINDOW_BYTES,
+        "linux_fw_addr": rv_platform.LINUX_FW_ADDR,
+        "linux_kernel_addr": rv_platform.LINUX_KERNEL_ADDR,
+        "linux_dtb_addr": rv_platform.LINUX_DTB_ADDR,
+        "linux_rom_dtb_addr": rv_platform.LINUX_ROM_DTB_ADDR,
+        "linux_initrd_end": rv_platform.LINUX_INITRD_END,
     }
 
 

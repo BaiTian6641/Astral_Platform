@@ -41,9 +41,35 @@ plic_ndev: 31
 plic_prio_bits: 4
 uart_irq: 1
 
-# Clock / timebase. Both are DiffTest placeholders, not board numbers:
-# the CLINT advances mtime on the instruction cadence (CLOCK_HZ / 100, Spike's
-# INSNS_PER_RTC_TICK), so timebase-frequency is only meaningful while both sides
-# run the same program. SoC mode drives mtime from a real RTC tick input.
 clock_hz: 1000000000
 timebase_frequency: 10000000
+
+# --- S4 Linux-boot profile (E2-RV2 increment 7) ---------------------------------
+# The keys above are the S3/S5 DiffTest-corpus contract (1 MiB window, DTB right
+# above the corpus image). These are the S4 profile, which boots OpenSBI -> Linux
+# and therefore needs a bigger window: the kernel Image alone is 22.4 MiB
+# (text_offset 0x200000, image_size 0x15d6000), the firmware occupies
+# 0x80000000..0x80042000, and the initramfs sits at the top of the window.
+# Mirrored by verif/eth_rv/rv_platform.py (LINUX_*) and by
+# verif/eth_rv/eth_rv_linux.dts (the tree the kernel is given).
+#
+# linux_ram_window_bytes: 40 MiB = 0x2800000. The minimum a stock OpenSBI fw_jump
+#   layout needs is 34.01 MiB (kernel 0x80200000..0x817d6000, DTB at the stock
+#   FW_JUMP_FDT_ADDR slot 0x82200000); 40 MiB is that plus slack for the initramfs
+#   and a larger tree.
+# linux_fw_addr: where fw_jump.bin is loaded (= FW_TEXT_START = the BootROM's
+#   handoff target).
+# linux_kernel_addr: FW_JUMP_OFFSET = the Image's text_offset (they must agree).
+# linux_dtb_addr: the stock FW_JUMP_FDT_ADDR slot; fw_jump relocates the tree here
+#   before entering the kernel, so this is the address a kernel always sees.
+# linux_rom_dtb_addr: 0x1020, where the S4 BootROM keeps the tree (Spike's own
+#   reset-ROM slot). The BootROM is 4 KiB at 0x1000, so the tree must fit in
+#   4064 B; the build fails if it does not.
+# linux_initrd_end: Spike's --initrd convention (mem_base + size - 0x1000); the
+#   start is end - <initramfs size> and is substituted into the DT by the build.
+linux_ram_window_bytes: 41943040
+linux_fw_addr: 0x80000000
+linux_kernel_addr: 0x80200000
+linux_dtb_addr: 0x82200000
+linux_rom_dtb_addr: 0x1020
+linux_initrd_end: 0x827ff000

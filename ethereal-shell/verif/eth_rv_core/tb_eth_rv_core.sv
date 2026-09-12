@@ -179,7 +179,20 @@ module tb_eth_rv_core;
     localparam logic [63:0] ROM_BASE       = 64'h0000_0000_0000_1000;
     localparam int unsigned ROM_BYTES      = 4096;
     localparam int unsigned ROM_WORDS      = ROM_BYTES / 4;
-    localparam int unsigned ROM_ENTRY_WORD = 8;      // offset 32: the entry dword
+    // The two ROM words the S3 contract names and the S4 Linux profile moves:
+    // the S4 BootROM is Spike's own reset vector (five instructions, the entry at
+    // offset 24) with the device tree filling the rest of the 4 KiB page, so its
+    // entry word is 6 and its stub step count lives at word 5 — the first word the
+    // stub never executes. Compile time, because the ROM module's ports are (see
+    // eth_rv_boot_rom.sv); the S4 runner selects the pair with -D.
+`ifndef ETH_RV_ROM_ENTRY_WORD
+`define ETH_RV_ROM_ENTRY_WORD 8
+`endif
+`ifndef ETH_RV_ROM_STUB_WORD
+`define ETH_RV_ROM_STUB_WORD 7
+`endif
+    localparam int unsigned ROM_ENTRY_WORD = `ETH_RV_ROM_ENTRY_WORD;  // offset 32 (S3) / 24 (S4)
+    localparam int unsigned ROM_STUB_WORD  = `ETH_RV_ROM_STUB_WORD;   // offset 28 (S3) / 20 (S4)
     localparam logic [63:0] DTB_ADDR       = 64'h0000_0000_8000_2000;  // a1 (S3 contract)
     // The FDT header magic is `0xd00dfeed` WRITTEN BIG-ENDIAN in the blob, so the
     // first four bytes read through this model's little-endian lanes are 0xedfe0dd0.
@@ -210,7 +223,24 @@ module tb_eth_rv_core;
     localparam logic [63:0] UART_BASE = 64'h0000_0000_1000_0000;
     localparam int unsigned UART_DIV  = 16;       // cycles per 8N1 bit cell
     localparam int unsigned UART_FRAME_CYCLES = 10 * UART_DIV;
-    localparam int unsigned UART_MAX_BYTES = 256; // receiver buffer (overflow = FAIL)
+    // The receiver buffer must hold everything the run logs up to its stop. The
+    // corpus strings are a few bytes; a Linux console prints ~12 KiB before the
+    // initramfs handoff, so the S4 profile needs headroom (overflow is still a
+    // hard FAIL — this is a bound, not a policy).
+    localparam int unsigned UART_MAX_BYTES = 131072; // receiver buffer (overflow = FAIL)
+    // The transmit queue's depth. Spike's ns16550 model has no queue at all — a THR
+    // store is written out immediately and LSR keeps reporting TEMT|THRE — so a
+    // program may emit console bytes as fast as it can retire stores, while this
+    // model shifts them out at UART_BIT_CYCLES (160 cycles/byte) and, being faithful
+    // to that LSR, cannot back-pressure the writer. The corpus bursts are a few
+    // bytes; a Linux boot prints ~12 KiB before userspace, so the S4 profile builds
+    // this testbench with a much deeper queue (`-DETH_RV_UART_FIFO_DEPTH`). Depth is
+    // a model parameter, not an architectural claim: the DUT's LSR semantics are
+    // unchanged, which is what keeps the firmware DiffTest aligned with Spike.
+`ifndef ETH_RV_UART_FIFO_DEPTH
+`define ETH_RV_UART_FIFO_DEPTH 64
+`endif
+    localparam int unsigned UART_FIFO_DEPTH = `ETH_RV_UART_FIFO_DEPTH;
     // The PLIC of the SoC map (rtl/eth_rv/eth_rv_plic.sv): Spike's window, source
     // count and priority width — mirrored by ethereal-shell/core.yaml and by
     // verif/eth_rv/rv_platform.py, and the address the device tree declares.
@@ -351,6 +381,33 @@ module tb_eth_rv_core;
     logic [63:0] stop_value;
     bit          stop_addr_en;
     bit          stop_value_en;
+    // ---- S4 Linux-boot controls (E2-RV2 increment 7) ------------------------
+    // `+a1_addr=<addr>`: the device-tree address the BootROM leaves in a1. It is
+    // DTB_ADDR (0x8000_2000) for the S3 corpus; the S4 BootROM mirrors Spike's own
+    // reset vector byte for byte, so its a1 is Spike's ROM address (0x1020) and
+    // the tree lives in the ROM rather than in RAM.
+    logic [63:0] a1_addr;
+    // `+rom_dtb=1`: the device tree is resident in the BootROM at `+a1_addr`
+    // instead of being loaded into RAM by `+dtb`. The FDT magic is checked at that
+    // ROM address, which is what makes "the firmware's a1 points at a device tree"
+    // an assertion rather than an assumption.
+    int unsigned rom_dtb;
+    // `+stop_pc=<addr>`: end the run at the first commit at this PC. It is the S4
+    // DiffTest's declared synchronisation point — the firmware portion ends where
+    // OpenSBI enters the kernel (its jump target), so the trace covers exactly the
+    // firmware and the comparator needs no golden tail beyond it.
+    logic [63:0] stop_pc;
+    bit          stop_pc_en;
+    // `+uart_marker=<hex>`: stop the run once the console line has carried this
+    // exact byte string (`+uart_marker=4d494c45` for "MILE"). The S4 milestone is a
+    // *console* event (userspace's first line), not a store, so the stop has to be
+    // defined on the decoded line — the same receiver that produces `+uart=`.
+    // Framing errors are still counted and still fail the run.
+    string       uart_marker_hex;
+    // `+progress=<cycles>`: print a progress line every N cycles. A Linux boot is
+    // hundreds of millions of cycles long and prints nothing until its console is
+    // up, so without this a slow run and a hung one look identical from outside.
+    int unsigned progress_cycles;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -555,10 +612,11 @@ module tb_eth_rv_core;
     eth_rv_mmio_mux #(
         .UART_BASE      (UART_BASE),
         .UART_BIT_CYCLES(UART_DIV),
-        .UART_FIFO_DEPTH(64),
+        .UART_FIFO_DEPTH(UART_FIFO_DEPTH),
         .ROM_BASE       (ROM_BASE),
         .ROM_BYTES      (ROM_BYTES),
         .ROM_ENTRY_WORD (ROM_ENTRY_WORD),
+        .ROM_STUB_WORD  (ROM_STUB_WORD),
         .CLINT_STEP_PRELOAD (CLINT_STEP_PRELOAD),
         .PLIC_BASE      (PLIC_BASE),
         .PLIC_SIZE      (PLIC_SIZE),
@@ -1002,6 +1060,15 @@ module tb_eth_rv_core;
     logic [15:0] rx_baud_cnt;
     logic [3:0]  rx_cell;
     logic [7:0]  rx_acc;
+    // `+uart_marker=<hex>` (S4): a rolling match over the decoded bytes. Instead
+    // of a windowed compare (which would need a procedural loop, G1), the position
+    // of the match advances one byte at a time — the classic streaming pattern
+    // matcher — so the stop costs one comparison per received frame.
+    localparam int unsigned MARKER_MAX = 96;
+    logic [7:0]  marker_bytes [0:MARKER_MAX-1];
+    int unsigned marker_len;
+    int unsigned marker_pos;
+    bit          marker_hit;
     logic [7:0]  rx_bytes [0:UART_MAX_BYTES-1];
     int unsigned rx_nbytes;
     int unsigned rx_nframes;
@@ -1072,6 +1139,24 @@ module tb_eth_rv_core;
                     end else begin
                         rx_buf_overflow <= 1'b1;
                     end
+                    // `+uart_marker`: the milestone is a console string, so the
+                    // stop is defined on the decoded line (see the plusarg).
+                    if (marker_len != 0) begin
+                        if (rx_acc == marker_bytes[marker_pos]) begin
+                            if (marker_pos + 1 >= marker_len) begin
+                                marker_hit <= 1'b1;   // the whole marker has been seen
+                            end else begin
+                                marker_pos <= marker_pos + 1;
+                            end
+                        end else begin
+                            // Restart from the first byte when this one could have
+                            // started the marker. `marker_len > 1` keeps the position
+                            // inside the marker for a one-byte marker (where a match
+                            // is a hit, never an advance).
+                            marker_pos <= ((marker_len > 1) && (rx_acc == marker_bytes[0]))
+                                          ? 1 : 0;
+                        end
+                    end
                 end else begin
                     rx_acc <= {uart_line, rx_acc[7:1]};           // data bits, LSB first
                 end
@@ -1108,6 +1193,7 @@ module tb_eth_rv_core;
     // latency, well under a hundred cycles, and the optional `+memlat` stall
     // counter is `mem_lat` (1..2 in every run the runner makes).
     localparam int unsigned PORT_STARVE_CYCLES = 4096;
+    int unsigned progress_cnt;      // +progress: cycles since the last progress line
     int unsigned dport_wait;        // consecutive cycles with an unanswered D-port request
     int unsigned iport_wait;
     int unsigned dport_wait_max;    // ... and the longest such wait in the whole run
@@ -1130,7 +1216,10 @@ module tb_eth_rv_core;
     logic [63:0] trace_from_pc;
     logic [63:0] cycle_now;
     bit          started_now;
+    bit          started_now_rec;
     bit          trace_on;
+    bit          trace_on_run;   // `+trace` given: dump commit records (S4 boots without one)
+    logic [63:0] a1_check_addr;  // the DTB address the ROM stub must leave in a1
     logic [63:0] rom_a0_val;     // the value the stub left in a0 (its last write)
     logic [63:0] rom_a1_val;     // ... and in a1: the two are checked at the handoff
     bit          rom_a0_seen;
@@ -1150,6 +1239,12 @@ module tb_eth_rv_core;
     assign started_now = rvfi_valid && (trace_on || (rvfi_pc == trace_from_pc));
     assign cycle_now   = rvfi_order - (trace_on ? cycle_base : (rvfi_order - 64'd1));
     assign pre_entry_now = rvfi_valid && !entry_seen && (rvfi_pc != entry_addr);
+    // The S4 DiffTest's declared synchronisation point: the commit at `+stop_pc`
+    // (OpenSBI's jump into the kernel) ends the run and is deliberately NOT part
+    // of the trace, so the dump is exactly the firmware portion the golden is cut
+    // to. Without `+stop_pc` this is never true and nothing changes.
+    wire at_stop_pc = rvfi_valid && stop_pc_en && (rvfi_pc == stop_pc);
+    assign started_now_rec = started_now && !at_stop_pc;
 
     // `fault_index` is a 0-based commit index, matching the harness's --inject.
     // Fault injection mirrors rv_difftest's own --inject INDEX:FIELD=VALUE: an `rd`
@@ -1262,6 +1357,23 @@ module tb_eth_rv_core;
         end else begin
             cycle_cnt <= cycle_cnt + 1;
 
+            // ---- console-marker stop (`+uart_marker`, S4) ---------------------
+            // Userspace's first line is a console event, not a store, so the S4
+            // milestone stops here: one cycle after the receiver decoded the last
+            // byte of the marker. The cycle count reported is this cycle's — the
+            // marker's own frame has already been accounted for in the UART record.
+            if (!stop_now && marker_hit) begin
+                stop_now <= 1'b1;
+            end
+
+            // ---- progress line (`+progress`, for runs too long to wait blind) --
+            progress_cnt <= progress_cnt + 1;
+            if ((progress_cycles != 0) && (progress_cnt >= progress_cycles) && !stop_now) begin
+                progress_cnt <= 0;
+                $display("ETH_RV_TB_INFO: progress cycle=%0d commits=%0d traps=%0d pgfaults=%0d console=%0d pc=0x%016x",
+                         cycle_cnt, commits, traps, n_pgfaults, rx_nbytes, imem_addr);
+            end
+
             // ---- wedge guard: every port request is answered (see the comment
             // on PORT_STARVE_CYCLES) ------------------------------------------
             if (core_dmem_req && !core_dmem_ready) begin
@@ -1344,11 +1456,11 @@ module tb_eth_rv_core;
                         stop_now <= 1'b1;
                         $display("ETH_RV_TB: FAIL the BootROM left a0 = 0x%016x, expected the hart id 0",
                                  rom_a0_val);
-                    end else if (rom_a1_val != DTB_ADDR) begin
+                    end else if (rom_a1_val != a1_check_addr) begin
                         failed   <= 1'b1;
                         stop_now <= 1'b1;
                         $display("ETH_RV_TB: FAIL the BootROM left a1 = 0x%016x, expected the DTB address 0x%016x",
-                                 rom_a1_val, DTB_ADDR);
+                                 rom_a1_val, a1_check_addr);
                     end else if (pre_entry_retires != {18'd0, rom_steps}) begin
                         // The image's step count and the stub's actual retires must
                         // agree: the CLINT swallows the former, the `time` cadence
@@ -1376,7 +1488,7 @@ module tb_eth_rv_core;
                     trace_on   <= 1'b1;
                     cycle_base <= rvfi_order - 64'd1;
                 end
-                if (started_now) begin
+                if (started_now_rec) begin
                     commits <= commits + 1;
                     last_insn <= rvfi_insn;
                     if (rvfi_insn[1:0] != 2'b11) begin
@@ -1394,6 +1506,11 @@ module tb_eth_rv_core;
                         end
                     end
 
+                    // The commit record, when this run is dumping one. The S4
+                    // Linux boot runs hundreds of millions of commits and compares
+                    // nothing commit by commit, so `+trace` is optional: without it
+                    // the counters above still run and no file is written.
+                    if (trace_on_run) begin
                     // Always the 8-field form: this dump is the memory-aware side of
                     // the DiffTest, so every commit states whether it touched memory
                     // (`-` address) and which bytes it read/wrote (masks `-` is
@@ -1430,6 +1547,7 @@ module tb_eth_rv_core;
                         $fwrite(trace_fd, " frm=0x%02x", {5'd0, f_frm});
                     end
                     $fwrite(trace_fd, "\n");
+                    end
 
                     // HTIF exit: the store that covers `tohost` is the last commit
                     if ((rvfi_mem_wmask != 8'd0) && (rvfi_mem_addr[63:3] == tohost_addr[63:3])
@@ -1445,6 +1563,12 @@ module tb_eth_rv_core;
                         && (rvfi_mem_addr[63:3] == stop_addr[63:3])
                         && rvfi_mem_wmask[stop_addr[2:0]]
                         && (!stop_value_en || (rvfi_mem_wdata == stop_value))) begin
+                        stop_now <= 1'b1;
+                    end
+                    // ... and the S4 synchronisation point: the firmware's own last
+                    // commit, the jump OpenSBI takes into the kernel. It ends the
+                    // run and is the first commit the golden is not asked about.
+                    if (at_stop_pc) begin
                         stop_now <= 1'b1;
                     end
                 end
@@ -1527,6 +1651,18 @@ module tb_eth_rv_core;
         trace_from        = 64'd0;                     // 0: start at the entry (below)
         dtb_path          = "";
         mem_bytes_arg     = 0;                         // 0: the compiled window
+        // S4: a1 defaults to the S3 contract value, the tree is expected in RAM via
+        // `+dtb`, there is no PC-bound stop and no console marker.
+        a1_addr           = 64'd0;                     // 0: the DTB_ADDR contract value
+        rom_dtb           = 0;
+        stop_pc           = 64'd0;
+        stop_pc_en        = 1'b0;
+        uart_marker_hex   = "";
+        marker_len        = 0;
+        progress_cycles   = 0;
+        // `marker_pos`/`marker_hit` are the receiver's own state and are cleared
+        // by that block's reset branch (see the marker match), like every other
+        // register this testbench owns.
         rst_n        = 1'b0;
 
         void'($value$plusargs("mem=%s", mem_path));
@@ -1557,6 +1693,34 @@ module tb_eth_rv_core;
         void'($value$plusargs("trace_from=%h", trace_from));
         void'($value$plusargs("dtb=%s", dtb_path));
         void'($value$plusargs("mem_bytes=%d", mem_bytes_arg));
+        void'($value$plusargs("a1_addr=%h", a1_addr));
+        void'($value$plusargs("rom_dtb=%d", rom_dtb));
+        void'($value$plusargs("uart_marker=%s", uart_marker_hex));
+        void'($value$plusargs("progress=%d", progress_cycles));
+        stop_pc_en = ($value$plusargs("stop_pc=%h", stop_pc) != 0);
+        a1_check_addr = (a1_addr != 64'd0) ? a1_addr : DTB_ADDR;
+        trace_on_run = (trace_path != "");
+        // `+uart_marker=<hex>`: decode two digits per byte, same convention as
+        // `+uart_rx`. An odd digit count, an empty string or more bytes than the
+        // matcher holds is a hard FAIL — a marker that silently matched nothing
+        // would turn a milestone into a timeout.
+        if (uart_marker_hex != "") begin : marker_decode
+            if (((uart_marker_hex.len() % 2) != 0) || (uart_marker_hex.len() == 0)) begin
+                $display("ETH_RV_TB: FAIL +uart_marker wants an even, non-zero number of hex digits, got '%s'",
+                         uart_marker_hex);
+                $fatal(1);
+            end
+            marker_len = uart_marker_hex.len() / 2;
+            if (marker_len > MARKER_MAX) begin
+                $display("ETH_RV_TB: FAIL +uart_marker has %0d bytes, the matcher holds %0d",
+                         marker_len, MARKER_MAX);
+                $fatal(1);
+            end
+            for (int unsigned bi = 0; bi < marker_len; bi = bi + 1) begin
+                marker_bytes[bi] = {hex_nib(uart_marker_hex.getc(2 * bi)),
+                                    hex_nib(uart_marker_hex.getc(2 * bi + 1))};
+            end
+        end
         // `$value$plusargs` returns 1 when the plusarg was present: `ADDR` and
         // `VALUE` are separately optional (`ADDR` alone stops on the first store
         // to that address, like `--stop-store ADDR`).
@@ -1660,6 +1824,30 @@ module tb_eth_rv_core;
                      dtb_n, DTB_ADDR);
         end
 
+        // ---- the device tree inside the BootROM (`+rom_dtb=1`, S4) --------------
+        // The S4 BootROM mirrors Spike's own reset vector, so its a1 points into
+        // the ROM (0x1020) and the tree is part of the 4 KiB image. Asserting the
+        // FDT magic at the address the ROM hands over is the same check `+dtb=`
+        // makes for a RAM-resident tree, moved to where the tree now lives.
+        if ((rom_dtb != 0) || (a1_check_addr != DTB_ADDR)) begin : rom_dtb_check
+            logic [63:0] rom_word_addr;
+            logic [ROM_WIW-1:0] rom_word_idx;
+            if (!in_rom(a1_check_addr)) begin
+                $display("ETH_RV_TB: FAIL +a1_addr=0x%016x is outside the BootROM (0x%016x..0x%016x): the ROM cannot hold the device tree there",
+                         a1_check_addr, ROM_BASE, ROM_BASE + 64'(ROM_BYTES));
+                $fatal(1);
+            end
+            rom_word_addr = a1_check_addr - ROM_BASE;
+            rom_word_idx = ROM_WIW'(rom_word_addr >> 2);
+            if (32'(u_mmio.u_rom.rom[rom_word_idx]) != DT_MAGIC_LE) begin
+                $display("ETH_RV_TB: FAIL the BootROM word at a1 = 0x%016x is 0x%08x, not the FDT magic 0x%08x — the firmware would be handed a tree that is not a tree",
+                         a1_check_addr, 32'(u_mmio.u_rom.rom[rom_word_idx]), DT_MAGIC_LE);
+                $fatal(1);
+            end
+            $display("ETH_RV_TB_INFO: BootROM-resident DTB at 0x%016x, FDT magic OK",
+                     a1_check_addr);
+        end
+
         // ---- UART RX injection: decode `+uart_rx=<hex bytes> -------------------
         // Two hex digits per byte, e.g. `+uart_rx=414243` for "ABC". The driver
         // above serialises them; the self-check after the run holds what the DUT
@@ -1682,31 +1870,34 @@ module tb_eth_rv_core;
             end
         end
 
-        if (trace_path == "") begin
-            $display("ETH_RV_TB: FAIL no +trace=<file> given");
-            $fatal(1);
+        // `+trace` is optional: the S4 Linux boot retires hundreds of millions of
+        // commits and compares none of them one by one, so a run that only needs
+        // the console, the cycle count and the trap counters omits it.
+        if (trace_on_run) begin
+            trace_fd = $fopen(trace_path, "w");
+            if (trace_fd == 0) begin
+                $display("ETH_RV_TB: FAIL cannot open trace file '%s'", trace_path);
+                $fatal(1);
+            end
+            $fwrite(trace_fd, "# rv_difftest trace v2\n");
+            $fwrite(trace_fd, "# generator: eth_rv_core rtl (eth_rv_core.sv RV-C)\n");
+            $fwrite(trace_fd, "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] [fflags=.. frm=..]\n");
         end
-        trace_fd = $fopen(trace_path, "w");
-        if (trace_fd == 0) begin
-            $display("ETH_RV_TB: FAIL cannot open trace file '%s'", trace_path);
-            $fatal(1);
-        end
-        $fwrite(trace_fd, "# rv_difftest trace v2\n");
-        $fwrite(trace_fd, "# generator: eth_rv_core rtl (eth_rv_core.sv RV-C)\n");
-        $fwrite(trace_fd, "# fields: cycle pc rd value [mem_addr mem_wdata [mem_rmask mem_wmask]] [fflags=.. frm=..]\n");
 
         repeat (4) @(posedge clk);
         rst_n = 1'b1;
 
         wait (stop_now === 1'b1);
         @(posedge clk);
-        $fclose(trace_fd);
-
-        if (failed) begin
-            $display("ETH_RV_TB: FAIL stopped at %0d commits after %0d cycles",
-                     commits, cycle_cnt);
-            $fatal(1);
+        if (trace_on_run) begin
+            $fclose(trace_fd);
         end
+
+        // The verdict itself is deferred to the very end: a run that failed its
+        // cycle/trap budget still has console evidence (the `+uart=` record is
+        // written below), and that evidence is exactly what a failed S4 boot needs
+        // to be diagnosable. `failed` is still sticky, so the FAIL/`$fatal` cannot
+        // be skipped — only its position moves.
 
         // The run must have gone through the BootROM into the payload: the entry
         // commit is the handshake's landing point, and the trace window has to have
@@ -1722,6 +1913,16 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the trace window never opened (no commit at 0x%016x)",
                      trace_from_pc);
             $fatal(1);
+        end
+
+        if (marker_len != 0) begin
+            if (marker_hit) begin
+                $display("ETH_RV_TB_INFO: console marker (%0d bytes) seen on the UART line after %0d console bytes",
+                         marker_len, rx_nbytes);
+            end else begin
+                $display("ETH_RV_TB_INFO: console marker (%0d bytes) NOT seen (%0d console bytes received)",
+                         marker_len, rx_nbytes);
+            end
         end
 
         // ---------------------------------------------------------- console UART
@@ -1812,6 +2013,13 @@ module tb_eth_rv_core;
             end
             $fwrite(uart_fd, "\n");
             $fclose(uart_fd);
+        end
+        // The run's verdict, after every report above so a failed run still carries
+        // its console evidence (see the note where the old verdict sat).
+        if (failed) begin
+            $display("ETH_RV_TB: FAIL stopped at %0d commits after %0d cycles",
+                     commits, cycle_cnt);
+            $fatal(1);
         end
 `ifdef ETH_RV_DRAM_AXI
         // A non-OKAY response is a legitimate event now: it is the socket's way of

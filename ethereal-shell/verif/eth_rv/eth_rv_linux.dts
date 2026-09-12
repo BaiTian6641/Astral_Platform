@@ -1,0 +1,134 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * eth_rv Linux device tree (E2-RV2 increment 7, S4: OpenSBI -> Linux).
+ *
+ * This is the DT the S4 boot uses on BOTH sides of the DiffTest: the firmware
+ * finds it through a1 (the BootROM's device tree pointer) and the harness hands
+ * the same blob to Spike with `--dtb=`. It is a separate file from eth_rv.dts on
+ * purpose: eth_rv.dts is the *DiffTest corpus* profile (1 MiB window, DTB at
+ * 0x8000_2000 right above the corpus image) and is pinned by test_rv_platform.py
+ * against core.yaml; this file is the *Linux boot* profile (40 MiB window, kernel
+ * at 0x8020_0000, DTB at the stock FW_JUMP_FDT_ADDR slot 0x8220_0000, initrd in
+ * /chosen), which no corpus program can use.
+ *
+ * TEMPLATE: the two initrd addresses are `@INITRD_START@` / `@INITRD_END@` tokens.
+ * They depend on the initramfs size, so verif/eth_rv/build_linux_boot.py
+ * substitutes them and compiles the result into generated/rv_difftest/s4/
+ * (the compiled blob is a build output; this file is the checked-in source).
+ * Placement rule (shared with the RTL loader and Spike's own `--initrd`):
+ *
+ *     initrd_end   = RAM_BASE + ram_window_bytes - 0x1000
+ *     initrd_start = initrd_end - <initramfs size>
+ *
+ * WHAT IS REAL HERE (and matches ethereal-shell/core.yaml + rv_platform.py)
+ *   - memory @ 0x8000_0000, 40 MiB: the S4 window (`linux_ram_window_bytes`).
+ *     Kernel `Image` (text_offset 0x200000 = FW_JUMP_OFFSET) 0x8020_0000..
+ *     0x817D_6000, firmware 0x8000_0000..0x8004_2000, DTB 0x8220_0000.
+ *   - clint @ 0x0200_0000: eth_rv_clint (msip/mtimecmp/mtime), the hart's
+ *     M-mode timer/software source; S-mode timer interrupts come from OpenSBI's
+ *     non-`sstc` path (`mtimecmp` + `mip.STIP`), which is why no `sstc` is
+ *     declared below (the hart has no `stimecmp`).
+ *   - plic @ 0x0C00_0000: eth_rv_plic, 31 sources, 4-bit priorities; the M and S
+ *     contexts are declared per hart in Spike's order, so the S context is the
+ *     hart's `mip.SEIP`.
+ *   - serial @ 0x1000_0000: eth_rv_uart (ns16550a, reg-shift 0, 1-byte
+ *     registers, source 1 level-triggered). `clock-frequency` is the only
+ *     property a Linux 8250_of/earlycon probe insists on: it is set to the
+ *     DiffTest timebase (10 MHz), which is what Spike's own auto-generated DTS
+ *     emits for this UART. It is a placeholder, not a board number: neither the
+ *     DUT's UART nor Spike's ns16550 model turns the divisor into a bit rate.
+ *   - cpu @ 0: rv64imafdc_zicsr_zicntr, Sv39, one hart.
+ *
+ * WHAT ELSE IS DELIBERATELY ABSENT
+ *   - No `sstc`, no IMSIC/APLIC, no cache/CMO properties, no Svadu/PBMTE, no
+ *     Zicclsm (see rv_platform.py for the same list): a DT that claims more
+ *     changes what the kernel is allowed to assume. Alpine's kernel has
+ *     CONFIG_RISCV_ISA_FALLBACK=y, so every absent optional extension is one the
+ *     kernel will simply not use.
+ *   - No `riscv,isa-extensions`: the legacy `riscv,isa` string is what the S3/S5
+ *     contract already pins, and it is what Spike parses for its own ISA.
+ *
+ * BOUNDARY
+ *   `timebase-frequency` / `clock-frequency` are DiffTest cadence placeholders
+ *   (the CLINT advances on the instruction cadence, Spike derives 10 MHz from
+ *   CPU_HZ/INSNS_PER_RTC_TICK); software that turns them into seconds is out of
+ *   contract until the SoC has a real tick source (E2-RV2 G9).
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "ethereal,eth_rv";
+	model = "ethereal,eth_rv";
+
+	chosen {
+		stdout-path = &serial0;
+		bootargs = "console=ttyS0 earlycon";
+		/* The initramfs the S4 runner loads at these addresses (fw_jump
+		 * passes only a0/a1, so this is the only handoff route). */
+		linux,initrd-start = <@INITRD_START@>;
+		linux,initrd-end = <@INITRD_END@>;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <10000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			status = "okay";
+			riscv,isa = "rv64imafdc_zicsr_zicntr";
+			mmu-type = "riscv,sv39";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x2800000>;
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x0 0x2000000 0x0 0xc000>;
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+		};
+
+		plic: plic@c000000 {
+			compatible = "riscv,plic0";
+			#address-cells = <0>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+			reg = <0x0 0xc000000 0x0 0x1000000>;
+			riscv,ndev = <31>;
+			riscv,max-priority = <15>;
+		};
+
+		serial0: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			clock-frequency = <10000000>;
+			interrupt-parent = <&plic>;
+			interrupts = <1 4>;
+		};
+	};
+};

@@ -1044,3 +1044,112 @@ No `sstc` and no S-mode timer source (use the SBI timer path — `mip.STIP` writ
 `riscv,ndev = 31`; no IMSIC/APLIC; no hardware A/D update; no PBMTE/Svadu/Zicclsm
 declarations. `timebase-frequency` in the DT is still a DiffTest placeholder, not a real
 timebase.
+
+## The Linux boot (E2-RV2 increment 7, S4: OpenSBI → Linux)
+
+The S4 slice leaves the corpus behind and boots a real kernel. Nothing above changes:
+the corpus profile (1 MiB window, DTB at `0x8000_2000`, `eth_rv.dts`) is still the
+DiffTest contract, and `core.yaml`/`rv_platform.py` now carry a second, explicitly
+separate *boot* profile.
+
+```sh
+# build the images (OpenSBI v1.3 + Alpine kernel + static-busybox initramfs + DT + ROM)
+python3 ethereal-shell/verif/eth_rv/build_linux_boot.py
+python3 ethereal-shell/verif/eth_rv/build_linux_boot.py --check
+
+# Phase 1 — the reference: Spike boots the pair to userspace (~2 s)
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --spike
+
+# Phase 2 — the same pair on the RTL (40 MiB window, console-marker stop)
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --rtl --dram
+
+# the firmware portion, commit by commit against Spike
+python3 ethereal-shell/verif/eth_rv_core/run_linux_boot.py --difftest
+```
+
+The build pins everything by hash (`OPENSBI_COMMIT`, the apk/deb URLs + SHA-256 in
+`build_linux_boot.py`) and writes `generated/rv_difftest/s4/` plus a `manifest.json`.
+**Only sources are committed** — `build_linux_boot.py`, `eth_rv_linux.dts` (a template:
+its `@INITRD_START@`/`@INITRD_END@` tokens are filled in for the initramfs just built),
+`s4/init` — while the firmware, kernel, initramfs, DTB and ROM image are regenerable
+blobs under `generated/`.
+
+### The address plan (the second profile in `core.yaml`)
+
+| region | address | notes |
+|---|---|---|
+| RAM window | `0x8000_0000` + 40 MiB | kernel 22.4 MiB + stock OpenSBI layout ≥34.01 MiB |
+| `fw_jump.bin` | `0x8000_0000` | `FW_TEXT_START` = the BootROM handoff target |
+| kernel `Image` | `0x8020_0000` | `FW_JUMP_OFFSET` **and** the image's `text_offset` |
+| DT (kernel) | `0x8220_0000` | `FW_JUMP_FDT_ADDR`; `fw_jump` relocates the tree here |
+| DT (boot ROM) | `0x1020` | Spike's own reset-ROM slot — see below |
+| initramfs | `[0x827F_F000 - size, 0x827F_F000)` | Spike's `--initrd` convention, via `/chosen` |
+
+`fw_jump` passes only `a0`/`a1`, so the initramfs has to be described in `/chosen`
+(hence the DT template). Alpine's `vmlinuz-lts` needs no carving beyond the gunzip: it
+is the flat RISC-V `Image` (its `_start` at image offset 0 jumps to `_start_kernel` at
+`0x10d8`, per `System.map`), with an EFI PE header overlaid on the image header's
+fields, so `fw_jump`'s plain jump to the load address boots it.
+
+### Why the DUT's BootROM is Spike's reset vector
+
+`+a1_addr=0x1020` and `+rom_dtb=1` select an S4 BootROM that *is* Spike's own reset
+vector (`auipc t0,0` / `addi a1,t0,32` / `csrr a0,mhartid` / `ld t0,24(t0)` / `jr t0`)
+with the device tree filling the rest of the 4 KiB page. Aligning `a1` is what makes the
+firmware portion diffable at all — Spike's DTB pointer is not configurable, and Spike's
+`--pc` cannot be used to move its start point (it bypasses Spike's ROM and leaves
+`a1 = 0`). The only deliberate difference from Spike's image is ROM word 5: it carries
+the stub's step count (5) for the CLINT's skip, because word 7 is both Spike's step word
+and the entry's high half. The stub never fetches word 5. `build_rom` (in
+`build_linux_boot.py`) asserts the whole layout, and the TB's `+rom_dtb` check asserts
+the FDT magic at the address `a1` actually names.
+
+### TB flags this slice added
+
+* `+uart_marker=<hex>` — stop when the *decoded console line* carries this byte string.
+  A milestone in userspace is a console event, not a store, so the stop condition has
+  to live on the same receiver that produces `+uart=` (which is already a bit-timing
+  assertion: every frame is start + 8 data + stop sampled at cell centres).
+* `+progress=<cycles>` — one `ETH_RV_TB_INFO: progress …` line every N cycles. A Linux
+  boot is hundreds of millions of cycles and silent until its console is up; without
+  this a slow run and a hung one look identical from outside.
+* `+stop_pc=<addr>` — end the run at the first commit at this PC. That is the S4
+  DiffTest's declared synchronisation point (the firmware ends where OpenSBI enters the
+  kernel), and the commit is deliberately excluded from the dump so the trace is exactly
+  the firmware portion.
+* `+a1_addr=` / `+rom_dtb=1` — the S4 handoff contract above.
+* `+trace` is now optional (a whole-boot single-stream dump of ~4×10^8 commits is
+  neither useful nor affordable), and the run's verdict is printed **after** the console
+  report, so a failed long run still carries its console evidence.
+* The verdict/`failed` handling is unchanged; the FAIL/`$fatal` position moved only.
+
+### Boundaries of the S4 profile (read before trusting a number)
+
+* **`mtime` across traps is not a diffable quantity.** Spike returns early from
+  `step()` on a trap (the trap costs it 0 steps) while the DUT's CLINT counts every
+  retired instruction, so a `rdtime`/printk timestamp taken after a trap diverges. The
+  kernel's console *text* is diffable; its timestamps are not. (The DUT's step strobe
+  also drops a pulse on `mem_trap`, which is the second, larger part of the same drift —
+  see the report's finding list.)
+* **Console bit rate.** Spike's ns16550 writes a THR store straight out with LSR
+  permanently `TEMT|THRE`; the DUT shifts bytes at 16 cycles/bit and cannot
+  back-pressure a writer that trusts THRE, so the S4 build sizes the transmit/receive
+  queue at 64 KiB (`-DETH_RV_UART_FIFO_DEPTH=65536`). Queue depth is a model parameter
+  — register semantics are untouched, which is what keeps the firmware DiffTest aligned
+  — and an overflow is still a hard FAIL rather than a silent drop.
+* **No TLB and no PTE cache** (`cor_mmu.sv` walks on every access), so the kernel phase
+  runs at ~0.2 IPC: the RTL boot is ~2×10^9 cycles to reach the kernel's unaligned
+  probe, i.e. ~45 minutes of single-threaded wall clock. This is a throughput statement,
+  not a correctness one.
+* **`timebase-frequency`/`clock-frequency` remain DiffTest placeholders** (10 MHz), and
+  the DT says so. The kernel's BogoMIPS/baud numbers derived from them are fiction.
+* **Current status (2026-09-12):** Phase 1 (Spike → userspace) passes. On the RTL the
+  console is byte-identical to Spike's for the first 4,462 bytes (OpenSBI + early kernel
+  init), the firmware DiffTest matches for the first 714,987 commits, and the kernel
+  then dies in `check_unaligned_access_emulated` with `cause=1`/`stval=epc` where a
+  misaligned `ld` should raise `cause=4` and be emulated by OpenSBI's
+  `sbi_misaligned_load_handler`. That is the open blocker; the full write-up, the
+  numbers and the boundaries are in
+  `docs/reports/report-E2-RV2-s4-opensbi-linux-20260912.md` and
+  `local://rv12-linux-notes.md`.
