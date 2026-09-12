@@ -23,7 +23,7 @@ if str(HARNESS_DIR) not in sys.path:
     sys.path.insert(0, str(HARNESS_DIR))
 
 from rv_image import Image, load_hex_image
-from rv_spike import SpikeError, find_spike, normalize_spike_log
+from rv_spike import SpikeError, StopStore, find_spike, normalize_spike_log
 from rv_trace import Commit
 
 
@@ -63,7 +63,7 @@ def golden_commits(golden_log_text: str, fixture_image: Image) -> list[Commit]:
     return normalize_spike_log(
         golden_log_text,
         source="fixture:cor_model.spike_log.txt",
-        tohost=fixture_image.tohost,
+        stop=StopStore(fixture_image.tohost),
         entry=fixture_image.entry,
     )
 
@@ -93,11 +93,24 @@ corpus_build = _load_build_module()
 
 
 @pytest.fixture(scope="session")
-def corpus_elfs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
-    """Build the corpus programs once per session; skip when no toolchain is installed."""
+def riscv_gcc() -> str:
+    """The riscv64-unknown-elf gcc this box has, or skip when it has none.
+
+    Anything that rebuilds a checked-in artefact from source (the corpus, the
+    BootROM hex) needs it; they all resolve the toolchain the same way, through
+    the corpus builder, so a box either has one or skips them together.
+    """
     try:
-        corpus_build.find_toolchain("gcc")
+        return str(corpus_build.find_toolchain("gcc"))
     except SystemExit as exc:
         pytest.skip(f"riscv toolchain not available: {exc}")
+
+
+@pytest.fixture(scope="session")
+def corpus_elfs(
+    tmp_path_factory: pytest.TempPathFactory, riscv_gcc: str
+) -> dict[str, Path]:
+    """Build the corpus programs once per session (skips without a toolchain)."""
+    del riscv_gcc  # the fixture is the toolchain check; the build re-resolves it
     out_dir = tmp_path_factory.mktemp("rv_difftest_corpus")
     return {source.stem: corpus_build.build_one(source, out_dir) for source in corpus_build.corpus_sources()}

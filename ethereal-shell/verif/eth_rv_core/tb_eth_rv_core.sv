@@ -4,7 +4,9 @@
 // Description: Verilator testbench for eth_rv_core: behavioral memory + RVFI commit-trace dump.
 // Details:     The RTL-side half of the DiffTest integration (C14 §5). It
 //              instantiates the core, serves its two v0 ports out of a
-//              zero-filled 256 KiB word array loaded from a $readmemh image, and
+//              zero-filled word array loaded from a $readmemh image (its size is
+//              the SoC memory window, `-DETH_RV_MEM_BYTES`, 1 MiB by default —
+//              see the parameters below), and
 //              writes one trace line per retired instruction in the harness's
 //              canonical format (ethereal-shell/verif/eth_rv/rv_trace.py):
 //              `cycle pc rd value` followed by the optional memory suffix
@@ -85,20 +87,121 @@
 //              instructions, how many were compressed, and the load/store
 //              counts taken from the RVFI memory fields — so a run is
 //              self-describing without reading the trace file.
+//
+//              THE BOOT PATH (E2-RV2 increment 5, S3): the core no longer starts
+//              in DRAM. `eth_rv_pkg::RESET_PC` is the BootROM base (0x1000), so
+//              every run begins in the 4 KiB `eth_rv_boot_rom` the MMIO mux
+//              decodes: its M-mode stub sets a0 = hart id, a1 = DTB_ADDR, and
+//              jumps to the 64-bit payload entry stored at ROM offset 32 (word 8).
+//              This testbench preloads that one ROM image (`+rom=<file>`, the
+//              checked-in hex from rtl/eth_rv/rom/build_rom.py; a missing file is
+//              a hard FAIL, never a silent zero ROM) into the MMIO mux's ROM
+//              instance, PATCHES the entry word from `+entry=<addr>` — exactly
+//              how a harness points a reset vector at an ELF entry — and serves
+//              FETCHES from the same array (the SoC's two routes to one ROM
+//              slave). The optional `+dtb=<file>` writes the blob at DTB_ADDR and
+//              checks its FDT magic: a1 pointing at something that is not a device
+//              tree is a boot failure, and it is caught here rather than showing
+//              up as a mystery load value later.
+//
+//              THE TRACE WINDOW: the golden stream is Spike's commits AFTER its
+//              own reset vector (rv_spike's `entry` rule), so the dump here starts
+//              at the PC the ROM actually jumps to and renumbers that commit
+//              `cycle` 1 — the two streams line up without `--no-cycle-check`.
+//              `+trace_from=<addr>` overrides the start: pass the ROM base
+//              (0x1000) to diff the reset stub itself, which is what a golden run
+//              started with `--disable-dtb --pc=0x1000` over an image carrying the
+//              same ROM produces (both streams then cover the seven ROM
+//              instructions and the payload, commit for commit). Commits before
+//              the window are still watched, never dumped.
+//
+//              THE HANDSHAKE IS CHECKED IN THE RTL, not left to the trace: the
+//              first commit must be inside the ROM, the ROM must write x10 (a0) = 0
+//              and x11 (a1) = DTB_ADDR before the payload entry retires, the entry
+//              word the ROM holds must equal the `+entry` that was asked for, and
+//              the run must reach the entry at all. Those are one-sided facts —
+//              the golden model boots through SPIKE's reset vector, whose a1 is
+//              Spike's own DTB — so they cannot be DiffTested; they are asserted
+//              here (FAILing with what was seen) and the payload's own checks
+//              cover what both sides can compare.
+//
+//              THE `time` CADENCE FOLLOWS THE STUB: the CLINT turns `mtime` into a
+//              staircase of the hart's retired instruction count, and the golden
+//              model counts a reset vector this SoC does not run. The invariant
+//              both sides share is
+//                  tick count = CLINT_STEP_PRELOAD + (retires AFTER the stub)
+//              where the preload is what the GOLDEN had counted when the program
+//              started (5 = Spike's own five-instruction reset vector; compile with
+//              `-DETH_RV_CLINT_PRELOAD=<n>` when the golden is started at this ROM,
+//              where n is the stub's instruction count) and the stub's own pulses
+//              are swallowed using the step-count word the ROM image carries. The
+//              check above holds that word against the retires actually seen before
+//              the handoff, so a stub whose length changed (or an image that lost
+//              the word) FAILs instead of silently shifting the `time` staircase.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
 // Modified:    2026-09-12 - E2-RV1 increment 5: port error responses + wedge guard
+//              2026-09-12 - E2-RV2 increment 5 (S3): BootROM preload + a0/a1
+//              handshake checks, `+entry`/`+trace_from` trace window, `+dtb`
+//              load + magic check, parameterized memory window (`+mem_bytes`)
 // Tags:        TESTBENCH
-// Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (I/D/RVFI ports), §5 (DiffTest)
+// Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (I/D/RVFI ports), §5 (DiffTest) ·
+//              ethereal-shell/core.yaml (SoC map / boot contract) ·
+//              ethereal-plan/subsystems/S15-应用处理器子系统.md §5 (DDR-less boot) ·
 //              ethereal-shell/verif/eth_rv/README.md (trace protocol)
 // Notes:       Sim-only (Tags: TESTBENCH): not part of `make lint`'s RTL set,
 //              lintable with `verilator --lint-only -Wall --timing` regardless.
 module tb_eth_rv_core;
 
     // ------------------------------------------------------------------ params
-`ifndef ETH_RV_DRAM_AXI
-    localparam int unsigned MEM_WORDS = 32_768;   // 256 KiB @ 8 B/word (behavioral build)
+    // THE MEMORY WINDOW (S3 contract): ONE number, shared by this testbench's
+    // behavioral memory, by the AXI/DRAM socket below and by the golden model's
+    // `-m0x80000000:<bytes>`. The runner passes it as `-DETH_RV_MEM_BYTES=<n>`
+    // (compile time: it sizes the array) and again as `+mem_bytes=<n>` (run time:
+    // checked against the compiled value), so a run cannot silently diff a DUT
+    // whose memory window differs from the one Spike was given.
+`ifndef ETH_RV_MEM_BYTES
+`define ETH_RV_MEM_BYTES 1_048_576     // 1 MiB (S3 contract)
 `endif
+    localparam int unsigned MEM_BYTES = `ETH_RV_MEM_BYTES;
+`ifndef ETH_RV_DRAM_AXI
+    // The behavioral build's array is indexed by 8-byte words; the AXI build's
+    // memory is the DRAM stub's own, sized by `DRAM_WORDS` below.
+    localparam int unsigned MEM_WORDS = MEM_BYTES / 8;
+`endif
+
+    // BootROM (rtl/eth_rv/eth_rv_boot_rom.sv): the 4 KiB read-only region at
+    // 0x0000_1000 the core executes FIRST (eth_rv_pkg::RESET_PC). Its M-mode stub
+    // sets a0 = 0 (hart id) and a1 = DTB_ADDR, then jumps to the 64-bit payload
+    // entry stored at ROM_ENTRY_WORD (offset 32) — the harness patches those two
+    // words (`+entry=<addr>`) so one ROM boots every corpus program. The region is
+    // served here for FETCHES and by the MMIO mux for data accesses: one image.
+    localparam logic [63:0] ROM_BASE       = 64'h0000_0000_0000_1000;
+    localparam int unsigned ROM_BYTES      = 4096;
+    localparam int unsigned ROM_WORDS      = ROM_BYTES / 4;
+    localparam int unsigned ROM_ENTRY_WORD = 8;      // offset 32: the entry dword
+    localparam logic [63:0] DTB_ADDR       = 64'h0000_0000_8000_2000;  // a1 (S3 contract)
+    // The FDT header magic is `0xd00dfeed` WRITTEN BIG-ENDIAN in the blob, so the
+    // first four bytes read through this model's little-endian lanes are 0xedfe0dd0.
+    localparam logic [31:0] DT_MAGIC_LE = 32'hEDFE_0DD0;
+    localparam string DEFAULT_ROM_IMAGE = "ethereal-shell/rtl/eth_rv/rom/boot_rom.hex";
+    localparam int unsigned ROM_WIW = $clog2(ROM_WORDS);   // ROM 32-bit word index width
+    localparam int unsigned ROM_BIW = ROM_WIW - 1;         // ROM 8-byte beat index width
+
+    // The CLINT's mtime phase: what the GOLDEN model has counted when the program
+    // starts. 5 (the default) is Spike's own five-instruction reset vector, which
+    // its step counter includes while this SoC boots through the BootROM instead —
+    // the corpus comparison. A golden started at THIS ROM (`--pc=0x1000
+    // --disable-dtb`, the full-ROM comparison) counts the stub itself, so that mode
+    // compiles the TB with `-DETH_RV_CLINT_PRELOAD=<stub instructions>` (7 for the
+    // checked-in image). The stub's own pulses are swallowed automatically from the
+    // ROM image's step-count word, so this is the only mode-dependent number here;
+    // the boot check below FAILs if the image's count and the ROM's actual retires
+    // ever disagree.
+`ifndef ETH_RV_CLINT_PRELOAD
+`define ETH_RV_CLINT_PRELOAD 5
+`endif
+    localparam int unsigned CLINT_STEP_PRELOAD = `ETH_RV_CLINT_PRELOAD;
 
     // Console UART of the SoC data map (rtl/eth_rv/eth_rv_mmio_mux.sv): the same
     // page Spike's ns16550 answers on, with a 16-cycle bit cell, so a queued
@@ -114,9 +217,11 @@ module tb_eth_rv_core;
 `endif
 
 `ifdef ETH_RV_DRAM_AXI
-    // eth_dram_ctrl window (the ASSUMPTION of the DRAM slice: 0x8000_0000 + 1 MiB)
+    // The DRAM socket's window is the SAME single number as the behavioral memory
+    // (S3 contract): the AXI master and `eth_dram_ctrl` are both built with it
+    // below, and the runner sizes Spike's `-m` with it.
     localparam logic [31:0] DRAM_BASE  = 32'h8000_0000;
-    localparam int unsigned DRAM_BYTES = 1 << 20;
+    localparam int unsigned DRAM_BYTES = MEM_BYTES;
     localparam int unsigned DRAM_WORDS = DRAM_BYTES / 8;
 `endif
 
@@ -177,6 +282,43 @@ module tb_eth_rv_core;
     // takes (pc, cause, instruction) — the commit trace deliberately has no
     // record for a trap, so this is how a run's trap sequence is read back.
     int unsigned trace_traps;
+    // ---- boot-path controls (E2-RV2 increment 5, S3) -----------------------
+    // `+rom=<file>`: the BootROM image ($readmemh, 32-bit words — see
+    // rtl/eth_rv/rom/boot_rom.hex). It is REQUIRED in practice: without a ROM the
+    // core's reset PC has nothing to execute, so a missing file is a hard FAIL,
+    // never a silently zero ROM.
+    string       rom_path;
+    // `+entry=<addr>`: the payload entry. It PATCHES the ROM's entry word (the
+    // 64-bit value the stub `ld`s and `jr`s through) before reset, exactly as a
+    // harness points Spike's reset vector at an ELF entry, and it is the default
+    // trace start (see `+trace_from`).
+    logic [63:0] entry_addr;
+    // `+trace_from=<addr>`: start dumping the commit trace at the first commit at
+    // this PC (and renumber that commit `cycle` 1, which is what the golden stream
+    // — Spike's commits after its own reset vector — is numbered from). Default:
+    // the ROM's entry word, i.e. the first payload instruction. Pass the ROM base
+    // (0x1000) to diff the reset stub itself, which is what a golden run that
+    // starts Spike at 0x1000 with `--disable-dtb --pc=0x1000` produces.
+    logic [63:0] trace_from;
+    // `+dtb=<file>`: a raw device-tree blob, written into RAM at DTB_ADDR before
+    // reset (the address the ROM leaves in a1). Optional — a harness may instead
+    // weave the same bytes into the `+mem` image at that address — but when given
+    // it is checked: the blob must start with the FDT magic, because a1 pointing
+    // at a non-FDT is exactly the boot failure this slice exists to catch.
+    string       dtb_path;
+    // `+mem_bytes=<n>`: the memory window the golden model was started with. It
+    // must equal the compiled `ETH_RV_MEM_BYTES` (see the params section); a
+    // mismatch is a hard FAIL rather than a quietly incomparable run.
+    int unsigned mem_bytes_arg;
+    // `+stop_addr=<addr>` `+stop_value=<value>`: the generalized stop event — the
+    // harness's `--stop-store ADDR[:VALUE]`, so BOTH sides end at the same
+    // architectural store instead of this testbench over-running to the HTIF
+    // mailbox while the comparator truncates the dump. Without `+stop_addr` the
+    // run ends at the `tohost` store, exactly as before.
+    logic [63:0] stop_addr;
+    logic [63:0] stop_value;
+    bit          stop_addr_en;
+    bit          stop_value_en;
 
     // ------------------------------------------------------------------ memory
     // One 8-byte word of the image, indexed from the corpus link base. The
@@ -213,6 +355,37 @@ module tb_eth_rv_core;
     function automatic logic [31:0] read_bytes32(input logic [63:0] addr);
         read_bytes32 = 32'(window_of(addr) >> {addr[2:0], 3'b000});
     endfunction
+    // ---- BootROM window -----------------------------------------------------
+    // The ROM array lives inside the MMIO mux's `eth_rv_boot_rom` instance (one
+    // image serves the fetch path here and the D port there, the way the SoC
+    // interconnect would route the core's two ports at one ROM slave). Fetches
+    // are served out of it exactly like `read_bytes32` serves the behavioral
+    // memory: the 8-byte beat at (addr & ~7), shifted so the addressed byte is
+    // at the LSB.
+    function automatic logic in_rom(input logic [63:0] addr);
+        in_rom = (addr >= ROM_BASE) && (addr < (ROM_BASE + 64'(ROM_BYTES)));
+    endfunction
+
+    function automatic logic [63:0] rom_beat(input logic [63:0] addr);
+        logic [ROM_BIW-1:0] bi;
+        bi = ROM_BIW'((addr - ROM_BASE) >> 3);
+        rom_beat = {u_mmio.u_rom.rom[{bi, 1'b1}], u_mmio.u_rom.rom[{bi, 1'b0}]};
+    endfunction
+
+    function automatic logic [31:0] rom_read32(input logic [63:0] addr);
+        rom_read32 = 32'(rom_beat({addr[63:3], 3'b000}) >> {addr[2:0], 3'b000});
+    endfunction
+
+    // Write one byte into the image of whichever build this is (the `+dtb` load).
+    task automatic mem_store_byte(input logic [63:0] addr, input logic [7:0] data);
+        int unsigned wi;
+        wi = word_of(addr);
+`ifdef ETH_RV_DRAM_AXI
+        if (wi < DRAM_WORDS) u_dram.u_impl.mem[wi][{addr[2:0], 3'b000} +: 8] = data;
+`else
+        if (wi < MEM_WORDS) mem[wi][{addr[2:0], 3'b000} +: 8] = data;
+`endif
+    endtask
 
     // Bit position of byte lane `l` inside the 64-bit port window: the lane
     // offset wraps inside the word, the word index carries (see the store block).
@@ -286,6 +459,8 @@ module tb_eth_rv_core;
     logic        mtip;
     logic        step_strobe;
     logic [63:0] clint_mtime;   // the CLINT's mtime register == the `time` CSR
+    logic [63:0] rom_entry;     // the payload entry the BootROM will jump to
+    logic [13:0] rom_steps;     // the stub's instruction count, from the ROM image
 
     eth_rv_core u_dut (
         .clk_i           (clk),
@@ -342,7 +517,11 @@ module tb_eth_rv_core;
     eth_rv_mmio_mux #(
         .UART_BASE      (UART_BASE),
         .UART_BIT_CYCLES(UART_DIV),
-        .UART_FIFO_DEPTH(64)
+        .UART_FIFO_DEPTH(64),
+        .ROM_BASE       (ROM_BASE),
+        .ROM_BYTES      (ROM_BYTES),
+        .ROM_ENTRY_WORD (ROM_ENTRY_WORD),
+        .CLINT_STEP_PRELOAD (CLINT_STEP_PRELOAD)
     ) u_mmio (
         .clk_i          (clk),
         .rst_ni         (rst_n),
@@ -369,7 +548,9 @@ module tb_eth_rv_core;
         .msip_o         (msip),
         .mtip_o         (mtip),
         .mtime_o        (clint_mtime),
-        .step_i         (step_strobe)
+        .step_i         (step_strobe),
+        .rom_entry_o    (rom_entry),
+        .rom_steps_o    (rom_steps)
     );
 
     // ------------------------------------------------------------------ I port
@@ -379,11 +560,12 @@ module tb_eth_rv_core;
     // Spike's `bus_t` has no device for such an address (`mmio_load/fetch`
     // returns false) and the DRAM socket answers DECERR outside its window, so
     // both raise an access fault. An in-window address is served as before.
-    // Known, deliberate deviation: Spike's boot ROM (0x1000) and its ns16550
-    // register file have no counterpart on this instruction port, so a FETCH from
-    // those pages faults here (it is what Spike does for the UART page too, since
-    // the 4-byte fetch is rejected by `reg_io_width != len`); no corpus program
-    // fetches there.
+    // The SoC's map on this port is the memory window plus the BootROM window: a
+    // fetch from the ROM (0x1000) is the reset path now, and it is served from the
+    // same `eth_rv_boot_rom` image the D port reads through the MMIO mux. The
+    // console page has no counterpart here, so a FETCH from it faults (exactly what
+    // Spike does: its ns16550 rejects the 4-byte fetch by `reg_io_width != len`);
+    // no corpus program fetches there.
 `ifdef ETH_RV_DRAM_AXI
     function automatic logic in_mem(input logic [63:0] addr);
         in_mem = (addr >= 64'(DRAM_BASE)) && (addr < (64'(DRAM_BASE) + 64'(DRAM_BYTES)));
@@ -419,10 +601,12 @@ module tb_eth_rv_core;
                         && ((mem_lat == 0)
                             || (imem_pend && (imem_addr_q == imem_addr)
                                 && (imem_wait >= mem_lat)));
-    assign imem_rdata = imem_req ? read_bytes32(imem_addr) : 32'd0;
+    assign imem_rdata = imem_req ? (in_rom(imem_addr) ? rom_read32(imem_addr)
+                                                      : read_bytes32(imem_addr))
+                                 : 32'd0;
     // the error rides the accept, so the core can never mistake "not ready yet"
     // for "this address has no instruction"
-    assign imem_err   = imem_ready && !in_mem(imem_addr);
+    assign imem_err   = imem_ready && !(in_mem(imem_addr) || in_rom(imem_addr));
 
     // ------------------------------------------------------------------ D port
 `ifdef ETH_RV_DRAM_AXI
@@ -792,11 +976,42 @@ module tb_eth_rv_core;
     int unsigned iport_wait_max;
     logic [3:0]  last_trap_cause;
     logic [63:0] last_mem_addr;
+    logic [63:0] last_mem_paddr;   // ... its physical address (Sv39 runs differ)
     logic [63:0] last_store_data;
     logic [31:0] last_insn;
     int unsigned cycle_cnt;
     bit          stop_now;
     bit          failed;
+    // ---- boot handshake + trace window (E2-RV2 increment 5, S3) -------------
+    // `entry_addr` is what the harness asked for (`+entry`); `rom_entry` is what
+    // the ROM image actually holds; `entry_seen` says the payload entry was
+    // retired; `rom_a0_seen`/`rom_a1_seen` say the stub's two architectural
+    // writes retired inside the ROM. `trace_on`/`cycle_base` implement the
+    // renumbered trace window (`cycle_now` is the ordinal the dump prints).
+    logic [63:0] cycle_base;
+    logic [63:0] trace_from_pc;
+    logic [63:0] cycle_now;
+    bit          started_now;
+    bit          trace_on;
+    logic [63:0] rom_a0_val;     // the value the stub left in a0 (its last write)
+    logic [63:0] rom_a1_val;     // ... and in a1: the two are checked at the handoff
+    bit          rom_a0_seen;
+    bit          rom_a1_seen;
+    bit          entry_seen;
+    // Commits retired BEFORE the payload entry: the BootROM stub's executed
+    // instructions. The image states that count (`rom_steps`, the word the CLINT
+    // swallows) and the hart's step cadence depends on the two agreeing, so they
+    // are held against each other at the handoff — a stub with a branch, a trap or
+    // a lost `_rom_steps` word fails here instead of shifting `time` silently.
+    int unsigned pre_entry_retires;
+    logic        pre_entry_now;
+    // The trace window is a pure function of the current commit and the state:
+    // `started_now` is true in the very cycle the first in-window commit retires,
+    // and `cycle_now` is the ordinal the dump prints for it (1 at the window's
+    // first commit — the golden stream's numbering).
+    assign started_now = rvfi_valid && (trace_on || (rvfi_pc == trace_from_pc));
+    assign cycle_now   = rvfi_order - (trace_on ? cycle_base : (rvfi_order - 64'd1));
+    assign pre_entry_now = rvfi_valid && !entry_seen && (rvfi_pc != entry_addr);
 
     // `fault_index` is a 0-based commit index, matching the harness's --inject.
     // Fault injection mirrors rv_difftest's own --inject INDEX:FIELD=VALUE: an `rd`
@@ -892,11 +1107,20 @@ module tb_eth_rv_core;
             iport_wait_max  <= 0;
             last_trap_cause <= 4'd0;
             last_mem_addr   <= 64'd0;
+            last_mem_paddr  <= 64'd0;
             last_store_data <= 64'd0;
             last_insn       <= 32'd0;
             cycle_cnt       <= 0;
             stop_now        <= 1'b0;
             failed          <= 1'b0;
+            cycle_base      <= 64'd0;
+            trace_on        <= 1'b0;
+            rom_a0_val      <= 64'd0;
+            rom_a1_val      <= 64'd0;
+            rom_a0_seen     <= 1'b0;
+            rom_a1_seen     <= 1'b0;
+            entry_seen      <= 1'b0;
+            pre_entry_retires <= 0;
         end else begin
             cycle_cnt <= cycle_cnt + 1;
 
@@ -920,63 +1144,171 @@ module tb_eth_rv_core;
             end
 
             if (rvfi_valid && !stop_now) begin
-                commits <= commits + 1;
-                last_insn <= rvfi_insn;
-                if (rvfi_insn[1:0] != 2'b11) begin
-                    n_compressed <= n_compressed + 1;
-                end
-                if (rvfi_mem_valid) begin
-                    last_mem_addr <= rvfi_mem_addr;
-                    if (rvfi_mem_rmask != 8'd0) begin
-                        n_loads <= n_loads + 1;
+                // ---- BootROM handshake (E2-RV2 increment 5, S3) -----------------
+                // The reset stub is the only code that runs before the payload, so
+                // its architectural effects are asserted HERE, in the RTL's own
+                // terms: it must start at the ROM base, leave the hart id in a0 and
+                // the DTB address in a1 before it jumps, and the entry it jumps
+                // through must be the `+entry` the harness asked for. A wrong value
+                // is a hard FAIL naming what was seen — never a trace divergence to
+                // be puzzled over later, and never a silently mis-booted run. The
+                // golden model cannot provide this check: it boots through Spike's
+                // own reset vector, whose a1 is Spike's DTB, so the ROM's effect is
+                // ground truth on the RTL side only (see the notes in
+                // verif/eth_rv/README.md and local://s3-rtl-notes.md).
+                if (rvfi_order == 64'd1) begin
+                    if (!in_rom(rvfi_pc)) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the first commit is at 0x%016x, not inside the BootROM (0x%016x..0x%016x) — check RESET_PC",
+                                 rvfi_pc, ROM_BASE, ROM_BASE + 64'(ROM_BYTES));
                     end
-                    if (rvfi_mem_wmask != 8'd0) begin
-                        n_stores        <= n_stores + 1;
-                        last_store_data <= rvfi_mem_wdata;
+                    if (rom_entry != entry_addr) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the BootROM entry word is 0x%016x, expected 0x%016x (+entry did not land)",
+                                 rom_entry, entry_addr);
+                    end
+                    if (rom_steps == 14'd0) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the BootROM image has no stub step count (its step-count word is zero) — wrong image, or boot_rom.S lost _rom_steps?");
+                    end
+                end
+                // The stub's executed instructions, counted from the commit stream:
+                // what the CLINT swallows must be exactly this (see pre_entry_retires).
+                if (pre_entry_now && !stop_now) begin
+                    pre_entry_retires <= pre_entry_retires + 1;
+                end
+                if (in_rom(rvfi_pc) && !entry_seen) begin
+                    // Latch what the stub leaves in the two argument registers —
+                    // the last write, not the first: a1 is built by a
+                    // LUI/SLLI/SRLI sequence, so the value that matters is the one
+                    // it holds when the payload starts.
+                    if (rvfi_rd_we && (rvfi_rd_addr == 5'd10)) begin
+                        rom_a0_seen <= 1'b1;
+                        rom_a0_val  <= rvfi_rd_wdata;
+                    end
+                    if (rvfi_rd_we && (rvfi_rd_addr == 5'd11)) begin
+                        rom_a1_seen <= 1'b1;
+                        rom_a1_val  <= rvfi_rd_wdata;
+                    end
+                end
+                if (!entry_seen && (rvfi_pc == entry_addr)) begin
+                    entry_seen <= 1'b1;
+                    if (!(rom_a0_seen && rom_a1_seen)) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the payload entry 0x%016x was reached without the BootROM handshake (a0 written=%0d, a1 written=%0d)",
+                                 entry_addr, rom_a0_seen, rom_a1_seen);
+                    end else if (rom_a0_val != 64'd0) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the BootROM left a0 = 0x%016x, expected the hart id 0",
+                                 rom_a0_val);
+                    end else if (rom_a1_val != DTB_ADDR) begin
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the BootROM left a1 = 0x%016x, expected the DTB address 0x%016x",
+                                 rom_a1_val, DTB_ADDR);
+                    end else if (pre_entry_retires != {18'd0, rom_steps}) begin
+                        // The image's step count and the stub's actual retires must
+                        // agree: the CLINT swallows the former, the `time` cadence
+                        // depends on the latter (see the CLINT's MTIME CADENCE note).
+                        failed   <= 1'b1;
+                        stop_now <= 1'b1;
+                        $display("ETH_RV_TB: FAIL the BootROM retired %0d instructions before the payload entry, but its image says %0d — stub and step-count word disagree",
+                                 pre_entry_retires, rom_steps);
                     end
                 end
 
-                // Always the 8-field form: this dump is the memory-aware side of
-                // the DiffTest, so every commit states whether it touched memory
-                // (`-` address) and which bytes it read/wrote (masks `-` is
-                // reserved for "not reported", which this testbench never needs).
-                if (f_we) begin
-                    if (f_rd_fp) begin
-                        $fwrite(trace_fd, "%0d 0x%016x f%0d 0x%016x ", rvfi_order,
-                                f_pc, f_rd, f_value);
-                    end else begin
-                        $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x ", rvfi_order,
-                                f_pc, f_rd, f_value);
+                // ---- trace window ---------------------------------------------
+                // The golden stream is Spike's commits AFTER its own reset vector
+                // (rv_spike's `entry` rule), so the DUT dump starts at the PC the
+                // ROM jumps to and renumbers that commit `cycle` 1 — the two
+                // streams then line up without `--no-cycle-check`. `+trace_from`
+                // overrides the start (pass the ROM base to diff the stub itself,
+                // which a golden run started with `--disable-dtb --pc=0x1000`
+                // produces). Commits before the window are still watched by the
+                // guards above, never dumped.
+                // Open the window on the commit that starts it: `started_now` is
+                // already true for it (see the assignments above), so this only
+                // latches the renumbering base for the commits that follow.
+                if (!trace_on && (rvfi_pc == trace_from_pc)) begin
+                    trace_on   <= 1'b1;
+                    cycle_base <= rvfi_order - 64'd1;
+                end
+                if (started_now) begin
+                    commits <= commits + 1;
+                    last_insn <= rvfi_insn;
+                    if (rvfi_insn[1:0] != 2'b11) begin
+                        n_compressed <= n_compressed + 1;
                     end
-                end else begin
-                    $fwrite(trace_fd, "%0d 0x%016x - - ", rvfi_order,
-                            f_pc);
-                end
-                if (f_mem_valid) begin
-                    if (f_mem_wmask != 8'd0) begin
-                        $fwrite(trace_fd, "0x%016x 0x%016x - 0x%02x",
-                                f_mem_addr, f_mem_wdata, f_mem_wmask);
-                    end else begin
-                        $fwrite(trace_fd, "0x%016x - 0x%02x -",
-                                f_mem_addr, f_mem_rmask);
+                    if (rvfi_mem_valid) begin
+                        last_mem_addr  <= rvfi_mem_addr;
+                        last_mem_paddr <= rvfi_mem_paddr;
+                        if (rvfi_mem_rmask != 8'd0) begin
+                            n_loads <= n_loads + 1;
+                        end
+                        if (rvfi_mem_wmask != 8'd0) begin
+                            n_stores        <= n_stores + 1;
+                            last_store_data <= rvfi_mem_wdata;
+                        end
                     end
-                end else begin
-                    $fwrite(trace_fd, "- - - -");
-                end
-                // ... and the FP record: the keyed tokens of trace v2, present
-                // only in the commit that wrote the CSR (E2-RV2 increment 2)
-                if (f_fflags_we) begin
-                    $fwrite(trace_fd, " fflags=0x%02x", {3'd0, f_fflags});
-                end
-                if (f_frm_we) begin
-                    $fwrite(trace_fd, " frm=0x%02x", {5'd0, f_frm});
-                end
-                $fwrite(trace_fd, "\n");
 
-                // HTIF exit: the store that covers `tohost` is the last commit
-                if ((rvfi_mem_wmask != 8'd0) && (rvfi_mem_addr[63:3] == tohost_addr[63:3])
-                    && rvfi_mem_wmask[tohost_addr[2:0]]) begin
-                    stop_now <= 1'b1;
+                    // Always the 8-field form: this dump is the memory-aware side of
+                    // the DiffTest, so every commit states whether it touched memory
+                    // (`-` address) and which bytes it read/wrote (masks `-` is
+                    // reserved for "not reported", which this testbench never needs).
+                    if (f_we) begin
+                        if (f_rd_fp) begin
+                            $fwrite(trace_fd, "%0d 0x%016x f%0d 0x%016x ", cycle_now,
+                                    f_pc, f_rd, f_value);
+                        end else begin
+                            $fwrite(trace_fd, "%0d 0x%016x x%0d 0x%016x ", cycle_now,
+                                    f_pc, f_rd, f_value);
+                        end
+                    end else begin
+                        $fwrite(trace_fd, "%0d 0x%016x - - ", cycle_now,
+                                f_pc);
+                    end
+                    if (f_mem_valid) begin
+                        if (f_mem_wmask != 8'd0) begin
+                            $fwrite(trace_fd, "0x%016x 0x%016x - 0x%02x",
+                                    f_mem_addr, f_mem_wdata, f_mem_wmask);
+                        end else begin
+                            $fwrite(trace_fd, "0x%016x - 0x%02x -",
+                                    f_mem_addr, f_mem_rmask);
+                        end
+                    end else begin
+                        $fwrite(trace_fd, "- - - -");
+                    end
+                    // ... and the FP record: the keyed tokens of trace v2, present
+                    // only in the commit that wrote the CSR (E2-RV2 increment 2)
+                    if (f_fflags_we) begin
+                        $fwrite(trace_fd, " fflags=0x%02x", {3'd0, f_fflags});
+                    end
+                    if (f_frm_we) begin
+                        $fwrite(trace_fd, " frm=0x%02x", {5'd0, f_frm});
+                    end
+                    $fwrite(trace_fd, "\n");
+
+                    // HTIF exit: the store that covers `tohost` is the last commit
+                    if ((rvfi_mem_wmask != 8'd0) && (rvfi_mem_addr[63:3] == tohost_addr[63:3])
+                        && rvfi_mem_wmask[tohost_addr[2:0]]) begin
+                        stop_now <= 1'b1;
+                    end
+                    // ... and the generalized stop (`+stop_addr`/`+stop_value`, the
+                    // harness's `--stop-store ADDR[:VALUE]`): the run ends at the
+                    // store that hits the address, and the value too when one was
+                    // given, so a program with no HTIF exit still stops where the
+                    // comparator stops it.
+                    if (stop_addr_en && (rvfi_mem_wmask != 8'd0)
+                        && (rvfi_mem_addr[63:3] == stop_addr[63:3])
+                        && rvfi_mem_wmask[stop_addr[2:0]]
+                        && (!stop_value_en || (rvfi_mem_wdata == stop_value))) begin
+                        stop_now <= 1'b1;
+                    end
                 end
             end
 
@@ -1045,6 +1377,11 @@ module tb_eth_rv_core;
         dmem_corrupt_addr = 64'd0;
         dmem_corrupt_xor  = 64'd0;
         trace_traps       = 0;
+        rom_path          = DEFAULT_ROM_IMAGE;
+        entry_addr        = 64'h0000_0000_8000_0000;   // the memory window base
+        trace_from        = 64'd0;                     // 0: start at the entry (below)
+        dtb_path          = "";
+        mem_bytes_arg     = 0;                         // 0: the compiled window
         rst_n        = 1'b0;
 
         void'($value$plusargs("mem=%s", mem_path));
@@ -1066,6 +1403,16 @@ module tb_eth_rv_core;
         void'($value$plusargs("uart_fault_bit=%d", uart_fault_bit));
         void'($value$plusargs("starve_dmem=%d", starve_dmem));
         void'($value$plusargs("no_dmem_err=%d", no_dmem_err));
+        void'($value$plusargs("rom=%s", rom_path));
+        void'($value$plusargs("entry=%h", entry_addr));
+        void'($value$plusargs("trace_from=%h", trace_from));
+        void'($value$plusargs("dtb=%s", dtb_path));
+        void'($value$plusargs("mem_bytes=%d", mem_bytes_arg));
+        // `$value$plusargs` returns 1 when the plusarg was present: `ADDR` and
+        // `VALUE` are separately optional (`ADDR` alone stops on the first store
+        // to that address, like `--stop-store ADDR`).
+        stop_addr_en  = ($value$plusargs("stop_addr=%h", stop_addr) != 0);
+        stop_value_en = ($value$plusargs("stop_value=%h", stop_value) != 0);
 
         if (mem_path == "") begin
             $display("ETH_RV_TB: FAIL no +mem=<file> given");
@@ -1074,6 +1421,14 @@ module tb_eth_rv_core;
 `ifdef ETH_RV_DRAM_AXI
         if (starve_dmem != 0) begin
             $display("ETH_RV_TB: FAIL +starve_dmem is only implemented by the behavioral build");
+            $fatal(1);
+        end
+        // The Sv39 walk-injection control folds into the beat THIS testbench
+        // returns; in the AXI build the beats come from the DRAM stub, so the
+        // control would be silently ignored and a "control not caught" would look
+        // like a modelling bug. Refuse it loudly instead.
+        if ((dmem_corrupt_xor != 64'd0) || (dmem_corrupt_addr != 64'd0)) begin
+            $display("ETH_RV_TB: FAIL +dmem_corrupt_addr/+dmem_corrupt_xor are only implemented by the behavioral build");
             $fatal(1);
         end
         // the DRAM stub's array is the one image: preload it so the instruction
@@ -1088,6 +1443,74 @@ module tb_eth_rv_core;
         end
         $readmemh(mem_path, mem);
 `endif
+
+        // ---- the memory window the golden model was given ----------------------
+        // `-DETH_RV_MEM_BYTES` sizes the arrays above; `+mem_bytes` is what the
+        // runner passed to Spike's `-m`. They must be the same number, or the two
+        // sides are not running the same machine and a MATCH would mean nothing.
+        if ((mem_bytes_arg != 0) && (mem_bytes_arg != MEM_BYTES)) begin
+            $display("ETH_RV_TB: FAIL +mem_bytes=%0d but this model was built with a %0d-byte window (-DETH_RV_MEM_BYTES)",
+                     mem_bytes_arg, MEM_BYTES);
+            $fatal(1);
+        end
+
+        // ---- BootROM: one image, preloaded, then pointed at the payload entry ---
+        // The ROM lives inside the MMIO mux's `eth_rv_boot_rom` instance, so the
+        // fetch path above and the D port read this ONE array — the SoC's two routes
+        // to one ROM slave. The entry word is patched in place: 64 bits at
+        // ROM_ENTRY_WORD, the shape a harness uses to point a reset vector at an
+        // entry. The ROM's own view of it (`rom_entry`) is checked against the
+        // request on the first commit, so a patch that did not land fails as itself
+        // instead of as a phantom fetch fault.
+        begin : rom_load
+            integer rom_fd;
+            rom_fd = $fopen(rom_path, "r");
+            if (rom_fd == 0) begin
+                $display("ETH_RV_TB: FAIL cannot open the BootROM image '%s'", rom_path);
+                $fatal(1);
+            end
+            $fclose(rom_fd);
+        end
+        for (int unsigned i = 0; i < ROM_WORDS; i = i + 1) begin
+            u_mmio.u_rom.rom[i] = 32'd0;
+        end
+        $readmemh(rom_path, u_mmio.u_rom.rom);
+        u_mmio.u_rom.rom[ROM_WIW'(ROM_ENTRY_WORD)]     = entry_addr[31:0];
+        u_mmio.u_rom.rom[ROM_WIW'(ROM_ENTRY_WORD + 1)] = entry_addr[63:32];
+        trace_from_pc = (trace_from != 64'd0) ? trace_from : entry_addr;
+
+        // ---- the device tree blob at the address the stub leaves in a1 ----------
+        // Optional: a harness may instead weave the same bytes into the `+mem`
+        // image. When the blob IS given, the FDT magic is checked — a1 pointing at
+        // something that is not a device tree is the boot failure this slice exists
+        // to catch, and it must be caught here, not as a mystery load in the trace.
+        if (dtb_path != "") begin : dtb_load
+            integer      dtb_fd;
+            int unsigned dtb_n;
+            logic [7:0]  dtb_byte;
+            dtb_fd = $fopen(dtb_path, "rb");
+            if (dtb_fd == 0) begin
+                $display("ETH_RV_TB: FAIL cannot open the DTB '%s'", dtb_path);
+                $fatal(1);
+            end
+            dtb_n = 0;
+            while (($fread(dtb_byte, dtb_fd) == 1)
+                   && ((DTB_ADDR + 64'(dtb_n)) < (base_addr + 64'(MEM_BYTES)))) begin
+                mem_store_byte(DTB_ADDR + 64'(dtb_n), dtb_byte);
+                dtb_n = dtb_n + 1;
+            end
+            $fclose(dtb_fd);
+            if ((dtb_n == 0) || (32'(mem_word(DTB_ADDR)) != DT_MAGIC_LE)) begin
+                $display("ETH_RV_TB: FAIL the DTB '%s' (%0d bytes) does not start with the FDT magic 0xd00dfeed at 0x%016x (read 0x%08x)",
+                         dtb_path, dtb_n, DTB_ADDR, 32'(mem_word(DTB_ADDR)));
+                $fatal(1);
+            end
+            // NOT the `ETH_RV_TB:` banner: the runner reads the first banner line
+            // as the run's verdict, and this is information, not a verdict.
+            $display("ETH_RV_TB_INFO: DTB %0d bytes loaded at 0x%016x, FDT magic OK",
+                     dtb_n, DTB_ADDR);
+        end
+
         if (trace_path == "") begin
             $display("ETH_RV_TB: FAIL no +trace=<file> given");
             $fatal(1);
@@ -1111,6 +1534,22 @@ module tb_eth_rv_core;
         if (failed) begin
             $display("ETH_RV_TB: FAIL stopped at %0d commits after %0d cycles",
                      commits, cycle_cnt);
+            $fatal(1);
+        end
+
+        // The run must have gone through the BootROM into the payload: the entry
+        // commit is the handshake's landing point, and the trace window has to have
+        // opened for the two streams to be comparable at all. Both are structural
+        // (a reset PC, ROM image or `+entry` mismatch lands here), so they are hard
+        // FAILs with the address in the message.
+        if (!entry_seen) begin
+            $display("ETH_RV_TB: FAIL the BootROM never reached the payload entry 0x%016x (reset PC, ROM image or +entry mismatch)",
+                     entry_addr);
+            $fatal(1);
+        end
+        if (!trace_on) begin
+            $display("ETH_RV_TB: FAIL the trace window never opened (no commit at 0x%016x)",
+                     trace_from_pc);
             $fatal(1);
         end
 
@@ -1166,17 +1605,19 @@ module tb_eth_rv_core;
             $display("ETH_RV_TB: FAIL the DRAM socket answered with a non-OKAY response that never became an access fault");
             $fatal(1);
         end
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, AXI %0d AR (%0d multi-beat) %0d R beats, %0d AW %0d W beats, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
-                 last_mem_addr, last_store_data, last_insn,
+                 last_mem_addr, last_mem_paddr, last_store_data, last_insn,
+                 MEM_BYTES / 1024, entry_addr,
                  n_axi_ar, n_axi_r_bursts, n_axi_r_beats, n_axi_aw, n_axi_w_beats,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `else
-        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x <- 0x%016x, last insn 0x%08x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
+        $display("ETH_RV_TB: PASS %0d commits (%0d compressed), %0d cycles, %0d loads, %0d stores, %0d traps (%0d interrupts, %0d access faults, %0d page faults, last mcause=%0d), port wait max D %0d / I %0d cycles, last mem 0x%016x (pa 0x%016x) <- 0x%016x, last insn 0x%08x, window %0d KiB, ROM entry 0x%016x, UART %0d bytes/%0d frames (%0d frame errors, drain %0d cycles)",
                  commits, n_compressed, cycle_cnt, n_loads, n_stores, traps,
                  n_interrupts, n_access_faults, n_pgfaults, last_trap_cause, dport_wait_max, iport_wait_max,
-                 last_mem_addr, last_store_data, last_insn,
+                 last_mem_addr, last_mem_paddr, last_store_data, last_insn,
+                 MEM_BYTES / 1024, entry_addr,
                  rx_nbytes, rx_nframes, rx_errors, drain_used);
 `endif
         $finish;

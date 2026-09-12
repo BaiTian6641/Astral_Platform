@@ -72,7 +72,9 @@ Spike is installed elsewhere, point the harness at it with `--spike PATH` or
 | `rv_dut.py` | DUT adapters (`dump:` / `model:` / `callback:`) + fault injection |
 | `rv_model.py` | Worked-example DUT: RV64IMC interpreter (RV64I + M + integer C subset) |
 | `rv_difftest.py` | CLI + comparator: first divergence with pc/rd/cycle, exit codes |
-| `corpus/` | Bare-metal RV64IMAFDC corpus: `crt0.S`, `link.ld`, eighteen `cor_*.S` programs, builder |
+| `corpus/` | Bare-metal RV64IMAFDC corpus: `crt0.S`, `link.ld`, twenty `cor_*.S` programs, builder |
+| `rv_platform.py` | The SoC contract (address map, boot handshake, DiffTest cadence) the runner and golden generator share |
+| `eth_rv.dts` | Device tree source for the contract above (Spike `--dtb`, testbench `+dtb=`); `build_dtb.py` compiles it |
 | `tests/` | pytest suite; `tests/fixtures/` holds the checked-in golden fixtures |
 
 ## The trace protocol
@@ -133,8 +135,12 @@ debugging.
 ## Golden side: Spike
 
 `--elf ELF` runs Spike as
-`spike --isa=rv64imafdc_zicsr_zicntr -l --log-commits --log=<tmp> <ELF>` and normalizes its log.
-Two details matter and are handled for you:
+`spike --isa=rv64imafdc_zicsr_zicntr -m0x80000000:1048576 -l --log-commits --log=<tmp> <ELF>`
+and normalizes its log. The memory region, the device tree, the bootargs, the
+start PC and the stop event are all flags now (`--mem-base`/`--mem-size`,
+`--dtb`/`--disable-dtb`, `--bootargs`, `--pc`/`--pcs`, `--stop-store`) and every
+one of them is recorded in the PASS line — see "The boot path and the harness
+flags" below. Three details matter and are handled for you:
 
 * **A trapping instruction is not committed.** Spike logs the exception
   (`core 0: exception trap_…, epc …`) instead of a commit line, so a trapping
@@ -147,7 +153,9 @@ Two details matter and are handled for you:
   by storing to the HTIF mailbox (`tohost`); Spike notices asynchronously and
   keeps retiring the program's final spin loop for thousands of instructions.
   The golden stream therefore stops at the commit that stores to that address
-  (read from the ELF symbol table), which is exactly where a DUT stops too.
+  (read from the ELF symbol table), which is exactly where a DUT stops too —
+  unless `--stop-store ADDR[:VALUE]` names a different store, in which case both
+  streams end there instead (see "The stop rule" below).
 
 `--golden TRACE` replays a captured stream instead, so the harness (and its
 tests) run without Spike. A *canonical* trace needs nothing else; a *raw* Spike
@@ -187,14 +195,140 @@ Three adapters, one contract: an ordered iterator of commits.
    and the first-divergence path are exercised by real runs *today*; treat it as
    the template for the RTL adapter, not as a permanent second core.
 
-`--inject INDEX:FIELD=VALUE` corrupts one field of one DUT commit (`pc`/`rd`/
-`value`/`cycle`/`mem_addr`/`mem_wdata`/`mem_rmask`/`mem_wmask`) — a demo/self-test
-switch that proves the harness detects the class of bug the RTL will eventually
-produce, memory stream included.
+## The boot path and the harness flags (`eth_rv_boot_rom`, S3)
+
+Before S3 the harness assumed a *single* image, loaded at the window base, ended
+by a store to `tohost`. A firmware handoff is none of those things: reset lands in
+a BootROM, the ROM leaves the hart id in `a0` and a device-tree pointer in `a1`,
+and only then does the payload run. This section is the contract the harness now
+speaks, and the boundaries that come with it.
+
+### The contract (one source of truth)
+
+| what | value | stated in |
+|---|---|---|
+| hart count | 1 | `core.yaml`, `eth_rv.dts` |
+| ISA | `rv64imafdc_zicsr_zicntr` | `core.yaml`, `eth_rv.dts`, `rv_spike.DEFAULT_ISA` |
+| RAM window | `0x8000_0000`, 1 MiB | `core.yaml`, `eth_rv.dts`, `rv_platform.RAM_WINDOW_BYTES`, `-DETH_RV_MEM_BYTES`, Spike `-m` |
+| BootROM | `0x0000_1000`, 4 KiB | `core.yaml`, `rv_platform.ROM_*`, `eth_rv_pkg::RESET_PC` |
+| payload entry word | ROM byte offset 32 | `core.yaml`, `rv_platform.ROM_ENTRY_OFFSET`, `boot_rom.S`/`boot_rom.ld` |
+| device tree | `0x8000_2000` | `core.yaml`, `rv_platform.DTB_ADDR`, `boot_rom.S`'s `a1` |
+| console UART / CLINT | `0x1000_0000` / `0x0200_0000` | `eth_rv.dts`, `rv_platform` |
+
+`ethereal-shell/core.yaml` is the checked-in SoC configuration; the Python copy
+in `rv_platform.py` is what the runner and the golden generator execute, and
+`eth_rv.dts` is what Spike is pointed at. `tests/test_rv_platform.py` fails if any
+of the three disagrees, and `rv_platform.read_core_yaml` refuses a structure the
+harness cannot read rather than silently ignoring it.
+
+```
+reset -> BootROM @ 0x1000 (4 KiB)      a0 = hartid (0)
+                                       a1 = 0x8000_2000
+                                       jr <64-bit entry word>   <- patched from +entry=
+      -> payload @ <entry>             (usually 0x8000_0000)
+      -> DTB     @ 0x8000_2000         loaded by the harness, passed to Spike with --dtb
+```
+
+### Flags (all recorded in the PASS line)
+
+Golden side — `rv_difftest.py`:
+
+| flag | effect |
+|---|---|
+| `--mem-base` / `--mem-size` | Spike's `-m0x80000000:<size>`; **must** match the DUT window |
+| `--dtb PATH` | device tree for Spike; a `.dts` is compiled on demand by the harness's `dtc` |
+| `--disable-dtb` | Spike `--disable-dtb` (no DT, and no Spike-side UART/CLINT either) |
+| `--bootargs ARGS` | Spike `--bootargs` |
+| `--pc ADDR` / `--pcs H:A,…` | override the start PC, bypassing Spike's built-in boot ROM; `--pc` is also the normalization entry |
+| `--stop-store ADDR[:VALUE]` | end both streams after that store instead of the `tohost` symbol |
+
+DUT side — `run_difftest.py`:
+
+| flag | effect |
+|---|---|
+| `--rom PATH` | BootROM source for `+rom=`: the TB's `@<word:04x> <value:08x>` hex, or an ELF transcribed here (entry at `ROM_ENTRY_OFFSET`) |
+| `--dtb PATH` | blob loaded at `0x8000_2000` (woven into the `+mem=` image **and** passed as `+dtb=`), and the same tree is handed to Spike |
+| `--stop-store ADDR[:VALUE]` | passed to the TB as `+stop_addr=`/`+stop_value=` and to the comparator as `--stop-store` |
+
+A run's configuration is printed verbatim, e.g.
+
+```
+[rv-rtl] window: -m0x80000000:1048576 (TB -DETH_RV_MEM_BYTES=1048576)
+[rv-rtl] dtb: …/generated/rv_difftest/eth_rv.dtb @ 0x80002000
+[rv-difftest] golden config: isa=rv64imafdc_zicsr_zicntr mem=-m0x80000000:1048576 \
+    dtb=eth_rv.dtb bootargs='console=ttyS0 earlycon' pc=elf-entry stop=store@0x800001a4=0xbadf00d
+```
+
+so a MATCH is always tied to a *pinned* golden configuration, never to whatever
+the two simulators happened to default to.
+
+### The stop rule
+
+`--stop-store ADDR[:VALUE]` generalises the `tohost`-symbol rule. Without the
+flag the old behaviour stands: the golden stream ends at the store to the ELF's
+`tohost` symbol, and the DUT ends wherever its own run limit is. With the flag,
+**both** streams are cut after the same architectural event — the golden inside
+its log parser, the DUT dump (and a canonical `--golden` trace) by
+`truncate_at_stop` — and a stream that never reaches the event is an *error*, not
+a silently longer comparison. Pinning `VALUE` makes it the same *event*, not just
+the same address:
+
+```bash
+# both streams stop at commit #82, the store of 0x0badf00d to 0x8000_01a4
+python3 ethereal-shell/verif/eth_rv/rv_difftest.py \
+    --elf generated/rv_difftest/corpus/cor_model.elf \
+    --dut model:generated/rv_difftest/corpus/cor_model.elf \
+    --stop-store 0x800001a4:0xbadf00d
+# -> MATCH: 82 commits compared … stop=store@0x800001a4=0xbadf00d
+```
+
+### Loading images that are not the window base
+
+`write_memory_image` (via `write_window_image`) places segments and raw blobs
+anywhere in the window and no longer requires `entry == base`; the entry is
+handed to the testbench as `+entry=`, which patches the ROM's entry word and
+starts the trace there. A blob that would overwrite a loaded segment is a setup
+error. `cor_boot` (built by `verif/eth_rv_core/build_boot.py`, linked at
+`0x8000_1000`) is the corpus program that exercises exactly this path.
+
+### Boundaries — read these before trusting a MATCH
+
+* **A pinned golden configuration is what makes a divergence meaningful.** The
+  ISA, the `-m` window, whether a DT was used, its content, the start PC and the
+  stop event all change what Spike executes. Every one of them is a flag and is
+  recorded in the PASS line; a run that leaves them implicit is comparing two
+  configurations, not two implementations (`docs/reports/report-E2-RV2-linux-gap-20260912.md` §3.7).
+* **The device tree carries one deliberate golden-side exception.** The pinned
+  Spike build aborts on an `ns16550a` node with no interrupt controller
+  (`ns16550_parse_from_fdt` calls `sim_t::get_intctrl()`, which asserts
+  `plic.get()`), so `eth_rv.dts` declares a PLIC the hardware does not have yet
+  (E2-RV2 G7). It is excluded from the `core.yaml` agreement, never touched by
+  the S3/S4 polled-console path, and must be replaced with the real description
+  when S5 wires the PLIC. An access below `0xc000_0000` is a divergence, not a
+  supported device.
+* **`timebase-frequency` is a DiffTest cadence, not a board oscillator.** The
+  DT declares 10 MHz because Spike's CLINT *is* an instruction-count-driven RTC
+  (`CPU_HZ / INSNS_PER_RTC_TICK`), and our CLINT is driven on the same cadence.
+  The two sides agree while they run the same program; software that turns the
+  number into seconds (sleeps, baud divisors, timer expiry) is out of contract
+  until a real RTC tick input exists (E2-RV2 G9). `clock-frequency` is the same
+  kind of placeholder.
+* **Spike's boot ROM is not our boot ROM.** With a DT enabled Spike builds its
+  own reset vector and leaves `a1 = 0x1020` (its own DTB), not the contract's
+  `0x8000_2000`. That is why `cor_boot` only checks that `a1` is a non-null,
+  aligned pointer, and why the *exact* `a0`/`a1` and the FDT at `0x8000_2000` are
+  asserted by the testbench, not by the commit diff. `--disable-dtb --pc=0x1000`
+  over an image that carries the same ROM is the configuration in which the stub
+  itself can be diffed.
+* **The window is a simulation budget, not an architecture claim.** 1 MiB is one
+  parameter shared by the TB, the AXI master and Spike so that "the RTL memory is
+  smaller than Spike's DRAM" cannot hide a bug; raising it for a larger payload
+  is a change to `core.yaml` (`ram_window_bytes`) and the two builds that read it,
+  not a per-run flag.
 
 ## Corpus
 
-The corpus grew program by program; the eighteen self-checking bare-metal programs
+The corpus grew program by program; the twenty self-checking bare-metal programs
 below are built the same way (`-march=rv64imafdc_zicsr_zicntr -mabi=lp64 -nostdlib
 -mcmodel=medany`, linked at `0x8000_0000` by `corpus/link.ld`, entered via
 `corpus/crt0.S`). The eight this section started with are tabulated here; the ten
@@ -491,7 +625,8 @@ python3 ethereal-shell/verif/eth_rv/corpus/build_corpus.py --out generated/rv_di
 
 The root `Makefile` carries both halves already: `make verif-rv` (build the corpus +
 run this suite) and `make verif-rv-rtl` (run the corpus on the Verilated RTL — all
-eighteen programs, both D-port builds with `--dram`, and the console assertion). The
+twenty programs, both D-port builds with `--dram`, and the console assertion —
+plus `cor_boot`, the non-base-entry payload the BootROM hands off to). The
 corpus step needs `riscv64-unknown-elf-gcc`, the RTL step needs Verilator, and the
 tests self-skip when a tool is missing.
 

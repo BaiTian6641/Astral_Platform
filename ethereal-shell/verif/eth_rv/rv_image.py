@@ -49,17 +49,24 @@ def _check(condition: bool, message: str) -> None:
         raise ImageError(message)
 
 
-def load_elf_image(path: str | Path) -> Image:
-    """Load PT_LOAD segments, entry and ``tohost`` from an ELF64 LE executable."""
+def load_elf_segments(path: str | Path) -> tuple[int, tuple[tuple[int, bytes], ...]]:
+    """``(entry, PT_LOAD segments)`` of an ELF64 LE file, without needing symbols.
+
+    Split out of :func:`load_elf_image` for a BootROM, which is a real ELF but has
+    no ``tohost`` symbol (it is not a DiffTest program) — the harness still has to
+    transcribe it into an image the testbench can load.
+    """
     elf_path = Path(path)
-    blob = elf_path.read_bytes()
-    _check(blob[:4] == ELF_MAGIC, f"{elf_path}: not an ELF file")
-    _check(len(blob) > 64 and blob[4] == 2 and blob[5] == 1, f"{elf_path}: need ELF64 little-endian")
+    return _elf_segments(elf_path.read_bytes(), str(elf_path))
+
+
+def _elf_segments(blob: bytes, name: str) -> tuple[int, tuple[tuple[int, bytes], ...]]:
+    """Shared PT_LOAD walk for :func:`load_elf_image` and :func:`load_elf_segments`."""
+    _check(blob[:4] == ELF_MAGIC, f"{name}: not an ELF file")
+    _check(len(blob) > 64 and blob[4] == 2 and blob[5] == 1, f"{name}: need ELF64 little-endian")
     (entry,) = struct.unpack_from("<Q", blob, 24)
     phoff = struct.unpack_from("<Q", blob, 32)[0]
-    shoff = struct.unpack_from("<Q", blob, 40)[0]
     phentsize, phnum = struct.unpack_from("<HH", blob, 54)
-    shentsize, shnum = struct.unpack_from("<HH", blob, 58)
     segments: list[tuple[int, bytes]] = []
     for index in range(phnum):
         base = phoff + index * phentsize
@@ -69,6 +76,16 @@ def load_elf_image(path: str | Path) -> Image:
         p_offset, p_vaddr = struct.unpack_from("<QQ", blob, base + 8)
         (p_filesz,) = struct.unpack_from("<Q", blob, base + 32)
         segments.append((p_vaddr, blob[p_offset : p_offset + p_filesz]))
+    return entry, tuple(segments)
+
+
+def load_elf_image(path: str | Path) -> Image:
+    """Load PT_LOAD segments, entry and ``tohost`` from an ELF64 LE executable."""
+    elf_path = Path(path)
+    blob = elf_path.read_bytes()
+    entry, segments = _elf_segments(blob, str(elf_path))
+    shoff = struct.unpack_from("<Q", blob, 40)[0]
+    shentsize, shnum = struct.unpack_from("<HH", blob, 58)
     symbols = _elf_symbols(blob, shoff, shentsize, shnum)
     _check("tohost" in symbols, f"{elf_path}: no `tohost` symbol — link with corpus/link.ld")
     return Image(
@@ -76,7 +93,7 @@ def load_elf_image(path: str | Path) -> Image:
         entry=entry,
         tohost=symbols["tohost"],
         fromhost=symbols.get("fromhost", 0),
-        segments=tuple(segments),
+        segments=segments,
     )
 
 

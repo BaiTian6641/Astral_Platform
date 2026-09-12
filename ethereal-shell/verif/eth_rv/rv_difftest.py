@@ -16,7 +16,19 @@ Golden side — at least one of (``--golden`` wins when both are given):
   ``--golden TRACE`` replay a captured canonical trace file — no Spike needed.
                      A *raw* Spike log is also accepted, in which case ``--elf``
                      must be given as well so the harness knows the entry point
-                     and the ``tohost`` mailbox the stream must stop at
+                     and the store the stream must stop at
+
+Golden configuration — every knob is passed to Spike and recorded in the PASS
+line, so a run's golden configuration is pinned and auditable:
+
+  ``--mem-base`` / ``--mem-size``   the ``-m0x80000000:<size>`` region; the size
+                                    must match the DUT's window
+  ``--dtb PATH`` / ``--disable-dtb`` use a device tree (a ``.dts`` is compiled on
+                                    demand with the harness's ``dtc``), or none
+  ``--bootargs ARGS``               Spike ``--bootargs``
+  ``--pc ADDR`` / ``--pcs H:A,…``   override the start PC (bypass Spike's boot ROM)
+  ``--stop-store ADDR[:VALUE]``     end both streams after that store; without it
+                                    the historical ``tohost``-symbol rule applies
 
 DUT side — exactly one:
   ``--dut dump:PATH``            trace file (canonical, or bare ``pc rd value``)
@@ -39,12 +51,18 @@ from pathlib import Path
 
 from rv_dut import CommitSource, DutSpecError, InjectedDUT, Injection, load_dut
 from rv_image import ImageError, load_elf_image
+from rv_platform import RAM_BASE, RAM_WINDOW_BYTES
 from rv_spike import (
     DEFAULT_ISA,
+    GoldenConfig,
     SpikeError,
+    StopStore,
+    ensure_dtb,
     is_spike_log,
     normalize_spike_log,
+    parse_stop_store,
     run_spike,
+    truncate_at_stop,
 )
 from rv_trace import (
     Commit,
@@ -429,25 +447,33 @@ def _remaining(iterator: Iterator[Commit]) -> int:
     return sum(1 for _ in iterator)
 
 
-def load_golden(text: str, *, source: str, elf: Path | None = None) -> list[Commit]:
+def load_golden(
+    text: str,
+    *,
+    source: str,
+    elf: Path | None = None,
+    stop: StopStore | None = None,
+) -> list[Commit]:
     """Parse a captured golden stream: a canonical trace file or a raw Spike log.
 
     A raw Spike log carries Spike's boot ROM before the program and its spin loop
-    after the HTIF exit store, so it needs ``elf`` for the entry point and the
-    ``tohost`` mailbox to cut both off (see :func:`rv_spike.normalize_spike_log`).
+    after the exit store, so it needs ``elf`` for the entry point; its stop
+    defaults to the ``tohost`` symbol but ``--stop-store`` overrides it (see
+    :func:`rv_spike.normalize_spike_log`). A canonical trace arrives whole and is
+    cut here instead, so both trace kinds honour the same stop event.
     """
     if is_canonical_trace(text):
-        return parse_trace(text, source=source)
+        return truncate_at_stop(parse_trace(text, source=source), stop, source=source)
     if is_spike_log(text):
         if elf is None:
             raise TraceFormatError(
                 "this is a raw Spike log; pass --elf as well so the harness knows the "
-                "entry point and the tohost mailbox (or convert it with "
-                "rv_spike.normalize_spike_log)",
+                "entry point (or convert it with rv_spike.normalize_spike_log)",
                 source=source,
             )
         image = load_elf_image(elf)
-        return normalize_spike_log(text, source=source, tohost=image.tohost, entry=image.entry)
+        effective = stop if stop is not None else StopStore(image.tohost)
+        return normalize_spike_log(text, source=source, stop=effective, entry=image.entry)
     raise TraceFormatError(
         "neither a canonical trace (# rv_difftest trace v1/v2) nor a Spike commit log",
         source=source,
@@ -458,26 +484,59 @@ def golden_from_elf(
     elf: Path,
     *,
     spike: str | Path | None,
-    isa: str,
+    config: GoldenConfig,
     timeout: float,
+) -> tuple[list[Commit], str, str]:
+    """Run ``elf`` under Spike; returns ``(commits, label, pinned config)``."""
+    run = run_spike(elf, spike=spike, config=config, timeout=timeout)
+    return run.commits, run.describe(), run.config_text()
+
+
+def golden_from_trace(
+    path: Path, *, elf: Path | None = None, stop: StopStore | None = None
 ) -> tuple[list[Commit], str]:
-    """Run ``elf`` under Spike; returns ``(commits, label)``."""
-    run = run_spike(elf, spike=spike, isa=isa, timeout=timeout)
-    return run.commits, run.describe()
-
-
-def golden_from_trace(path: Path, *, elf: Path | None = None) -> tuple[list[Commit], str]:
     """Load a captured golden stream; returns ``(commits, label)``.
 
     A canonical trace file needs nothing else. A raw Spike log needs ``elf`` so
-    that the harness can skip Spike's boot ROM and stop at the ``tohost`` store.
+    that the harness can skip Spike's boot ROM and stop at the requested store
+    (the ``tohost`` symbol by default).
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise TraceFormatError(f"cannot read golden trace: {exc}", source=str(path)) from None
     kind = "spike-log" if is_spike_log(text) else "trace"
-    return load_golden(text, source=str(path), elf=elf), f"{kind}:{path.name}"
+    return load_golden(text, source=str(path), elf=elf, stop=stop), f"{kind}:{path.name}"
+
+
+def _int_arg(text: str) -> int:
+    """An argparse integer literal: ``0x…`` is hex, everything else decimal."""
+    value = text.strip()
+    return int(value, 16) if value[:2].lower() == "0x" else int(value, 10)
+
+
+def _address_arg(text: str) -> int:
+    """An argparse address: hex (``0x…``) or decimal, must be non-negative."""
+    value = _int_arg(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"address must be non-negative, got {text!r}")
+    return value
+
+
+def _size_arg(text: str) -> int:
+    """An argparse byte size: positive, hex or decimal."""
+    value = _int_arg(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"size must be positive, got {text!r}")
+    return value
+
+
+def _stop_store_arg(text: str) -> StopStore:
+    """``ADDR[:VALUE]`` for ``--stop-store``, reported as an argparse error."""
+    try:
+        return parse_stop_store(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -502,6 +561,44 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ignore the cycle field (DUT reports real cycles, golden reports ordinals)",
     )
+    memory = parser.add_argument_group("golden configuration (passed to Spike, recorded in the PASS line)")
+    memory.add_argument(
+        "--mem-base", type=_address_arg, default=RAM_BASE,
+        help=f"memory window base for Spike's -m region (default: 0x{RAM_BASE:x})",
+    )
+    memory.add_argument(
+        "--mem-size", type=_size_arg, default=RAM_WINDOW_BYTES,
+        help=f"memory window size in bytes (default: {RAM_WINDOW_BYTES})",
+    )
+    dtb = memory.add_mutually_exclusive_group()
+    dtb.add_argument(
+        "--dtb", type=Path, default=None,
+        help="device tree for Spike: a .dtb, or a .dts compiled on demand to the build output",
+    )
+    dtb.add_argument(
+        "--disable-dtb", action="store_true",
+        help="Spike --disable-dtb: no device tree, and no Spike-side UART/CLINT either",
+    )
+    memory.add_argument("--dtc", type=Path, default=None, help="dtc binary used for a .dts --dtb")
+    memory.add_argument(
+        "--bootargs", default=None,
+        help="Spike --bootargs for the payload (default: Spike's own)",
+    )
+    memory.add_argument(
+        "--pc", type=_address_arg, default=None,
+        help="Spike --pc: override the start PC (bypasses Spike's built-in boot ROM)",
+    )
+    memory.add_argument(
+        "--pcs", default=None,
+        help="Spike --pcs=H:A[,...]: per-hart start PC override, passed through verbatim",
+    )
+    parser.add_argument(
+        "--stop-store", type=_stop_store_arg, default=None,
+        help=(
+            "end both streams after a store to ADDR[:VALUE] (hex or decimal) instead of "
+            "the ELF's tohost symbol; the DUT stream is truncated at the same event"
+        ),
+    )
     return parser
 
 
@@ -512,19 +609,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.elf is None and args.golden is None:
         parser.error("one of --elf (golden from Spike) or --golden is required")
     try:
+        dtb = ensure_dtb(args.dtb, dtc=args.dtc) if args.dtb is not None else None
+        config = GoldenConfig(
+            isa=args.isa,
+            mem_base=args.mem_base,
+            mem_size=args.mem_size,
+            dtb=dtb,
+            bootargs=args.bootargs,
+            pc=args.pc,
+            pcs=args.pcs,
+            dtb_enabled=not args.disable_dtb,
+            stop=args.stop_store,
+        )
+        config_text = config.describe()
         if args.elf is not None and args.golden is None:
-            golden_commits, golden_label = golden_from_elf(
-                args.elf, spike=args.spike, isa=args.isa, timeout=args.timeout
+            golden_commits, golden_label, config_text = golden_from_elf(
+                args.elf, spike=args.spike, config=config, timeout=args.timeout
             )
         elif args.golden is not None:
-            golden_commits, golden_label = golden_from_trace(args.golden, elf=args.elf)
+            golden_commits, golden_label = golden_from_trace(
+                args.golden, elf=args.elf, stop=config.stop
+            )
         else:  # pragma: no cover - guarded below by the "at least one" check
             sys.stderr.write("[rv_difftest] error: one of --elf/--golden is required\n")
             return EXIT_ERROR
         dut: CommitSource = load_dut(args.dut, path_dirs=args.dut_path, max_commits=MODEL_MAX_COMMITS)
         if args.inject:
             dut = InjectedDUT(dut, tuple(Injection.parse(spec) for spec in args.inject))
-        dut_commits = list(dut.iter_commits())
+        dut_commits = truncate_at_stop(dut.iter_commits(), config.stop, source=dut.describe())
     except (DutSpecError, TraceFormatError, SpikeError, ImageError) as exc:
         sys.stderr.write(f"[rv_difftest] error: {exc}\n")
         return EXIT_ERROR
@@ -544,12 +656,14 @@ def main(argv: list[str] | None = None) -> int:
         max_commits=args.max_commits,
     )
     print(f"[rv_difftest] golden = {golden_label} ({len(golden_commits)} commits)")
+    print(f"[rv_difftest] golden config: {config_text}")
     print(f"[rv_difftest] dut    = {dut.describe()} ({len(dut_commits)} commits)")
     if divergence is None:
         compared = min(len(golden_commits), len(dut_commits))
         scope = f" (prefix of {args.max_commits})" if args.max_commits is not None else ""
         print(
-            f"MATCH: {compared} commits compared{scope}, 0 divergence — pc, rd and value agree"
+            f"MATCH: {compared} commits compared{scope}, 0 divergence — pc, rd and value agree "
+            f"[golden: {config_text}]"
         )
         if check_mem:
             accesses = sum(

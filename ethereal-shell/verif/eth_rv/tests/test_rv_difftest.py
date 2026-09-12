@@ -675,3 +675,65 @@ def test_cli_fp_not_provided_is_reported_not_claimed(
     )
     assert result.returncode == EXIT_MATCH
     assert "fp: not provided" in result.stdout
+
+
+# --- the stop rule (S3) -------------------------------------------------------------
+
+MID_STORE_ADDR = "0x800001a4"
+"""A mid-program store in ``cor_model.trace`` (commit #82), well before tohost."""
+
+MID_STORE_VALUE = "0xbadf00d"
+"""The value that store retires — pinning it makes the stop the same *event*."""
+
+
+def test_cli_stop_store_ends_both_streams_at_one_event(cli_path: Path, fixtures_dir: Path) -> None:
+    trace = str(fixtures_dir / "cor_model.trace")
+    result = _run_cli(
+        cli_path,
+        "--golden",
+        trace,
+        "--dut",
+        f"dump:{trace}",
+        "--stop-store",
+        f"{MID_STORE_ADDR}:{MID_STORE_VALUE}",
+    )
+    assert result.returncode == EXIT_MATCH
+    assert "MATCH: 82 commits compared" in result.stdout  # cut mid-program, not at tohost
+    # the PASS line carries the pinned golden configuration for audit
+    assert "golden config:" in result.stdout
+    assert f"stop=store@{MID_STORE_ADDR}=0xbadf00d" in result.stdout
+    assert "mem=-m0x80000000:1048576" in result.stdout
+
+
+def test_cli_stop_store_address_only_stops_without_a_value(cli_path: Path, fixtures_dir: Path) -> None:
+    trace = str(fixtures_dir / "cor_model.trace")
+    result = _run_cli(
+        cli_path, "--golden", trace, "--dut", f"dump:{trace}", "--stop-store", MID_STORE_ADDR
+    )
+    assert result.returncode == EXIT_MATCH
+    assert "MATCH: 82 commits compared" in result.stdout
+    assert f"stop=store@{MID_STORE_ADDR}" in result.stdout
+
+
+def test_cli_stop_store_that_never_happens_is_an_error(cli_path: Path, fixtures_dir: Path) -> None:
+    """A typo must not silently become a whole-stream pass."""
+    trace = str(fixtures_dir / "cor_model.trace")
+    result = _run_cli(
+        cli_path, "--golden", trace, "--dut", f"dump:{trace}", "--stop-store", "0x80009999"
+    )
+    assert result.returncode == EXIT_ERROR
+    assert "does not" in result.stderr or "does not" in result.stdout
+
+
+def test_cli_dtb_flag_reaches_spike_as_a_recorded_configuration(
+    cli_path: Path, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    """``--dtb`` is recorded in the PASS line even on a ``--golden`` replay."""
+    trace = str(fixtures_dir / "cor_model.trace")
+    dtb = tmp_path / "eth_rv.dtb"
+    dtb.write_bytes(b"\xd0\x0d\xfe\xed")
+    result = _run_cli(
+        cli_path, "--golden", trace, "--dut", f"dump:{trace}", "--dtb", str(dtb)
+    )
+    assert result.returncode == EXIT_MATCH
+    assert "dtb=eth_rv.dtb" in result.stdout

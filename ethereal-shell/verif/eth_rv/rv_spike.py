@@ -43,14 +43,22 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rv_image import load_elf_image
+from rv_platform import (
+    DEFAULT_BOOTARGS,
+    DTB_PATH_REL,
+    ISA_STRING,
+    RAM_BASE,
+    RAM_WINDOW_BYTES,
+    repo_root,
+)
 from rv_trace import Commit, TraceFormatError, format_trace
 
-DEFAULT_ISA = "rv64imafdc_zicsr_zicntr"
+DEFAULT_ISA = ISA_STRING
 """ISA string the corpus is built for (RV-C: RV64IMAFDC + Zicsr, no MMU).
 
 I|M|A|F|D|C|S|U is what the core advertises in ``misa`` (0x800000000014112d).
@@ -134,12 +142,137 @@ class SpikeError(RuntimeError):
     """Spike could not be found, did not run, or produced no usable trace."""
 
 
-def repo_root() -> Path | None:
-    """Repository root (the directory holding ``AGENTS.md``), or ``None`` if not found."""
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "AGENTS.md").is_file():
-            return parent
-    return None
+@dataclass(frozen=True, slots=True)
+class StopStore:
+    """The store that ends a run: an address, optionally a pinned value.
+
+    A run's architectural end is a store the program makes; the HTIF mailbox
+    (``tohost``) is just the one the corpus uses by default. ``value=None``
+    stops on the first store to ``addr``; pinning the value as well is how two
+    runs are shown to stop at the *same architectural event* rather than merely
+    at the same address.
+    """
+
+    addr: int
+    value: int | None = None
+
+    def matches(self, mem_addr: int | None, mem_wdata: int | None) -> bool:
+        """True when this commit is the stopping store (a load never matches)."""
+        if mem_addr != self.addr or mem_wdata is None:
+            return False
+        return self.value is None or mem_wdata == self.value
+
+    def describe(self) -> str:
+        """``store@0x…`` / ``store@0x…=0x…`` for the PASS line."""
+        suffix = "" if self.value is None else f"=0x{self.value:x}"
+        return f"store@0x{self.addr:x}{suffix}"
+
+
+def _int_literal(text: str) -> int:
+    """Parse a CLI integer: ``0x…`` is hex, everything else is decimal."""
+    return int(text, 16) if text[:2].lower() == "0x" else int(text, 10)
+
+
+_STOP_STORE_RE = re.compile(
+    r"^(?P<addr>0[xX][0-9a-fA-F]+|\d+)(?::(?P<value>0[xX][0-9a-fA-F]+|\d+))?$"
+)
+
+
+def parse_stop_store(spec: str) -> StopStore:
+    """Parse ``ADDR[:VALUE]`` (hex or decimal) into a :class:`StopStore`."""
+    match = _STOP_STORE_RE.match(spec.strip())
+    if match is None:
+        raise ValueError(f"want ADDR[:VALUE] (hex or decimal), got {spec!r}")
+    value = match.group("value")
+    return StopStore(
+        addr=_int_literal(match.group("addr")),
+        value=None if value is None else _int_literal(value),
+    )
+
+
+def truncate_at_stop(
+    commits: Iterable[Commit], stop: StopStore | None, *, source: str = "<stream>"
+) -> list[Commit]:
+    """Cut a commit stream *after* the stopping store (no-op when ``stop`` is None).
+
+    The golden side stops inside the log parser; a DUT dump and a canonical trace
+    arrive whole, so the comparator uses this to end both streams at the same
+    architectural event. A stream that never reaches the event is an **error**, not
+    a silently longer comparison: ``--stop-store`` must mean the same thing on both
+    sides, and a typo in the address should not turn into a whole-stream pass.
+    """
+    if stop is None:
+        return list(commits)
+    kept: list[Commit] = []
+    for commit in commits:
+        kept.append(commit)
+        if stop.matches(commit.mem_addr, commit.mem_wdata):
+            return kept
+    raise TraceFormatError(
+        f"the stream does not reach the stopping store ({stop.describe()})", source=source
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GoldenConfig:
+    """How a golden run is pinned: ISA, memory window, DT, bootargs, PC and stop.
+
+    ``stop=None`` means the historical default — stop at the ELF's ``tohost``
+    symbol. Every other field is only passed to Spike when set, so the harness's
+    default argv is exactly the pre-S3 one plus the memory window.
+    """
+
+    isa: str = DEFAULT_ISA
+    mem_base: int = RAM_BASE
+    mem_size: int = RAM_WINDOW_BYTES
+    dtb: Path | None = None
+    bootargs: str | None = None
+    pc: int | None = None
+    pcs: str | None = None
+    dtb_enabled: bool = True
+    stop: StopStore | None = None
+
+    def __post_init__(self) -> None:
+        if not self.dtb_enabled and self.dtb is not None:
+            raise ValueError("--dtb and --disable-dtb are mutually exclusive")
+        if self.mem_size <= 0:
+            raise ValueError(f"memory window size must be positive, got {self.mem_size}")
+
+    def memory_argument(self) -> str:
+        """Spike's region form ``-m0x80000000:1048576`` (bytes, 4 KiB aligned)."""
+        return f"-m0x{self.mem_base:x}:{self.mem_size}"
+
+    def arguments(self) -> list[str]:
+        """The argv fragment that carries this configuration."""
+        args = [self.memory_argument()]
+        if not self.dtb_enabled:
+            args.append("--disable-dtb")
+        elif self.dtb is not None:
+            args.append(f"--dtb={self.dtb}")
+        if self.bootargs is not None:
+            args.append(f"--bootargs={self.bootargs}")
+        if self.pc is not None:
+            args.append(f"--pc=0x{self.pc:x}")
+        if self.pcs is not None:
+            args.append(f"--pcs={self.pcs}")
+        return args
+
+    def describe(self) -> str:
+        """One-line, audit-ready rendering of every pinned knob."""
+        if not self.dtb_enabled:
+            dtb = "disabled"
+        elif self.dtb is not None:
+            dtb = self.dtb.name
+        else:
+            dtb = "spike-auto"
+        bootargs = DEFAULT_BOOTARGS if self.bootargs is None else self.bootargs
+        pc = "elf-entry" if self.pc is None else f"0x{self.pc:x}"
+        stop = "tohost" if self.stop is None else self.stop.describe()
+        text = (
+            f"isa={self.isa} mem={self.memory_argument()} dtb={dtb} "
+            f"bootargs={bootargs!r} pc={pc} stop={stop}"
+        )
+        return text if self.pcs is None else f"{text} pcs={self.pcs}"
 
 
 def default_spike_path() -> Path | None:
@@ -161,6 +294,73 @@ def default_dtc_dir() -> Path | None:
         return None
     candidate = root / DTC_REL_PATH
     return candidate if (candidate / "dtc").is_file() else None
+
+
+def find_dtc(explicit: str | Path | None = None) -> Path:
+    """Locate the ``dtc`` binary: explicit (file or dir), ``$RV_DIFFTEST_DTC``, repo, PATH."""
+    if explicit is not None:
+        path = Path(explicit)
+        if path.is_dir():
+            path = path / "dtc"
+        if not path.is_file():
+            raise SpikeError(f"dtc binary not found: {path}")
+        return path
+    built = default_dtc_dir()
+    if built is not None:
+        return built / "dtc"
+    on_path = shutil.which("dtc")
+    if on_path is not None:
+        return Path(on_path)
+    raise SpikeError(
+        "no dtc binary found (looked at the explicit path, "
+        f"${DTC_DIR_ENV_VAR}, <repo>/{DTC_REL_PATH}, $PATH).\n"
+        f"Build it with:\n{BUILD_COMMANDS}"
+    )
+
+
+def compile_dts(
+    dts: str | Path, dtb: str | Path | None = None, *, dtc: str | Path | None = None
+) -> Path:
+    """Compile a device tree source into a blob (``dtc -I dts -O dtb``)."""
+    source = Path(dts)
+    if not source.is_file():
+        raise SpikeError(f"device tree source not found: {source}")
+    out = Path(dtb) if dtb is not None else source.with_suffix(".dtb")
+    try:
+        proc = subprocess.run(
+            [str(find_dtc(dtc)), "-I", "dts", "-O", "dtb", "-o", str(out), str(source)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except OSError as exc:
+        raise SpikeError(f"cannot execute dtc: {exc}") from None
+    except subprocess.TimeoutExpired:
+        raise SpikeError(f"dtc timed out compiling {source}") from None
+    if proc.returncode != 0 or not out.is_file():
+        detail = (proc.stderr or proc.stdout or "").strip()[:400]
+        raise SpikeError(f"dtc failed on {source}: {detail}")
+    return out
+
+
+def ensure_dtb(
+    path: str | Path, *, dtb: str | Path | None = None, dtc: str | Path | None = None
+) -> Path:
+    """Return a device tree blob path, compiling a ``*.dts`` on demand.
+
+    A compiled tree lands at ``dtb`` when given, otherwise at the harness's
+    build output (``generated/rv_difftest/eth_rv.dtb``) so compiling the
+    checked-in source never writes into the source tree.
+    """
+    candidate = Path(path)
+    if candidate.suffix == ".dts":
+        root = repo_root()
+        out = Path(dtb) if dtb is not None else (root / DTB_PATH_REL if root else None)
+        return compile_dts(candidate, out, dtc=dtc)
+    if not candidate.is_file():
+        raise SpikeError(f"device tree blob not found: {candidate}")
+    return candidate
 
 
 def find_spike(explicit: str | Path | None = None) -> Path:
@@ -226,17 +426,25 @@ class SpikeRun:
     returncode: int
     log: str
     commits: list[Commit]
+    config: GoldenConfig = field(default_factory=GoldenConfig)
 
     def describe(self) -> str:
         """One-line provenance string used in ``rv_difftest`` summaries."""
         return f"spike[{self.isa}] {self.elf.name} ({self.version})"
 
+    def config_text(self) -> str:
+        """The pinned golden configuration (recorded in the PASS line)."""
+        return self.config.describe()
 
-def build_spike_command(spike: str | Path, elf: str | Path, *, isa: str, log_path: Path) -> list[str]:
+
+def build_spike_command(
+    spike: str | Path, elf: str | Path, *, config: GoldenConfig, log_path: Path
+) -> list[str]:
     """Argv used for a commit-logged run (exposed so tests can assert it)."""
     return [
         str(spike),
-        f"--isa={isa}",
+        f"--isa={config.isa}",
+        *config.arguments(),
         "-l",  # disassembly in the log: human debugging, ignored by the parser
         "--log-commits",  # ONE line per retired instruction: priv pc (insn) regs mem
         f"--log={log_path}",
@@ -262,17 +470,28 @@ def run_spike(
     elf: str | Path,
     *,
     spike: str | Path | None = None,
+    config: GoldenConfig | None = None,
     isa: str = DEFAULT_ISA,
     timeout: float = 300.0,
 ) -> SpikeRun:
-    """Run ``elf`` under Spike and return its normalized commit trace."""
+    """Run ``elf`` under Spike and return its normalized commit trace.
+
+    ``config`` pins the run: memory window, device tree, bootargs, start PC and
+    the stop event. Omitting it reproduces the historical run exactly — corpus
+    ISA, Spike's default memory, its auto-generated device tree, the ELF entry
+    point and the ``tohost`` symbol as the stop.
+    """
+    golden = config if config is not None else GoldenConfig(isa=isa)
     binary = find_spike(spike)
     elf_path = Path(elf)
     if not elf_path.is_file():
         raise SpikeError(f"ELF not found: {elf_path}")
+    image = load_elf_image(elf_path)
+    stop = golden.stop if golden.stop is not None else StopStore(image.tohost)
+    entry = golden.pc if golden.pc is not None else image.entry
     with tempfile.TemporaryDirectory(prefix="rv_difftest_spike_") as tmpdir:
         log_path = Path(tmpdir) / "spike.log"
-        argv = build_spike_command(binary, elf_path, isa=isa, log_path=log_path)
+        argv = build_spike_command(binary, elf_path, config=golden, log_path=log_path)
         try:
             proc = subprocess.run(
                 argv,
@@ -284,8 +503,8 @@ def run_spike(
             )
         except subprocess.TimeoutExpired:
             raise SpikeError(
-                f"spike timed out after {timeout:.0f}s on {elf_path.name}: the program "
-                "never wrote a non-zero value to `tohost` (the corpus exit protocol)"
+                f"spike timed out after {timeout:.0f}s on {elf_path.name}: the stopping "
+                f"store ({stop.describe()}) was never retired"
             ) from None
         except OSError as exc:
             raise SpikeError(f"cannot execute {binary}: {exc}") from None
@@ -295,20 +514,18 @@ def run_spike(
             f"spike exited with {proc.returncode} on {elf_path.name}: "
             f"{(proc.stderr or proc.stdout or '').strip()[:400]}"
         )
-    image = load_elf_image(elf_path)
-    commits = normalize_spike_log(
-        log, source=f"spike:{elf_path.name}", tohost=image.tohost, entry=image.entry
-    )
+    commits = normalize_spike_log(log, source=f"spike:{elf_path.name}", stop=stop, entry=entry)
     if not commits:
         raise SpikeError(
             f"spike produced no commit lines for {elf_path.name} — is the ELF loadable "
-            f"and built for {isa}?"
+            f"and built for {golden.isa}?"
         )
     return SpikeRun(
         spike=binary,
         version=spike_version(binary),
         elf=elf_path,
-        isa=isa,
+        isa=golden.isa,
+        config=golden,
         returncode=proc.returncode,
         log=log,
         commits=commits,
@@ -324,7 +541,7 @@ def normalize_spike_log(
     text: str,
     *,
     source: str = "<spike log>",
-    tohost: int | None = None,
+    stop: StopStore | None = None,
     entry: int | None = None,
 ) -> list[Commit]:
     """Convert Spike's ``--log-commits`` output into canonical commits.
@@ -339,19 +556,30 @@ def normalize_spike_log(
     through its own debug ROM (``0x1000``: ``auipc`` / ``csrr mhartid`` /
     ``ld`` / ``jr``), which is not part of the DUT and must not be diffed.
 
-    ``tohost``: drop everything after the store that writes the HTIF mailbox.
+    ``stop``: drop everything after the store named by the :class:`StopStore`.
     Spike keeps committing the program's final spin loop for thousands of
-    instructions after the exit store arms the HTIF, and the DUT stops at the
-    store — so the mailbox address is where the golden stream ends.
+    instructions after an exit store arms the HTIF, and the DUT stops at the
+    store — so the stopping event is where the golden stream ends. The default
+    (``stop=None`` here; ``--stop-store`` on the CLI) is the ``tohost`` mailbox,
+    which is the corpus's exit protocol.
     """
-    return [commit for _, commit in iter_spike_commits(text, source=source, tohost=tohost, entry=entry)]
+    commits = [commit for _, commit in iter_spike_commits(text, source=source, stop=stop, entry=entry)]
+    if stop is not None and not (
+        commits and stop.matches(commits[-1].mem_addr, commits[-1].mem_wdata)
+    ):
+        raise TraceFormatError(
+            f"the stream does not end at the stopping store ({stop.describe()}): the "
+            "stop event was never retired",
+            source=source,
+        )
+    return commits
 
 
 def iter_spike_commits(
     text: str,
     *,
     source: str = "<spike log>",
-    tohost: int | None = None,
+    stop: StopStore | None = None,
     entry: int | None = None,
 ) -> Iterator[tuple[int, Commit]]:
     """Yield ``(0-based line index, commit)`` for the commits that make up the golden stream."""
@@ -464,38 +692,44 @@ def iter_spike_commits(
             frm=keyed.get("frm"),
         )
         index += 1
-        if tohost is not None and _writes_htif_mailbox(rest, tohost):
+        if stop is not None and _writes_stop(rest, stop):
             return
 
 
-def last_golden_line(text: str, *, source: str = "<spike log>", tohost: int | None, entry: int | None) -> int:
+def last_golden_line(
+    text: str, *, source: str = "<spike log>", stop: StopStore | None, entry: int | None
+) -> int:
     """0-based index of the last line the golden stream consumes, or ``-1`` if none."""
     last = -1
-    for lineno, _ in iter_spike_commits(text, source=source, tohost=tohost, entry=entry):
+    for lineno, _ in iter_spike_commits(text, source=source, stop=stop, entry=entry):
         last = lineno
     return last
 
 
-def _writes_htif_mailbox(rest: str, tohost: int) -> bool:
-    """True when a commit line's ``mem`` field stores to the HTIF mailbox.
+def _writes_stop(rest: str, stop: StopStore) -> bool:
+    """True when a commit line's ``mem`` field stores the stopping value.
 
-    The mailbox store is a store, so Spike logs data with it — the ``data`` group
-    is what distinguishes a store from the address-only entry of a load.
+    A store is what Spike logs *with* data, so the ``data`` group is what
+    distinguishes the stopping store from the address-only entry of a load; an
+    AMO's trailing read-modify-write field is the store and is the one kept.
     """
-    return any(
-        int(mem.group("addr"), 16) == tohost and mem.group("data") is not None
-        for mem in _MEM_RE.finditer(rest)
-    )
-
+    for mem in _MEM_RE.finditer(rest):
+        data = mem.group("data")
+        if data is None:
+            continue
+        if stop.matches(int(mem.group("addr"), 16), int(data, 16)):
+            return True
+    return False
 
 
 def trace_text_for_elf(
     elf: str | Path,
     *,
     spike: str | Path | None = None,
+    config: GoldenConfig | None = None,
     isa: str = DEFAULT_ISA,
     timeout: float = 300.0,
 ) -> tuple[str, SpikeRun]:
     """Run Spike and return ``(canonical trace text, run metadata)``."""
-    run = run_spike(elf, spike=spike, isa=isa, timeout=timeout)
+    run = run_spike(elf, spike=spike, config=config, isa=isa, timeout=timeout)
     return format_trace(run.commits, generator=run.describe()), run

@@ -4,10 +4,13 @@
 
 Pipeline per corpus ELF (C14 §5):
 
-1. load the ELF with the harness's own image loader (``rv_image`` — the harness is
-   used, never modified),
-2. flatten it into the ``$readmemh`` image the testbench consumes
-   (``tb_eth_rv_core.sv``),
+1. load the ELF with the harness's own image loader (``rv_image``) and flatten it
+   into the ``$readmemh`` image the testbench consumes (``tb_eth_rv_core.sv``);
+   the payload entry no longer has to be the window base (`--rom`/`+entry=`),
+2. hand the testbench the boot contract: the window size it was compiled with
+   (`+mem_bytes=`), the BootROM (`+rom=`), the device tree at ``DTB_ADDR``
+   (`+dtb=`, also woven into the memory image) and the stop event
+   (`+stop_addr=`/`+stop_value=`),
 3. build/run the Verilator ``--binary --timing`` model, which dumps one
    ``cycle pc rd value`` line per retired instruction plus the optional
    ``mem_addr mem_wdata mem_rmask mem_wmask`` suffix (C14 §5.2),
@@ -40,6 +43,16 @@ Examples::
 
     # negative control for the UART: break one bit cell of the first byte on the line
     python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_hello --uart-fault 0:1
+
+    # boot path: a BootROM image, the device tree at the contract address, and the
+    # golden pinned to the same 1 MiB window the TB was compiled with
+    python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_model \\
+        --rom ethereal-shell/rtl/eth_rv/rom/boot_rom.hex \\
+        --dtb ethereal-shell/verif/eth_rv/eth_rv.dts
+
+    # stop both streams at one architectural event instead of the tohost symbol
+    python3 ethereal-shell/verif/eth_rv_core/run_difftest.py --only cor_model \\
+        --stop-store 0x80001000:0x1
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,12 +71,6 @@ RTL_DIR = REPO_ROOT / "ethereal-shell" / "rtl" / "eth_rv"
 HARNESS_DIR = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv"
 DEFAULT_CORPUS = REPO_ROOT / "generated" / "rv_difftest" / "corpus"
 DEFAULT_WORK = REPO_ROOT / "generated" / "rv_difftest" / "rtl"
-
-MEM_BASE = 0x8000_0000
-"""Corpus link base (corpus/link.ld) == the core's reset PC (eth_rv_pkg RESET_PC)."""
-
-MEM_WINDOW_BYTES = 32_768 * 8
-"""Must match ``MEM_WORDS`` in tb_eth_rv_core.sv (256 KiB)."""
 
 RTL_SOURCES = [
     RTL_DIR / "eth_rv_pkg.sv",
@@ -81,6 +89,9 @@ RTL_SOURCES = [
     # (C14 §4). Both sit in front of either memory path, so they are part of
     # every build.
     RTL_DIR / "eth_rv_uart.sv",
+    # The BootROM (E2-RV2 increment 5, S3): the 4 KiB region at 0x1000 the core
+    # resets into; `eth_rv_mmio_mux` instantiates it, so it is part of every build.
+    RTL_DIR / "eth_rv_boot_rom.sv",
     RTL_DIR / "eth_rv_mmio_mux.sv",
 ]
 
@@ -129,7 +140,18 @@ CORPUS_PROGRAMS = [
     # chain) plus the identification/envcfg/HPM floor (`cor_csrid`).
     "cor_counters",
     "cor_csrid",
+    # E2-RV2 increment 5 (S3): the BootROM handoff check. Linked at a NON-BASE
+    # entry (0x8000_1000) so it can only be reached through the reset vector —
+    # the one corpus program whose whole point is that the image loader and the
+    # testbench must not assume entry == window base.
+    "cor_boot",
 ]
+
+BOOT_PROGRAM = "cor_boot"
+"""The one corpus program linked at a non-base entry (own linker script)."""
+
+BOOT_BUILDER = REPO_ROOT / "ethereal-shell" / "verif" / "eth_rv_core" / "build_boot.py"
+"""Builder for ``cor_boot``: it links at 0x8000_1000, so it has its own link step."""
 
 HELLO_STRING = b"hello, eth_rv!\n"
 """The console string ``corpus/cor_hello.S`` writes — the C14 §8 checkpoint 5 vehicle.
@@ -159,7 +181,26 @@ DIVERGE_RE = re.compile(r"DIVERGENCE \((\w+)\) at commit #(\d+) \(cycle (\d+)\)"
 
 sys.path.insert(0, str(HARNESS_DIR))
 
-from rv_image import load_elf_image  # (imported after the sys.path insert above)
+# The SoC contract lives in one module (verif/eth_rv/rv_platform.py), mirrored by
+# ethereal-shell/core.yaml and eth_rv.dts and pinned by that suite's tests. The
+# runner imports it rather than restating any address, so the window Spike is
+# given with -m and the window the testbench compiles with cannot drift apart.
+from rv_image import Image, load_elf_image, load_elf_segments
+from rv_platform import (
+    DTB_ADDR,
+    RAM_BASE,
+    RAM_WINDOW_BYTES,
+    ROM_BASE,
+    ROM_BYTES,
+    ROM_ENTRY_OFFSET,
+)
+from rv_spike import SpikeError, StopStore, ensure_dtb, parse_stop_store
+
+MEM_BASE = RAM_BASE
+"""RAM window base: the corpus link address and the DTB's home (rv_platform)."""
+
+MEM_WINDOW_BYTES = RAM_WINDOW_BYTES
+"""The one memory-window size (rv_platform / core.yaml); Spike gets it as -m too."""
 
 
 class SetupError(RuntimeError):
@@ -192,50 +233,201 @@ def run(
         raise SetupError(f"timeout: {' '.join(argv)}") from None
 
 
-def build_corpus(corpus_dir: Path) -> None:
-    """Build the bare-metal corpus ELFs if they are not there yet."""
-    if all((corpus_dir / f"{name}.elf").is_file() for name in CORPUS_PROGRAMS):
-        return
-    print(f"[rv-rtl] corpus missing under {corpus_dir}, building it")
-    builder = HARNESS_DIR / "corpus" / "build_corpus.py"
-    done = run([sys.executable, str(builder), "--out", str(corpus_dir)], cwd=REPO_ROOT)
-    if done.returncode != 0:
-        raise SetupError(f"corpus build failed:\n{done.stdout}\n{done.stderr}")
+def build_corpus(corpus_dir: Path, programs: Sequence[str]) -> None:
+    """Build the requested corpus ELFs if they are not there yet.
 
-
-def write_memory_image(elf: Path, image_path: Path) -> tuple[int, int]:
-    """Flatten an ELF into the ``$readmemh`` image the testbench loads.
-
-    Returns ``(tohost, word_count)``. Words are indexed from :data:`MEM_BASE`, so
-    the file's address N is the 64-bit word at ``MEM_BASE + 8*N`` — the same
-    mapping ``tb_eth_rv_core.sv`` uses.
+    Only what the run asked for is built (``--only`` does not drag in the whole
+    corpus). ``cor_boot`` is built by its own script — it links at a non-base
+    entry — but that builder imports the corpus builder rather than copying it,
+    so the two toolchain/ISA configurations cannot drift apart.
     """
-    image = load_elf_image(elf)
-    if image.entry != MEM_BASE:
-        raise SetupError(
-            f"{elf.name}: entry 0x{image.entry:016x} != core reset PC 0x{MEM_BASE:016x} "
-            "(the v0 TB loads a window based at the corpus link address)"
-        )
-    words: dict[int, bytearray] = {}
-    for addr, data in image.segments:
+    missing = [name for name in programs if not (corpus_dir / f"{name}.elf").is_file()]
+    corpus_missing = [name for name in missing if name != BOOT_PROGRAM]
+    if corpus_missing:
+        print(f"[rv-rtl] corpus missing under {corpus_dir}, building it")
+        builder = HARNESS_DIR / "corpus" / "build_corpus.py"
+        done = run([sys.executable, str(builder), "--out", str(corpus_dir)], cwd=REPO_ROOT)
+        if done.returncode != 0:
+            raise SetupError(f"corpus build failed:\n{done.stdout}\n{done.stderr}")
+    if BOOT_PROGRAM in missing and BOOT_BUILDER.is_file():
+        done = run([sys.executable, str(BOOT_BUILDER), "--out", str(corpus_dir)], cwd=REPO_ROOT)
+        if done.returncode != 0:
+            raise SetupError(f"cor_boot build failed:\n{done.stdout}\n{done.stderr}")
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryImage:
+    """A window image the testbench can ``$readmemh``, plus how to run it."""
+
+    path: Path
+    base: int
+    size: int
+    entry: int
+    tohost: int
+    word_count: int
+
+
+class _ImageWindow:
+    """A base/size-bounded byte window that renders as the TB's 64-bit word image."""
+
+    def __init__(self, base: int, size: int, name: str) -> None:
+        self.base = base
+        self.size = size
+        self.name = name
+        self.spans: list[tuple[int, int, str]] = []
+        self.bytes: dict[int, int] = {}
+
+    def place(self, addr: int, data: bytes, owner: str, *, exclusive: bool = False) -> None:
+        """Write ``data`` at ``addr``; ``exclusive`` spans may not overlap anything."""
+        start, end = addr, addr + len(data)
+        if start < self.base or end > self.base + self.size:
+            raise SetupError(
+                f"{self.name}: {owner} byte 0x{start:016x}..0x{end:016x} is outside the "
+                f"0x{self.base:016x}..0x{self.base + self.size:016x} window"
+            )
+        if exclusive:
+            for other_start, other_end, other in self.spans:
+                if start < other_end and other_start < end:
+                    raise SetupError(
+                        f"{self.name}: {owner} 0x{start:016x}..0x{end:016x} overlaps "
+                        f"{other} 0x{other_start:016x}..0x{other_end:016x}"
+                    )
+        self.spans.append((start, end, owner))
         for offset, byte in enumerate(data):
-            where = addr + offset
-            if not MEM_BASE <= where < MEM_BASE + MEM_WINDOW_BYTES:
-                raise SetupError(
-                    f"{elf.name}: segment byte 0x{where:016x} is outside the "
-                    f"0x{MEM_BASE:016x}..0x{MEM_BASE + MEM_WINDOW_BYTES:016x} window"
-                )
-            index = (where - MEM_BASE) >> 3
+            self.bytes[addr + offset] = byte
+
+    def render(self) -> tuple[dict[int, bytearray], int]:
+        """The touched 64-bit words (indexed from ``base``) and their count."""
+        words: dict[int, bytearray] = {}
+        for where, byte in self.bytes.items():
+            index = (where - self.base) >> 3
             slot = words.setdefault(index, bytearray(8))
             slot[where & 7] = byte
-    lines = []
+        return words, len(words)
+
+
+def write_window_image(
+    image: Image,
+    image_path: Path,
+    *,
+    base: int = MEM_BASE,
+    size: int = MEM_WINDOW_BYTES,
+    blobs: Sequence[tuple[int, bytes, str]] = (),
+) -> MemoryImage:
+    """Flatten a program image (plus optional blobs) into the TB's ``$readmemh`` form.
+
+    Words are indexed from ``base``, so the file's address N is the 64-bit word at
+    ``base + 8*N`` — the mapping ``tb_eth_rv_core.sv`` uses. ``entry`` is no longer
+    required to equal ``base``: the TB takes the payload entry as a plusarg and
+    starts its trace there, so a program loaded anywhere in the window is loadable.
+    ``blobs`` are raw ``(addr, bytes, name)`` ranges placed in the same window —
+    the device tree at :data:`DTB_ADDR` — and a blob that collides with a loaded
+    segment is an error rather than a silent overwrite.
+    """
+    window = _ImageWindow(base, size, image.name)
+    for addr, data in image.segments:
+        window.place(addr, data, "segment")
+    for addr, data, name in blobs:
+        window.place(addr, data, name, exclusive=True)
+    words, count = window.render()
+    lines: list[str] = []
     for index in sorted(words):
         lines.append(f"@{index:08x}")
         # $readmemh reads the first character as the MSB, so a little-endian
         # word lands in the file byte-reversed.
         lines.append(bytes(words[index][::-1]).hex())
     image_path.write_text("\n".join(lines) + "\n", encoding="ascii")
-    return image.tohost, len(words)
+    return MemoryImage(
+        path=image_path,
+        base=base,
+        size=size,
+        entry=image.entry,
+        tohost=image.tohost,
+        word_count=count,
+    )
+
+
+def write_memory_image(
+    elf: Path,
+    image_path: Path,
+    *,
+    base: int = MEM_BASE,
+    size: int = MEM_WINDOW_BYTES,
+    blobs: Sequence[tuple[int, bytes, str]] = (),
+) -> MemoryImage:
+    """Load ``elf`` and flatten it with :func:`write_window_image`."""
+    return write_window_image(load_elf_image(elf), image_path, base=base, size=size, blobs=blobs)
+
+
+@dataclass(frozen=True, slots=True)
+class RomImage:
+    """A BootROM image for the TB's ``+rom=`` plusarg (32-bit sparse words)."""
+
+    path: Path
+    source: Path
+    word_count: int
+    entry: int | None
+
+
+_TB_ROM_LINE = re.compile(r"^@[0-9a-fA-F]{1,8}\s+[0-9a-fA-F]{8}$")
+
+
+def write_rom_image(source: Path, image_path: Path, *, base: int = ROM_BASE) -> RomImage:
+    """Transcribe a BootROM source into the TB's 32-bit ``$readmemh`` image.
+
+    Two sources are accepted. An already-built ROM hex (``@<word:04x> <value:08x>``,
+    the format ``rtl/eth_rv/rom/build_rom.py`` writes) is passed through verbatim
+    — that is the file to use, since it is the one the drift check rebuilds.
+
+    An ELF is transcribed here: every segment byte is kept (so the stub's own
+    data words, e.g. its instruction-count word at ROM offset 28 that the CLINT's
+    ``mtime`` phase is derived from, survive) and the 64-bit payload entry is
+    written at :data:`ROM_ENTRY_OFFSET` on top of it. Transcribe an ELF built from
+    the current ``boot_rom.S``; a hand-rolled stub without the step word will be
+    rejected by the testbench.
+    """
+    src = Path(source)
+    if not src.is_file():
+        raise SetupError(f"ROM image not found: {src}")
+    blob = src.read_bytes()
+    if blob[:4] != b"\x7fELF":
+        lines = blob.decode("ascii", errors="replace").splitlines()
+        word_count = sum(1 for line in lines if _TB_ROM_LINE.match(line.strip()))
+        if word_count == 0:
+            raise SetupError(
+                f"{src}: not an ELF and not a boot-rom hex image "
+                "(want `@<word_index:04x> <value:08x>` lines)"
+            )
+        image_path.write_bytes(blob)
+        return RomImage(path=image_path, source=src, word_count=word_count, entry=None)
+    entry, segments = load_elf_segments(src)
+    window = _ImageWindow(base, ROM_BYTES, src.name)
+    for addr, data in segments:
+        window.place(addr, data, "segment")
+    words: dict[int, int] = {}
+    for where, byte in window.bytes.items():
+        index = (where - base) >> 2
+        words[index] = words.get(index, 0) | (byte << (8 * (where & 3)))
+    words[ROM_ENTRY_OFFSET // 4] = entry & 0xFFFF_FFFF
+    words[ROM_ENTRY_OFFSET // 4 + 1] = (entry >> 32) & 0xFFFF_FFFF
+    text = "".join(
+        f"@{index:04x} {word:08x}\n" for index, word in sorted(words.items()) if word
+    )
+    image_path.write_text(text, encoding="ascii")
+    return RomImage(path=image_path, source=src, word_count=len(words), entry=entry)
+
+
+def verilator_defines(dram: bool, line_beats: int) -> list[str]:
+    """The compile-time knobs the TB is built with (window size is the contract).
+
+    ``-DETH_RV_MEM_BYTES`` is the same number Spike is given with ``-m`` and the
+    ROM/runner use; the testbench asserts its ``+mem_bytes=`` plusarg against it,
+    so a stale model built with a different window cannot pass silently.
+    """
+    defines = [f"-DETH_RV_MEM_BYTES={MEM_WINDOW_BYTES}"]
+    if dram:
+        defines += ["-DETH_RV_DRAM_AXI", f"-DETH_RV_LINE_BEATS={line_beats}"]
+    return defines
 
 
 def build_model(
@@ -256,9 +448,7 @@ def build_model(
     if exe.is_file() and not rebuild and not _stale(exe, sources):
         return exe
     obj_dir.mkdir(parents=True, exist_ok=True)
-    defines = [f"-DETH_RV_LINE_BEATS={line_beats}"] if dram else []
-    if dram:
-        defines.insert(0, "-DETH_RV_DRAM_AXI")
+    defines = verilator_defines(dram, line_beats)
     argv = [
         verilator,
         "--binary",
@@ -289,6 +479,8 @@ class RtlRun:
     status: str
     stdout: str
     uart: UartRecord
+    mem: MemoryImage
+    rom: RomImage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,6 +608,59 @@ def _stale(exe: Path, sources: list[Path]) -> bool:
     return any(path.stat().st_mtime > built for path in [*sources, TB_SOURCE])
 
 
+def tb_argv(
+    exe: Path,
+    *,
+    mem: MemoryImage,
+    trace_path: Path,
+    uart_path: Path,
+    mem_lat: int,
+    rom: RomImage | None = None,
+    dtb: Path | None = None,
+    stop: StopStore | None = None,
+    fault: str | None = None,
+    uart_fault: str | None = None,
+    plusargs: Sequence[str] | None = None,
+) -> list[str]:
+    """The testbench plusargs for one run (exposed so tests can assert them).
+
+    The S3 boot contract lives here: `+base=`/`+mem_bytes=` pin the window the
+    model was compiled with, `+entry=` is the payload entry the BootROM hands off
+    to (the TB starts its trace there), `+rom=`/`+dtb=` supply the BootROM and the
+    blob at :data:`DTB_ADDR`, and `+stop_addr=`/`+stop_value=` name the store the
+    run must end at — the same event the comparator cuts the golden stream at.
+    """
+    argv = [
+        str(exe),
+        f"+mem={mem.path}",
+        f"+trace={trace_path}",
+        f"+uart={uart_path}",
+        f"+base=0x{mem.base:x}",
+        f"+entry=0x{mem.entry:x}",
+        f"+tohost=0x{mem.tohost:x}",
+        f"+memlat={mem_lat}",
+        f"+mem_bytes={mem.size}",
+    ]
+    if rom is not None:
+        argv.append(f"+rom={rom.path}")
+    if dtb is not None:
+        argv.append(f"+dtb={dtb}")
+    if stop is not None:
+        argv.append(f"+stop_addr=0x{stop.addr:x}")
+        if stop.value is not None:
+            argv.append(f"+stop_value=0x{stop.value:x}")
+    if fault is not None:
+        index, field, value = parse_fault(fault)
+        argv += [f"+fault_index={index}", f"+fault_field={field}", f"+fault_value=0x{value:x}"]
+    if uart_fault is not None:
+        frame, bit = parse_uart_fault(uart_fault)
+        argv += [f"+uart_fault_frame={frame}", f"+uart_fault_bit={bit}"]
+    # pass-through negative controls (`+no_dmem_err=1`, `+dmem_corrupt_addr=…`
+    # `+dmem_corrupt_xor=…`, `+trace_traps=1`, …) — see verif/eth_rv/README.md
+    argv += list(plusargs or [])
+    return argv
+
+
 def run_rtl(
     exe: Path,
     elf: Path,
@@ -426,6 +671,9 @@ def run_rtl(
     quiet: bool,
     uart_fault: str | None = None,
     plusargs: list[str] | None = None,
+    rom: RomImage | None = None,
+    dtb: Path | None = None,
+    stop: StopStore | None = None,
 ) -> RtlRun:
     """Run the RTL on one ELF; produce its commit trace and console record.
 
@@ -433,30 +681,34 @@ def run_rtl(
     console UART's serial line (the C14 §8 checkpoint 5 evidence), and
     `uart_fault` = ``FRAME:BIT`` inverts one bit cell of one received frame — the
     negative control that proves the UART assertion is live.
+
+    The boot contract rides on plusargs: `+rom=` (BootROM at ``ROM_BASE``),
+    `+entry=` (the payload entry the ROM hands off to; the TB starts its trace
+    there), `+dtb=` (the blob at :data:`DTB_ADDR`, also woven into `+mem=`),
+    `+mem_bytes=` (assert the compiled window matches), and `+stop_addr=`/
+    `+stop_value=` (the same event the comparator stops both streams at).
     """
     stem = elf.stem if fault is None else f"{elf.stem}.fault"
     image_path = work_dir / f"{elf.stem}.mem.hex"
     trace_path = work_dir / f"{stem}.trace"
     uart_path = work_dir / f"{elf.stem}.uart"
-    tohost, _ = write_memory_image(elf, image_path)
-    argv = [
-        str(exe),
-        f"+mem={image_path}",
-        f"+trace={trace_path}",
-        f"+uart={uart_path}",
-        f"+base=0x{MEM_BASE:x}",
-        f"+tohost=0x{tohost:x}",
-        f"+memlat={mem_lat}",
-    ]
-    if fault is not None:
-        index, field, value = parse_fault(fault)
-        argv += [f"+fault_index={index}", f"+fault_field={field}", f"+fault_value=0x{value:x}"]
-    if uart_fault is not None:
-        frame, bit = parse_uart_fault(uart_fault)
-        argv += [f"+uart_fault_frame={frame}", f"+uart_fault_bit={bit}"]
-    # pass-through negative controls (`+no_dmem_err=1`, `+dmem_corrupt_addr=…`
-    # `+dmem_corrupt_xor=…`, `+trace_traps=1`, …) — see verif/eth_rv/README.md
-    argv += list(plusargs or [])
+    blobs: tuple[tuple[int, bytes, str], ...] = ()
+    if dtb is not None:
+        blobs = ((DTB_ADDR, Path(dtb).read_bytes(), "dtb"),)
+    mem = write_memory_image(elf, image_path, blobs=blobs)
+    argv = tb_argv(
+        exe,
+        mem=mem,
+        trace_path=trace_path,
+        uart_path=uart_path,
+        mem_lat=mem_lat,
+        rom=rom,
+        dtb=dtb,
+        stop=stop,
+        fault=fault,
+        uart_fault=uart_fault,
+        plusargs=plusargs,
+    )
     done = run(argv, cwd=REPO_ROOT, quiet=quiet)
     banner = "ETH_RV_TB:"
     status = next(
@@ -473,6 +725,8 @@ def run_rtl(
         status=status,
         stdout=done.stdout,
         uart=parse_uart_record(uart_path),
+        mem=mem,
+        rom=rom,
     )
 
 
@@ -509,8 +763,16 @@ def parse_fault(spec: str) -> tuple[int, str, int]:
     return int(match.group(1)), match.group(2), int(match.group(3), 0)
 
 
-def compare(elf: Path, trace: Path, *, quiet: bool) -> tuple[bool, str]:
-    """Run the harness comparator against the RTL dump; returns (matched, report)."""
+def compare(
+    elf: Path, trace: Path, *, quiet: bool, stop: StopStore | None = None, dtb: Path | None = None
+) -> tuple[bool, str]:
+    """Run the harness comparator against the RTL dump; returns (matched, report).
+
+    The golden is pinned to the same window the testbench compiled with
+    (``-m0x80000000:<size>``) and, when asked, to the same device tree and stop
+    event — so the comparison cannot silently use a different configuration on
+    the two sides (E2-RV2 §3 item 7).
+    """
     argv = [
         sys.executable,
         str(HARNESS_DIR / "rv_difftest.py"),
@@ -518,7 +780,16 @@ def compare(elf: Path, trace: Path, *, quiet: bool) -> tuple[bool, str]:
         str(elf),
         "--dut",
         f"dump:{trace}",
+        "--mem-base",
+        f"0x{MEM_BASE:x}",
+        "--mem-size",
+        str(MEM_WINDOW_BYTES),
     ]
+    if dtb is not None:
+        argv += ["--dtb", str(dtb)]
+    if stop is not None:
+        spec = f"0x{stop.addr:x}" if stop.value is None else f"0x{stop.addr:x}:0x{stop.value:x}"
+        argv += ["--stop-store", spec]
     done = run(argv, cwd=HARNESS_DIR, quiet=quiet)
     report = (done.stdout + done.stderr).strip()
     return done.returncode == 0, report
@@ -568,6 +839,36 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(1, 2, 4, 8, 16),
         help="--dram: read line fill in beats (1 = one beat per transaction, the default is 8)",
     )
+    parser.add_argument(
+        "--rom",
+        type=Path,
+        default=None,
+        help=(
+            "BootROM source for +rom=. Prefer the checked-in hex "
+            "(rtl/eth_rv/rom/boot_rom.hex), which carries the stub's step-count word; an "
+            f"ELF built from boot_rom.S is transcribed here (entry word at offset {ROM_ENTRY_OFFSET})"
+        ),
+    )
+    parser.add_argument(
+        "--dtb",
+        type=Path,
+        default=None,
+        help=(
+            f"device tree blob loaded at 0x{DTB_ADDR:x} (a .dts is compiled on demand with "
+            "the harness's dtc) and passed to Spike's golden run, so both sides read the "
+            "same tree; omitted = no DT (the ordinary corpus programs do not use one)"
+        ),
+    )
+    parser.add_argument(
+        "--stop-store",
+        default=None,
+        metavar="ADDR[:VALUE]",
+        help=(
+            "end both streams after a store to ADDR (hex or decimal), optionally requiring "
+            "VALUE, instead of the ELF's tohost symbol; passed to the TB as "
+            "+stop_addr/+stop_value and to the comparator as --stop-store"
+        ),
+    )
     parser.add_argument("--quiet", action="store_true", help="only print the harness verdicts")
     parser.add_argument(
         "--tb-plusarg",
@@ -587,7 +888,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     programs = args.only if args.only else list(CORPUS_PROGRAMS)
     try:
-        build_corpus(args.corpus_dir)
+        build_corpus(args.corpus_dir, programs)
         args.work_dir.mkdir(parents=True, exist_ok=True)
         exe = build_model(
             args.work_dir,
@@ -599,6 +900,31 @@ def main(argv: list[str] | None = None) -> int:
     except SetupError as exc:
         sys.stderr.write(f"[rv-rtl] error: {exc}\n")
         return 2
+    try:
+        stop = parse_stop_store(args.stop_store) if args.stop_store is not None else None
+        rom = (
+            write_rom_image(args.rom, args.work_dir / "rom.hex")
+            if args.rom is not None
+            else None
+        )
+        dtb = ensure_dtb(args.dtb) if args.dtb is not None else None
+    except (SetupError, SpikeError, ValueError) as exc:
+        sys.stderr.write(f"[rv-rtl] error: {exc}\n")
+        return 2
+    print(
+        f"[rv-rtl] window: -m0x{MEM_BASE:x}:{MEM_WINDOW_BYTES} "
+        f"(TB -DETH_RV_MEM_BYTES={MEM_WINDOW_BYTES})"
+    )
+    if rom is not None:
+        entry = "-" if rom.entry is None else f"0x{rom.entry:x}"
+        print(f"[rv-rtl] rom: {rom.source} -> {rom.path} (payload entry word: {entry})")
+    if dtb is not None:
+        print(f"[rv-rtl] dtb: {dtb} @ 0x{DTB_ADDR:x}")
+    print(
+        "[rv-rtl] stop: "
+        + ("tohost (the ELF symbol)" if stop is None else stop.describe())
+        + " (golden and DUT end at the same store)"
+    )
     if args.dram:
         print(
             f"[rv-rtl] D port: eth_rv_axi_master -> eth_dram_ctrl (+stub), "
@@ -621,6 +947,9 @@ def main(argv: list[str] | None = None) -> int:
                 quiet=args.quiet,
                 uart_fault=args.uart_fault,
                 plusargs=args.tb_plusarg,
+                rom=rom,
+                dtb=dtb,
+                stop=stop,
             )
         except SetupError as exc:
             sys.stderr.write(f"[rv-rtl] error: {exc}\n")
@@ -628,7 +957,7 @@ def main(argv: list[str] | None = None) -> int:
 
         expected = EXPECTED_UART.get(name, b"")
         if args.fault is None:
-            matched, report = compare(elf, rtl.trace, quiet=args.quiet)
+            matched, report = compare(elf, rtl.trace, quiet=args.quiet, stop=stop, dtb=dtb)
             print(f"[rv-rtl] {name}: {rtl.status}")
             print(report)
             failures += report_uart(
@@ -638,7 +967,7 @@ def main(argv: list[str] | None = None) -> int:
                 failures += 1
         else:
             index, field, value = parse_fault(args.fault)
-            matched, report = compare(elf, rtl.trace, quiet=args.quiet)
+            matched, report = compare(elf, rtl.trace, quiet=args.quiet, stop=stop, dtb=dtb)
             print(f"[rv-rtl] {name}: negative control {field}@#{index}=0x{value:x}")
             print(report)
             caught = DIVERGE_RE.search(report)

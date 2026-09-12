@@ -22,15 +22,20 @@
 //              what keeps the decoder free of latches and of repeated defaults.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
+// Modified:    2026-09-12 - E2-RV2 increment 5 (S3): RESET_PC moves to the BootROM
+//              base (0x1000); the payload entry is a ROM data word, not a constant
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §2 (frozen parameter pack),
-//              §3 (micro-architecture), §4 (RVFI trace port)
-//              ethereal-plan/subsystems/S15-应用处理器子系统.md §2.2
-// Notes:       RV-B v0 scope: RV64I + M + A + C integer subset, plus the M-mode CSR/trap
-//              path (`mstatus/misa/mie/mip/mtvec/mepc/mcause/mtval/mscratch/mhartid`,
-//              ecall/ebreak/illegal/misaligned). An unimplemented encoding or CSR
-//              number sets `ctrl_t.illegal` and raises the error strobe — it NEVER
-//              retires silently (C14 §3).
+//              §3 (micro-architecture), §4 (RVFI trace port) ·
+//              ethereal-plan/subsystems/S15-应用处理器子系统.md §2.2, §5 (DDR-less boot:
+//              BootROM reset vector + a0/a1 handoff)
+// Notes:       Single blessed configuration (C14 §2): XLEN 64, one hart, RV64IMAFDC +
+//              Zicsr/Zicntr — the extension set `misa` advertises. This package holds
+//              only the CONFIGURATION and the decode/writeback control types; the
+//              architectural behaviour lives in eth_rv_core and its unit modules.
+//              RESET_PC is the BootROM base (see the comment on it below). An
+//              unimplemented encoding or CSR number sets `ctrl_t.illegal` and raises
+//              the error strobe — it NEVER retires silently (C14 §3).
 package eth_rv_pkg;
 
     // ---------------------------------------------------------------- config
@@ -38,7 +43,12 @@ package eth_rv_pkg;
     localparam int unsigned REG_ADDR = 5;
     localparam int unsigned REG_NUM  = 32;
 
-    localparam logic [63:0] RESET_PC = 64'h0000_0000_8000_0000;
+    // Reset PC: the BootROM base (E2-RV2 increment 5, S3). The core executes the
+    // M-mode stub at 0x1000 first — it sets a0 = mhartid and a1 = 0x8000_2000
+    // (the DTB) and jumps to the payload entry word the harness patches — so the
+    // core itself starts in a ROM, not in the DRAM socket, and the payload may be
+    // loaded at any entry (see eth_rv_boot_rom / rtl/eth_rv/rom/boot_rom.S).
+    localparam logic [63:0] RESET_PC = 64'h0000_0000_0000_1000;
     // ------------------------------------------------------------- alu ops
     typedef enum logic [3:0] {
         ALU_ADD   = 4'd0,

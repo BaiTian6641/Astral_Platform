@@ -1,0 +1,13 @@
+# eth_rv boot rom hex v1
+# base 0x00001000 bytes 4096 words 1024 step_word 7 stub_steps 7 entry_word 8
+# generated from boot_rom.S by rtl/eth_rv/rom/build_rom.py -- do not edit
+
+@0000 00000297
+@0001 800025b7
+@0002 02059593
+@0003 0205d593
+@0004 f1402573
+@0005 0202b283
+@0006 00028067
+@0007 00000007
+@0008 80000000

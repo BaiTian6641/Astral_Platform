@@ -1,0 +1,40 @@
+# eth_rv SoC configuration (E2-RV2 increment 5, S3).
+#
+# The single checked-in source of the SoC address map and boot contract. It is
+# mirrored by verif/eth_rv/rv_platform.py (what the DiffTest harness executes)
+# and by verif/eth_rv/eth_rv.dts (the device tree Spike is pointed at with
+# --dtb); verif/eth_rv/tests/test_rv_platform.py fails if the three disagree.
+#
+# Flat key: value scalars only -- see rv_platform.read_core_yaml.
+
+hart_count: 1
+isa: rv64imafdc_zicsr_zicntr
+
+# RAM window: one number shared by the testbench's behavioural memory
+# (-DETH_RV_MEM_BYTES), eth_rv_axi_master's MEM_BYTES and Spike's
+# `-m0x80000000:<ram_window_bytes>`.
+ram_base: 0x80000000
+ram_window_bytes: 1048576
+
+# BootROM: reset vector (eth_rv_pkg RESET_PC), the stub's instruction-count word
+# (the TB derives the CLINT mtime phase from it) and the payload-entry word.
+rom_base: 0x1000
+rom_bytes: 4096
+rom_step_offset: 28
+rom_entry_offset: 32
+
+# Device tree blob: 8 KiB into RAM; the ROM stub leaves this in a1.
+dtb_addr: 0x80002000
+
+# Console UART (ns16550a) and CLINT, as the device tree declares them.
+uart_base: 0x10000000
+uart_reg_bytes: 256
+clint_base: 0x2000000
+clint_bytes: 49152
+
+# Clock / timebase. Both are DiffTest placeholders, not board numbers:
+# the CLINT advances mtime on the instruction cadence (CLOCK_HZ / 100, Spike's
+# INSNS_PER_RTC_TICK), so timebase-frequency is only meaningful while both sides
+# run the same program. SoC mode drives mtime from a real RTC tick input.
+clock_hz: 1000000000
+timebase_frequency: 10000000

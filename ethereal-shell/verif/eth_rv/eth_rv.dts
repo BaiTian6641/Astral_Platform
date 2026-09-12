@@ -1,0 +1,134 @@
+/* SPDX-License-Identifier: MIT
+ *
+ * eth_rv device tree (E2-RV2 increment 5, S3).
+ *
+ * This is the DT the harness hands to Spike with `--dtb=` and the one the
+ * BootROM leaves in a1 (DTB_ADDR in the S3 contract). Its numbers are mirrored
+ * by ethereal-shell/core.yaml and verif/eth_rv/rv_platform.py; the test
+ * suite fails if the three disagree.
+ *
+ * Compile with:
+ *   generated/rv_difftest/dtc/dtc -I dts -O dtb \
+ *       -o generated/rv_difftest/eth_rv.dtb eth_rv.dts
+ * or `python3 verif/eth_rv/build_dtb.py` (finds the built dtc for you).
+ *
+ * WHAT IS REAL HERE
+ *   - memory @ 0x8000_0000, 1 MiB: the single window the TB, the AXI master and
+ *     Spike's `-m0x80000000:1048576` all use (core.yaml ram_window_bytes).
+ *   - clint @ 0x0200_0000, 0xc000: eth_rv_clint (msip/mtimecmp/mtime). Base and
+ *     size match Spike's CLINT model exactly, so the golden and the DUT decode
+ *     the same registers.
+ *   - serial @ 0x1000_0000: eth_rv_uart, register window and byte aliasing
+ *     identical to Spike's ns16550 model (reg-shift 0, 1-byte registers).
+ *   - cpu @ 0: rv64imafdc_zicsr_zicntr (the MISATM value), Sv39, one hart.
+ *
+ * THE ONE GOLDEN-SIDE EXCEPTION -- the PLIC node below.
+ *   The hardware has no PLIC yet (E2-RV2 G7; S5 wires it), and until it does,
+ *   the UART is a *polled* console: no interrupt-parent, no interrupt line. But
+ *   the pinned Spike build cannot model an ns16550a node without one:
+ *   `ns16550_parse_from_fdt` calls `sim_t::get_intctrl()` unconditionally, and
+ *   that asserts `plic.get()` (riscv/ns16550.cc, riscv/sim.h). A DTB with a UART
+ *   and no interrupt controller therefore aborts Spike before the first
+ *   instruction, so `--dtb=eth_rv.dtb` could not be used at all.
+ *   The PLIC node is present for that reason only. It is NOT part of the
+ *   core.yaml agreement (a test checks the RAM/CPU/CLINT/UART numbers), it is
+ *   never touched by the S3/S4 firmware path, and it must be replaced by the
+ *   real PLIC description when S5 lands. Treat a DUT access below 0xc000_0000
+ *   as a divergence, not as a supported device.
+ *
+ * WHAT ELSE IS DELIBERATELY ABSENT
+ *   - No cache properties, no Svadu/PBMTE, no Zicclsm: the core does not
+ *     implement them (E2-RV2 G10/G11) and a DT that claims otherwise changes
+ *     what the kernel is allowed to assume.
+ *   - No S-mode SWI/timer delegation node: mideleg exists, but the S-mode
+ *     interrupt path is not wired (G7).
+ *
+ * BOUNDARY -- timebase-frequency and clock-frequency are DiffTest placeholders
+ *   The CLINT advances mtime from the simulation cadence, not a board
+ *   oscillator: Spike derives 10 MHz from CPU_HZ (1 GHz) / INSNS_PER_RTC_TICK
+ *   (100), and our CLINT is driven on the same instruction cadence so both
+ *   sides agree *while they run the same program*. `timebase-frequency` below
+ *   records that DiffTest cadence. In SoC mode it must come from a real RTC
+ *   tick input (E2-RV2 G9) -- until then, software that turns this number into
+ *   seconds (sleeps, baud divisors, timer expiry) is out of contract.
+ *   `clock-frequency` is likewise a placeholder, not a synthesis target.
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "ethereal,eth_rv";
+	model = "ethereal,eth_rv";
+
+	chosen {
+		stdout-path = &serial0;
+		bootargs = "console=ttyS0 earlycon";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <10000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "riscv";
+			reg = <0>;
+			status = "okay";
+			riscv,isa = "rv64imafdc_zicsr_zicntr";
+			mmu-type = "riscv,sv39";
+			clock-frequency = <1000000000>;
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x100000>;
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "riscv,clint0";
+			reg = <0x0 0x2000000 0x0 0xc000>;
+			/* hart 0: MSIP (irq 3) and MTIP (irq 7) of the local interrupt
+			 * controller. No S-mode SWI/timer delegation node yet: mideleg
+			 * exists, but the S-mode interrupt sources are not wired (G7). */
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7>;
+		};
+
+		/* GOLDEN-SIDE ONLY -- see "THE ONE GOLDEN-SIDE EXCEPTION" above.
+		 * Spike aborts on an ns16550a node with no interrupt controller. */
+		plic: plic@c000000 {
+			compatible = "riscv,plic0";
+			#address-cells = <0>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 11 &cpu0_intc 9>;
+			reg = <0x0 0xc000000 0x0 0x1000000>;
+			riscv,ndev = <31>;
+			riscv,max-priority = <15>;
+		};
+
+		serial0: serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			interrupt-parent = <&plic>;
+			interrupts = <1 4>;
+		};
+	};
+};

@@ -9,6 +9,8 @@
 //              stays unchanged.
 // Details:     SoC DATA MAP (increment 6: CLINT added):
 //
+//                0x0000_0000_0000_1000  BootROM (eth_rv_boot_rom, 4 KiB, read-only)
+//                  -> reset PC: the M-mode stub sets a0/a1 and jumps to the payload
 //                0x0000_0000_8000_0000  system memory (DRAM socket / eth_dram_ctrl)
 //                0x0000_0000_1000_0000  console UART (eth_rv_uart, 4 KiB page)
 //                0x0000_0000_0200_0000  CLINT (eth_rv_clint, 0xc000 window)
@@ -76,33 +78,78 @@
 //              claimed by no region and so becomes an access fault, which is
 //              Spike's absent-device behaviour. `step_i` is the hart's
 //              executed-instruction strobe, which the CLINT counts to advance
-//              `mtime` on Spike's cadence (see eth_rv_clint.sv for why reading
-//              MTIME is still a documented DiffTest boundary).
+//              `mtime` on Spike's cadence — but NOT before `CLINT_STEP_PRELOAD`
+//              plus the BootROM stub's own instruction count have been accounted
+//              for: the counter has to equal the golden model's at the same
+//              architectural point, and the golden counts a reset vector this
+//              SoC does not run (Spike's five-instruction one) while this SoC's
+//              own stub must not be counted twice. The skip is taken from the
+//              ROM image itself (`eth_rv_boot_rom`'s step-count word), so it
+//              tracks the stub instead of being a second magic number; see the
+//              MTIME CADENCE note on `eth_rv_clint` for the rule. Reading MTIME is
+//              still a documented DiffTest boundary (Spike's step accounting
+//              diverges after a trap).
 //
 //              MEIP has no source: the golden model's default configuration has
 //              no PLIC, so `meip_i` on the core is tied low here and stays 0.
+//
+//              BOOTROM (E2-RV2 increment 5, S3): the 4 KiB read-only region at
+//              0x0000_1000 holds the reset stub the core executes first
+//              (`eth_rv_pkg::RESET_PC`) — see `eth_rv_boot_rom`: set a0/a1, jump
+//              to the payload entry word. It is decoded HERE, first, because it
+//              is a device like the console: the core has one D port and the
+//              address map is this module's to own. The ROM's read port is a
+//              combinational 8-byte aligned beat, exactly the shape the UART's
+//              page and the memory path already present, so a load from the ROM
+//              completes in the cycle it is issued and a *store* is answered as
+//              an ERROR (ready + err, i.e. the architectural store access
+//              fault): Spike's `rom_device_t::store` returns false for the same
+//              reason — the region is read-only, and a silently dropped store
+//              would be exactly the "silent success" the error response exists
+//              to prevent. The instruction port reaches the same ROM instance
+//              through the SoC interconnect; in the v0 testbench that route is
+//              the testbench's fetch path reading this module's array (one
+//              image, preloaded from the checked-in hex, serves both ports).
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
 // Modified:    2026-09-12 - E2-RV1 increment 6: CLINT (MSIP/MTIMECMP/MTIME) in front
 //              of the D port; interrupt lines exit to the core
+//              2026-09-12 - E2-RV2 increment 5 (S3): BootROM at 0x1000 (the new
+//              reset PC) in front of the D port; the DRAM window size is a parameter
+//              2026-09-12 - E2-RV2 increment 5 (S3) follow-up: the CLINT's mtime
+//              cadence counts the GOLDEN's pre-program instructions (CLINT_STEP_PRELOAD)
+//              and swallows this SoC's BootROM stub pulses (derived from the ROM image),
+//              so `time` matches Spike again now that a ROM runs before the payload
 // Tags:        RTL, SYNTH
 // Plan-Ref:    ethereal-plan/components/C14-eth_rv-RV64核心.md §4 (I/D ports, MMIO via D-port decode),
 //              §6 (eth_axi / eth_dram_ctrl socket) · §8 checkpoint 5 ·
-//              ethereal-plan/subsystems/S15-应用处理器子系统.md §5 (SoC map)
+//              ethereal-plan/subsystems/S15-应用处理器子系统.md §5 (DDR-less boot:
+//              BootROM + a0/a1 handoff, SoC map)
 // Notes:       Combinational decode and muxing — no arbitration, no clock-domain
-//              crossing; the UART and the CLINT own the only state. `mem_*` is a
-//              straight pass-through of the core's request (same values, same
-//              cycle) when the address is not a device, so inserting this module
-//              cannot change the memory path's behavior. Every request is
-//              answered in its own cycle: `ready_o` is high with or without
-//              `err_o`, so no address in a device window (or outside every
-//              region) can wedge the core's D port.
+//              crossing; the ROM, the UART and the CLINT answer without state of
+//              their own on the path. `mem_*` is a straight pass-through of the
+//              core's request (same values, same cycle) when the address is not a
+//              device, so inserting this module cannot change the memory path's
+//              behavior. Every request is answered in its own cycle: `ready_o` is
+//              high with or without `err_o`, so no address in a device window (or
+//              outside every region) can wedge the core's D port.
 module eth_rv_mmio_mux #(
     parameter logic [63:0] UART_BASE       = 64'h0000_0000_1000_0000,  // console page (Spike NS16550_BASE)
     parameter int unsigned UART_BIT_CYCLES = 16,                       // clk / baud (see eth_rv_uart)
     parameter int unsigned UART_FIFO_DEPTH = 64,                       // transmit queue depth
     parameter logic [63:0] CLINT_BASE      = 64'h0000_0000_0200_0000,  // CLINT window (Spike clint.cc)
-    parameter logic [63:0] CLINT_SIZE      = 64'h0000_0000_0000_c000   // msip..mtime, as Spike decodes it
+    parameter logic [63:0] CLINT_SIZE      = 64'h0000_0000_0000_c000,  // msip..mtime, as Spike decodes it
+    // What the GOLDEN has counted when the program starts (the CLINT's mtime
+    // phase): 5 = Spike's own five-instruction reset vector, which is what a
+    // corpus run compares against. A golden started at *our* ROM (full-ROM mode)
+    // counts that stub instead, so it passes the stub's instruction count (7 for
+    // the checked-in image). The stub's own pulses are swallowed from the image's
+    // step-count word, so only this one mode-dependent number is supplied here.
+    parameter int unsigned CLINT_STEP_PRELOAD = 5,
+    parameter logic [63:0] ROM_BASE        = 64'h0000_0000_0000_1000,  // BootROM region (S3 contract)
+    parameter int unsigned ROM_BYTES       = 4096,                     // 4 KiB
+    parameter int unsigned ROM_ENTRY_WORD  = 8,                        // offset 32: the payload entry
+    parameter int unsigned ROM_STUB_WORD   = 7                         // offset 28: the stub's step count
 ) (
     input  logic        clk_i,
     input  logic        rst_ni,
@@ -137,7 +184,20 @@ module eth_rv_mmio_mux #(
     output logic        msip_o,     // machine software interrupt pending
     output logic        mtip_o,     // machine timer interrupt pending
     output logic [63:0] mtime_o,    // the CLINT's mtime register: the `time` CSR
-    input  logic        step_i      // one pulse per instruction that left EX
+    input  logic        step_i,     // one pulse per instruction that left EX
+
+    // ---- BootROM: the payload entry its stub will jump to (observability) ----
+    // The entry is a DATA word in the ROM image (rom/boot_rom.S); a harness patches
+    // it before reset to point the same ROM at any payload. It is exported so the
+    // verification side can read back which entry the ROM will actually take,
+    // instead of assuming the one it asked for.
+    output logic [63:0] rom_entry_o,
+
+    // ---- BootROM: the stub's instruction count (observability) -----------------
+    // The number of step pulses the CLINT swallows (a word of the ROM image,
+    // written by the linker from the stub's own bytes). Exported so the testbench
+    // can hold the image's claim against the commits the ROM actually retired.
+    output logic [13:0] rom_steps_o
 );
 
     logic       page_sel;   // access inside the UART page
@@ -148,6 +208,11 @@ module eth_rv_mmio_mux #(
     logic [7:0] uart_rdata;
     logic       clint_sel;  // access inside the CLINT window
     logic [63:0] clint_rdata;
+    logic       rom_hit;    // addr_i is inside the BootROM region (read port)
+    logic       rom_sel;    // ... and this request targets it
+    logic [63:0] rom_rdata; // the eight ROM bytes at the aligned beat
+    logic [63:0] rom_entry; // the payload entry word the ROM's stub will jump to
+    logic [13:0] rom_stub_steps;  // the stub's instruction count, from the ROM image
 
     // `reg_off = addr_i[2:0]` is the whole of the peripheral's address decode:
     // every offset inside the 4 KiB page aliases onto one of the eight byte
@@ -156,21 +221,28 @@ module eth_rv_mmio_mux #(
     assign page_byte = (size_i == 2'd0);          // eth_rv_pkg::SZ_BYTE
     assign reg_off   = addr_i[2:0];
     assign uart_sel  = page_sel && page_byte;
+    // The BootROM answers a load in the cycle it is made and rejects a store as
+    // an access fault (see the BOOTROM note in the header). Its read port is
+    // addressed with the 8-byte aligned beat address — the same shape the core's
+    // D port consumes for every other memory.
+    assign rom_sel   = req_i && rom_hit;
 
     // In-page accesses are always accepted — with `err_o` when the width is one
     // the byte register file cannot serve, which is Spike's `reg_io_width != len`
     // rejection turned into the architectural access fault. The CLINT answers
     // combinationally in the same cycle for every access it claims, so it can
     // never wedge either.
-    assign ready_o = page_sel ? (page_byte ? uart_ready : 1'b1)
+    assign ready_o = rom_sel   ? 1'b1
+                    : page_sel ? (page_byte ? uart_ready : 1'b1)
                     : clint_sel ? 1'b1 : mem_ready_i;
-    assign rdata_o = uart_sel  ? {8{uart_rdata}}
+    assign rdata_o = rom_sel   ? rom_rdata
+                    : uart_sel ? {8{uart_rdata}}
                     : clint_sel ? clint_rdata : mem_rdata_i;
-    assign err_o   = (page_sel && !page_byte) || (mem_req_o && mem_err_i);
+    assign err_o   = (rom_sel && we_i) || (page_sel && !page_byte) || (mem_req_o && mem_err_i);
 
     // The memory path sees the core's request verbatim, except that a device
     // access never reaches it (see why in the header).
-    assign mem_req_o   = req_i && !page_sel && !clint_sel;
+    assign mem_req_o   = req_i && !page_sel && !clint_sel && !rom_sel;
     assign mem_we_o    = we_i;
     assign mem_addr_o  = addr_i;
     assign mem_wdata_o = wdata_i;
@@ -178,7 +250,8 @@ module eth_rv_mmio_mux #(
 
     eth_rv_clint #(
         .BASE            (CLINT_BASE),
-        .CLINT_SIZE      (CLINT_SIZE)
+        .CLINT_SIZE      (CLINT_SIZE),
+        .STEP_PRELOAD    (CLINT_STEP_PRELOAD)
     ) u_clint (
         .clk_i        (clk_i),
         .rst_ni       (rst_ni),
@@ -192,8 +265,25 @@ module eth_rv_mmio_mux #(
         .msip_o       (msip_o),
         .mtip_o       (mtip_o),
         .mtime_o      (mtime_o),
-        .step_i       (step_i)
+        .step_i       (step_i),
+        .step_skip_i  (rom_stub_steps)   // the BootROM's own instructions (image-derived)
     );
+
+    eth_rv_boot_rom #(
+        .BASE       (ROM_BASE),
+        .BYTES      (ROM_BYTES),
+        .ENTRY_WORD (ROM_ENTRY_WORD),
+        .STUB_WORD  (ROM_STUB_WORD)
+    ) u_rom (
+        .addr_i        ({addr_i[63:3], 3'b000}),  // the read port takes the aligned beat
+        .sel_o         (rom_hit),
+        .rdata_o       (rom_rdata),
+        .entry_o       (rom_entry),
+        .stub_steps_o  (rom_stub_steps)
+    );
+
+    assign rom_entry_o = rom_entry;
+    assign rom_steps_o = rom_stub_steps;
 
     eth_rv_uart #(
         .BIT_CYCLES (UART_BIT_CYCLES),
@@ -246,16 +336,30 @@ endmodule
 //              instruction late and the commit stream would diverge.
 //
 //              MTIME CADENCE: Spike ticks mtime by INTERLEAVE/INSNS_PER_RTC_TICK
-//              (50) every INTERLEAVE (5000) *steps*, so the register steps as a
-//              staircase of the hart's instruction count, not its cycles. This
-//              module reproduces that cadence over the core's `step_i` strobe
-//              (one pulse per instruction that leaves EX), with STEP_PRELOAD
-//              standing in for the pinned Spike's five-instruction boot ROM so
-//              the phase lines up for a trap-free program. Reading MTIME is a
-//              documented boundary of the DiffTest all the same: Spike's
-//              sim-level step accounting (its early step return on a trap)
-//              diverges from any hart-side counter once a program traps, so the
-//              corpus only ever arms MTIP with 0 (always pending) or all-ones
+//              (50) every INTERLEAVE (5000) *steps*, so the register is a
+//              staircase of the hart's instruction count, not its cycles. For a
+//              DiffTest the register has to equal the golden model's at every
+//              architectural point, and that fixes the counting rule exactly:
+//
+//                tick count = STEP_PRELOAD + (instructions the hart retires after
+//                             the BootROM stub handed off to the payload)
+//
+//              STEP_PRELOAD is what the GOLDEN has already counted when the
+//              program starts: 5 for a corpus run (Spike's own five-instruction
+//              reset vector, which its step counter includes) and the stub's own
+//              instruction count when the golden is started at *our* ROM
+//              (`--pc=0x1000 --disable-dtb`, the full-ROM comparison). The stub's
+//              instructions are excluded on this side because that preload already
+//              accounts for the golden's pre-program instructions, so
+//              `step_skip_i` — driven from the ROM image's step-count word (see
+//              eth_rv_boot_rom) — makes the counter swallow exactly those pulses.
+//              The phase is therefore DERIVED from the stub rather than tuned to
+//              it: a longer stub changes the image's own count word in lockstep.
+//
+//              Reading MTIME is a documented boundary of the DiffTest all the
+//              same: Spike's sim-level step accounting (its early step return on a
+//              trap) diverges from any hart-side counter once a program traps, so
+//              the corpus only ever arms MTIP with 0 (always pending) or all-ones
 //              (never pending) — see verif/eth_rv/README.md.
 // Maintainer:  BaiTian6641
 // Created:     2026-09-12
@@ -280,7 +384,7 @@ endmodule
 module eth_rv_clint #(
     parameter logic [63:0] BASE             = 64'h0000_0000_0200_0000,
     parameter logic [63:0] CLINT_SIZE       = 64'h0000_0000_0000_c000,
-    parameter int unsigned STEP_PRELOAD     = 5,      // pinned Spike boot ROM (see header)
+    parameter int unsigned STEP_PRELOAD     = 5,      // the golden's pre-program step count
     parameter int unsigned RTC_TICK_STEPS   = 5000,   // Spike sim_t::INTERLEAVE
     parameter int unsigned RTC_TICK_ADVANCE = 50      // INTERLEAVE / INSNS_PER_RTC_TICK
 ) (
@@ -299,7 +403,8 @@ module eth_rv_clint #(
     output logic        mtip_o,      // machine timer interrupt pending
     output logic [63:0] mtime_o,     // the register itself: the hart's `time` CSR
 
-    input  logic        step_i       // one pulse per instruction that left EX
+    input  logic        step_i,      // one pulse per instruction that left EX
+    input  logic [13:0] step_skip_i  // pulses to swallow: the BootROM stub's own count
 );
 
     // ------------------------------------------------------------- addresses
@@ -331,6 +436,7 @@ module eth_rv_clint #(
     logic [63:0] mtimecmp_r;
     logic [63:0] mtime_r;
     logic [13:0] steps_mod_r;    // steps into the current RTC tick (< 5000)
+    logic [13:0] skip_r;         // BootROM stub pulses left to swallow (see the header)
 
     // ------------------------------------------------------------ write side
     // msip: Spike only latches a write at a multiple of 4 (and a dword store
@@ -429,12 +535,18 @@ module eth_rv_clint #(
             mtimecmp_r   <= 64'd0;
             mtime_r      <= 64'd0;
             steps_mod_r  <= STEP_PRELOAD[13:0];
+            skip_r       <= step_skip_i;
         end else begin
             msip_r     <= msip_next;
             mtimecmp_r <= mtimecmp_next;
             mtime_r    <= mtime_next;
             if (step_i) begin
-                if (rtc_tick) begin
+                // The stub's own instructions are swallowed: the preload already
+                // stands for whatever the golden counted before the program, so
+                // counting them here would shift the tick phase (see the header).
+                if (skip_r != 14'd0) begin
+                    skip_r <= skip_r - 14'd1;
+                end else if (rtc_tick) begin
                     steps_mod_r <= 14'd0;
                     mtime_r     <= mtime_next + TICK_ADV;
                 end else begin

@@ -161,6 +161,7 @@ def write_golden_fixtures(elf: Path, out_dir: Path, *, spike: str | Path | None 
     from rv_image import load_elf_image
     from rv_spike import (
         DEFAULT_ISA,
+        StopStore,
         last_golden_line,
         run_spike,
         trace_text_for_elf,
@@ -169,7 +170,9 @@ def write_golden_fixtures(elf: Path, out_dir: Path, *, spike: str | Path | None 
     image = load_elf_image(elf)
     run = run_spike(elf, spike=spike)
     lines = run.log.splitlines()
-    last = last_golden_line(run.log, source=str(elf), tohost=image.tohost, entry=image.entry)
+    last = last_golden_line(
+        run.log, source=str(elf), stop=StopStore(image.tohost), entry=image.entry
+    )
     kept = lines[: last + 1 + LOG_TAIL_LINES] if last >= 0 else lines
     log_path = out_dir / f"{elf.stem}.spike_log.txt"
     log_path.write_text(

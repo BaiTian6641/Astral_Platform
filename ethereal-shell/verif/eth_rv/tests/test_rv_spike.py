@@ -14,11 +14,15 @@ import pytest
 from rv_image import Image, ImageError, load_elf_image
 from rv_spike import (
     DEFAULT_ISA,
+    GoldenConfig,
     SpikeError,
+    StopStore,
     build_spike_command,
     is_spike_log,
     last_golden_line,
     normalize_spike_log,
+    parse_stop_store,
+    truncate_at_stop,
 )
 from rv_trace import Commit, TraceFormatError, stream_has_fp_info
 
@@ -39,7 +43,7 @@ def test_log_skips_boot_rom_and_stops_at_htif_store(
     commits = normalize_spike_log(
         golden_log_text,
         source=FIXTURE_LOG,
-        tohost=fixture_image.tohost,
+        stop=StopStore(fixture_image.tohost),
         entry=fixture_image.entry,
     )
     assert len(commits) == GOLDEN_COMMITS
@@ -52,7 +56,7 @@ def test_log_skips_boot_rom_and_stops_at_htif_store(
     exit_line = golden_log_text.splitlines()[
         last_golden_line(
             golden_log_text,
-            tohost=fixture_image.tohost,
+            stop=StopStore(fixture_image.tohost),
             entry=fixture_image.entry,
         )
     ]
@@ -74,7 +78,7 @@ def test_compressed_instruction_words_are_captured(
     golden_log_text: str, fixture_image: Image
 ) -> None:
     commits = normalize_spike_log(
-        golden_log_text, source=FIXTURE_LOG, tohost=fixture_image.tohost, entry=fixture_image.entry
+        golden_log_text, source=FIXTURE_LOG, stop=StopStore(fixture_image.tohost), entry=fixture_image.entry
     )
     widths = {commit.insn.bit_length() for commit in commits if commit.insn is not None}
     assert min(widths) <= 16  # 16-bit compressed instructions survive normalization
@@ -88,7 +92,7 @@ def test_last_golden_line_points_at_the_exit_store(
     index = last_golden_line(
         golden_log_text,
         source=FIXTURE_LOG,
-        tohost=fixture_image.tohost,
+        stop=StopStore(fixture_image.tohost),
         entry=fixture_image.entry,
     )
     assert "mem 0x0000000080001000" in lines[index]
@@ -96,7 +100,7 @@ def test_last_golden_line_points_at_the_exit_store(
 
 
 def test_last_golden_line_is_minus_one_for_a_useless_log() -> None:
-    assert last_golden_line("nothing to see here\n", tohost=0, entry=None) == -1
+    assert last_golden_line("nothing to see here\n", stop=StopStore(0), entry=None) == -1
 
 
 def test_multi_register_commit_line_is_rejected() -> None:
@@ -144,14 +148,85 @@ def test_wfi_commits_with_no_register_and_no_memory() -> None:
 
 
 def test_spike_command_is_pinned_to_the_corpus_flags(tmp_path: Path) -> None:
-    argv = build_spike_command("/opt/spike", "prog.elf", isa=DEFAULT_ISA, log_path=tmp_path / "l.log")
+    config = GoldenConfig(isa=DEFAULT_ISA)
+    argv = build_spike_command("/opt/spike", "prog.elf", config=config, log_path=tmp_path / "l.log")
     # the ISA whose misa advertises I|M|A|F|D|C|S|U (0x8000_0000_0014_112d)
     assert DEFAULT_ISA == "rv64imafdc_zicsr_zicntr"
     assert argv[1] == f"--isa={DEFAULT_ISA}"
+    assert argv[2] == "-m0x80000000:1048576"
     assert "--log-commits" in argv
     assert argv[0] == "/opt/spike"
     assert argv[-1] == "prog.elf"
     assert argv[-2] == f"--log={tmp_path / 'l.log'}"
+    # nothing optional is passed unless it was asked for
+    assert not any(flag.startswith(("--dtb", "--bootargs", "--pc=", "--pcs", "--disable-dtb")) for flag in argv)
+
+
+def test_spike_command_carries_every_golden_flag(tmp_path: Path) -> None:
+    config = GoldenConfig(
+        dtb=Path("eth_rv.dtb"),
+        bootargs="console=ttyS0 earlycon",
+        pc=0x8000_2000,
+        pcs="0:0x80000000",
+        stop=StopStore(0x8000_1000, 1),
+    )
+    argv = build_spike_command("spike", "prog.elf", config=config, log_path=tmp_path / "l.log")
+    assert "--dtb=eth_rv.dtb" in argv
+    assert "--bootargs=console=ttyS0 earlycon" in argv
+    assert "--pc=0x80002000" in argv
+    assert "--pcs=0:0x80000000" in argv
+    assert "-m0x80000000:1048576" in argv
+    text = config.describe()
+    for fragment in ("mem=-m0x80000000:1048576", "dtb=eth_rv.dtb", "pc=0x80002000", "stop=store@0x80001000=0x1"):
+        assert fragment in text
+
+
+def test_disable_dtb_and_dtb_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        GoldenConfig(dtb=Path("x.dtb"), dtb_enabled=False)
+
+
+def test_disable_dtb_is_passed_and_recorded(tmp_path: Path) -> None:
+    config = GoldenConfig(dtb_enabled=False)
+    argv = build_spike_command("spike", "prog.elf", config=config, log_path=tmp_path / "l.log")
+    assert "--disable-dtb" in argv
+    assert "dtb=disabled" in config.describe()
+
+
+def test_mem_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        GoldenConfig(mem_size=0)
+
+
+def test_stop_store_parses_address_and_optional_value() -> None:
+    assert parse_stop_store("0x80001000") == StopStore(0x8000_1000)
+    assert parse_stop_store("2147487744") == StopStore(0x8000_1000)
+    assert parse_stop_store("0x80001000:0x1") == StopStore(0x8000_1000, 1)
+    assert parse_stop_store("0x80001000:1") == StopStore(0x8000_1000, 1)
+    for bad in ("", "start", "0x80001000:", "0x80001000:0x1:0x2"):
+        with pytest.raises(ValueError, match="ADDR"):
+            parse_stop_store(bad)
+
+
+def test_stop_store_matches_only_stores() -> None:
+    stop = StopStore(0x8000_1000, 1)
+    assert stop.matches(0x8000_1000, 1)
+    assert not stop.matches(0x8000_1000, 2)  # wrong value
+    assert not stop.matches(0x8000_1000, None)  # a load, not a store
+    assert not stop.matches(0x8000_2000, 1)  # wrong address
+    assert StopStore(0x8000_1000).matches(0x8000_1000, 0xABC)
+
+
+def test_truncate_at_stop_cuts_after_the_event() -> None:
+    commits = [
+        Commit(cycle=index, pc=0x100, rd=None, value=None, mem_addr=0x8000_1000, mem_wdata=index)
+        for index in (1, 2, 3)
+    ]
+    assert [c.cycle for c in truncate_at_stop(commits, StopStore(0x8000_1000, 2))] == [1, 2]
+    assert truncate_at_stop(commits, None) == commits
+    # a stop event that is never reached is an error, not a silent full-stream pass
+    with pytest.raises(TraceFormatError, match="does not reach the stopping store"):
+        truncate_at_stop(commits, StopStore(0x9999))
 
 
 def test_missing_spike_binary_is_reported(tmp_path: Path) -> None:
@@ -294,7 +369,7 @@ def test_integer_only_log_has_no_fp_record(
     commits = normalize_spike_log(
         golden_log_text,
         source=FIXTURE_LOG,
-        tohost=fixture_image.tohost,
+        stop=StopStore(fixture_image.tohost),
         entry=fixture_image.entry,
     )
     assert not stream_has_fp_info(commits)
