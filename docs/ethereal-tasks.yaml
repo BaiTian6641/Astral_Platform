@@ -309,7 +309,7 @@ tasks:
     est_days: 2
     deliverable: rtl/emri/ + ethctl 探测逻辑
     acceptance: ethctl 自动识别 BMC/mFSM 模式并调整会话语义
-    status: in_progress   # 2026-09-11 对账: EMRI 寄存器面已实现（emri_regfile + 全套 TB）；模式探测=CAPABILITIES.has_bmc 可读（ethctl info 输出 has_bmc）；**缺**：ethctl 依据探测结果自动选择/调整 EFP↔mFSM 会话语义（当前为显式 --transport 选择）。mFSM 侧 RTL（E2-BMC1）到位后可一并关
+    status: done   # 2026-09-13 收官: EMRI 寄存器面（emri_regfile + 全套 TB）+ 能力探测（CAPABILITIES.has_bmc，ethctl info 输出 has_bmc）此前已完成；本轮补齐**自动识别与按模式调整会话语义**：`--transport {auto,mfsm,efp}` 默认 auto（探测后分派 EFP mailbox 或 host 驱动的 Daemon）、`--device {auto,emri,bmc}`、显式选择时对探测矛盾 fail-closed、旧 `--transport efp` 隐式映射到 bmc（既有调用不变）。模式差异全部按 `emri-v0.md` §1.1/§3.2/§3.8/§5/§8 落地：谁发起 `OCC_CMD.start`、谁验 Ed25519、会话 FSM 归属、mFSM 上 EFP mailbox 无效（拒绝）、mFSM 下 `MON_NOTIFY` 由**主机**在 OCC_DONE 后写入、daemon 专属流程（stop/restart/abort、run_packed、ctx save/restore、fwupdate/reboot）在 mFSM 上拒绝、`inspect` 跨模式逐字节一致。14 条新测试；scoped 61 passed；全量 `pytest ethereal-tools` 在 OSS-CAD PATH 下 **514 passed / 0 failed**；ruff/mypy --strict 干净（其余历史 mypy 债已如实记录，未改任何断言）。三处规范歧义按 G6 报告未猜（region-lock 生命周期是否需 mFSM 主机镜像、节流预检归属、v0 的 SESSION_CMD 是否脉冲）
 
   - id: E1-IO1
     title: SPI 数据通道（NEORV32 SDI + EFP-SPI 帧协议固件栈 + CRC16）

@@ -8,20 +8,26 @@ EFP-SPI frame protocol (EMRI spec sec 7) on real hardware; in simulation a
 ``RecordTransport`` emits a replayable deploy-plan JSON consumed by the SV
 testbench (real EMRI regfile + OCC + fabric_top RTL — single source of truth).
 
-Deploy flow (mFSM, host-driven, EMRI v0):
-  1. read CAPABILITIES (confirm mFSM mode) + OCC_STATUS (IDLE);
-  2. write OCC_FRAME_ADDR + OCC_WORD_COUNT, then OCC_CMD BLANK -> poll DONE;
-  3. write OCC_FRAME_ADDR + OCC_WORD_COUNT, then OCC_CMD WRITE;
-  4. stream every 32-bit frame word via OCC_PUSH (EFP-SPI op 0x03);
-  5. poll OCC_STATUS until DONE; (optionally READBACK + CRC check).
+**Session mode (E1-BMC4).** ethctl does NOT need the user to say which side it
+talks to: it probes ``CAPABILITIES.has_bmc`` — the only field that differs
+between the two EMRI implementations (spec sec 1.1) — and derives the session
+semantics from it (spec sec 8). mFSM = the host-driven flow above (there is no
+device-side daemon); BMC = the high-level EFP command block (``EFP_CMD`` /
+``EFP_STATUS``, sec 3.2) whose firmware daemon owns the OCC lifecycle.
+``--transport mfsm|efp`` pins the path instead (override); a pinned path that
+contradicts the probe fails closed rather than driving the wrong protocol.
+Commands only a BMC can answer (``stop``/``restart``/``abort``, ``run_packed``,
+ctx save/restore) are refused with an actionable error on an mFSM. The full
+mFSM-vs-BMC difference table lives on :class:`EmriMode`.
 
 Plan-Ref: ethereal-plan/subsystems/S08-运行时daemon与ethctl.md sec 2.1/§2.3,
-          ethereal-spec/control/emri-v0.md sec 2/3/4/7.
+          ethereal-spec/control/emri-v0.md sec 1.1/2/3/4/7/8.
 """
 
 from __future__ import annotations
 
 import argparse
+import enum
 import json
 import struct
 import sys
@@ -45,6 +51,7 @@ import efp_client
 import ethimg
 import oci_registry
 from emri_constants import (
+    CAPB_HAS_BMC,
     EFP_REGION_AUTO,
     OCC_BLANK,
     OCC_CMD_START,
@@ -62,8 +69,11 @@ from emri_constants import (
     OCC_STATUS_DONE_FLAG,
     OCC_WRITE,
     R_CAPABILITIES,
+    R_EFP_ERR,
+    R_EFP_STATUS,
     R_HEALTH_STATUS,
     R_MAGIC,
+    R_MON_NOTIFY,
     R_NUM_REGIONS,
     R_OCC_CMD,
     R_OCC_FRAME_ADDR,
@@ -77,6 +87,71 @@ from emri_constants import (
 
 # pi-lens-ignore: E402
 from security import capcheck
+
+# --------------------------------------------------------------------------- #
+# Session mode (E1-BMC4): BMC vs mFSM
+# --------------------------------------------------------------------------- #
+# MON_NOTIFY bit layout (spec sec 2/3.8): bit r = "deploy completed in region r"
+# for r in 0..7 (bit 8+r = watchdog event on region r). Bits above the fabric's
+# region count are ignored by the regfile.
+MON_NOTIFY_REGIONS = 8
+
+
+class EmriMode(enum.Enum):
+    """Which EMRI implementation ethctl drives (emri-v0.md sec 1.1 + sec 8).
+
+    Both expose the *same* register map, transport and commands; the only probe
+    field that differs is ``CAPABILITIES.has_bmc`` (sec 1.1/2). What changes is
+    where the session intelligence lives (sec 8, "protocol identical,
+    intelligence location differs"):
+
+    * ``MFSM`` (has_bmc=0) -- no CPU and no daemon on the device, so the HOST
+      owns the session:
+      - it verifies the image (``ethimg``/Ed25519; the mFSM trusts the host),
+      - it writes ``OCC_CMD.start`` itself and polls ``OCC_STATUS``,
+      - it streams the frame words (sec 1 v0 scope: the device-side 5-state
+        session FSM + ``rx_buf`` are v0.1, so v0 does NOT pulse ``SESSION_CMD``;
+        the ``SESSION_*``/``RX_BUF_CTRL`` registers are plain storage for
+        forward-compat),
+      - it notifies the anomaly monitor (sec 3.8: "the daemon (or the host in
+        mFSM mode) writes bit r on a completed deploy").
+      The EFP command block is inert here (sec 3.2: "In mFSM mode these
+      registers are plain host-visible storage (the mFSM has no daemon;
+      ``EFP_CMD`` writes are ignored)").
+    * ``BMC`` (has_bmc=1) -- the firmware daemon owns the session: the host
+      stages metadata and rings ``EFP_CMD``, then polls ``EFP_STATUS`` /
+      ``EFP_ERR``; the daemon issues ``OCC_CMD``, verifies Ed25519 in firmware
+      and applies the region-lock lifecycle (sec 3.2/3.10). The host must NOT
+      write ``OCC_CMD`` or ``MON_NOTIFY`` behind it.
+
+    Daemon-only (BMC) flows with no mFSM equivalent: ``run_packed`` (sec 3.3),
+    stop/restart/abort lifecycle (sec 3.2), context save/restore (sec 3.9),
+    fw-update/reboot (sec 3.6, sim-demo).
+    """
+
+    MFSM = "mfsm"
+    BMC = "bmc"
+
+
+class RegisterReadable(Protocol):
+    """Read-only EMRI register face -- the capability-probe seam."""
+
+    def read(self, addr: int) -> int: ...
+
+
+def probe_mode(device: RegisterReadable) -> EmriMode:
+    """Derive the session mode from the capability probe (spec sec 1.1/2).
+
+    ``CAPABILITIES`` bit0 ``has_bmc`` is the ONLY field that differs between
+    the BMC and the mFSM, so auto-detection is a single register read.
+    """
+    caps = device.read(R_CAPABILITIES)
+    return EmriMode.BMC if caps & (1 << CAPB_HAS_BMC) else EmriMode.MFSM
+
+
+def resolve_mode(device: RegisterReadable, override: EmriMode | None) -> EmriMode:
+    """Session mode: the caller's pinned override, else the capability probe."""
+    return override if override is not None else probe_mode(device)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +201,7 @@ class RecordTransport:
     def read_status(self) -> int:
         return self.read(R_OCC_STATUS)
 
-    def to_plan(self, name: str, frames_words: list[int], region: int) -> dict:
+    def to_plan(self, name: str, frames_words: list[int], region: int) -> dict[str, Any]:
         return {
             "schema": "ethereal.deploy-plan.v0",
             "name": name,
@@ -200,7 +275,7 @@ class PythonEmriModel:
         if addr == R_MAGIC:
             return 0x45544852
         if addr == R_CAPABILITIES:
-            return 1 if self.has_bmc else 0
+            return (1 << CAPB_HAS_BMC) if self.has_bmc else 0
         if addr == R_PLATFORM_ID:
             return self.platform_id
         if addr == R_NUM_REGIONS:
@@ -260,6 +335,38 @@ class DaemonError(Exception):
     pass
 
 
+def require_bmc(mode: EmriMode, feature: str) -> None:
+    """Refuse a BMC-only feature on an mFSM (emri-v0.md sec 3.2/8).
+
+    The mFSM has no daemon and no CPU: the EFP command block is plain storage
+    there ("EFP_CMD writes are ignored", sec 3.2), so a daemon lifecycle
+    command would silently do nothing.
+    """
+    if mode is EmriMode.MFSM:
+        raise DaemonError(
+            f"{feature} needs a BMC daemon: this device reports mFSM "
+            "(CAPABILITIES.has_bmc=0), which has no device-side daemon -- "
+            "EFP_CMD writes are ignored (emri-v0.md sec 3.2/8). Use "
+            "--transport efp against a BMC, or --device bmc in sim."
+        )
+
+
+def require_mfsm(mode: EmriMode, feature: str) -> None:
+    """Refuse the host-driven OCC flow on a BMC (emri-v0.md sec 8).
+
+    On a BMC the firmware daemon owns the OCC lifecycle; a host writing
+    ``OCC_CMD`` behind it would race the daemon (and bypass the sec 3.10 lock
+    policy), so the two must not be driven at once.
+    """
+    if mode is EmriMode.BMC:
+        raise DaemonError(
+            f"{feature} is mFSM-only: this device reports a BMC "
+            "(CAPABILITIES.has_bmc=1), whose daemon owns the OCC lifecycle "
+            "(emri-v0.md sec 8/3.2). Use the EFP command block "
+            "(--transport efp) instead."
+        )
+
+
 @dataclass
 class DeployResult:
     region: int
@@ -270,30 +377,54 @@ class DeployResult:
 
 @dataclass
 class Daemon:
-    """mFSM-mode deploy orchestrator. Drives a Transport (real SPI or sim)."""
+    """mFSM-mode deploy orchestrator. Drives a Transport (real SPI or sim).
+
+    The session mode is auto-detected from ``CAPABILITIES.has_bmc`` (E1-BMC4);
+    ``mode_override`` pins it instead (the CLI ``--transport`` override). A
+    device that reports a BMC is refused by :meth:`deploy` unless the override
+    pinned mFSM: the BMC daemon owns the OCC lifecycle there (spec sec 8).
+    """
 
     transport: Transport
     poll_interval_s: float = 0.0  # 0 = no real delay (sim); set for HW
     poll_timeout: int = 100_000
+    mode_override: EmriMode | None = None  # None = probe CAPABILITIES.has_bmc
 
     # ---- discovery ----
+    def probe_mode(self) -> EmriMode:
+        """Capability-probe result, ignoring any override (spec sec 1.1)."""
+        return probe_mode(self.transport)
+
+    def mode(self) -> EmriMode:
+        """Effective session mode: pinned override, else the capability probe."""
+        return resolve_mode(self.transport, self.mode_override)
+
     def is_mfsm_mode(self) -> bool:
-        caps = self.transport.read(R_CAPABILITIES)
-        return (caps & 0x1) == 0
+        """True when the effective session is the host-driven mFSM flow."""
+        return self.mode() is EmriMode.MFSM
 
     def magic_ok(self) -> bool:
         return self.transport.read(R_MAGIC) == 0x45544852
 
     def inspect(self) -> dict[str, Any]:
+        """Read the identity/capability face -- identical on both modes.
+
+        ``mode`` is the effective session mode (the probe, or the override);
+        ``has_bmc`` is the raw capability bit, so an override that disagrees
+        with the device stays visible. Every other field comes from the shared
+        register map (spec sec 1.1), which is what makes ``ethctl inspect``
+        byte-identical across a BMC and an mFSM (spec sec 8 acceptance).
+        """
         caps = self.transport.read(R_CAPABILITIES)
-        info = {
+        info: dict[str, Any] = {
+            "mode": self.mode().value,
             "magic_ok": self.magic_ok(),
-            "has_bmc": bool(caps & 0x1),
+            "has_bmc": bool(caps & (1 << CAPB_HAS_BMC)),
             "num_regions": self.transport.read(R_NUM_REGIONS),
             "platform_id": self.transport.read(R_PLATFORM_ID),
             "health": self.transport.read(R_HEALTH_STATUS),
         }
-        regions = []
+        regions: list[int] = []
         for i in range(info["num_regions"]):
             self.transport.write(R_REGION_SEL, i)
             regions.append(self.transport.read(R_REGION_INFO))
@@ -366,6 +497,18 @@ class Daemon:
             self.transport.push(w)
         return self._occ_wait()  # done_code (DONE or NEEDS_BLANK)
 
+    def _notify_deploy(self, region: int) -> None:
+        """Post the completed-deploy pulse to the hardware anomaly monitor.
+
+        emri-v0.md sec 3.8: "the daemon (or the host in mFSM mode) writes bit
+        ``r`` on a completed deploy". With no device-side daemon in mFSM mode
+        the HOST is the only writer, so without this the MON_RECFG_COUNT /
+        spike-detector surfaces stay dark. In BMC mode the daemon owns the
+        word, which is why this sits on the host-driven path only.
+        """
+        if 0 <= region < MON_NOTIFY_REGIONS:
+            self.transport.write(R_MON_NOTIFY, 1 << region)
+
     # ---- top-level deploy ----
     def deploy(
         self,
@@ -389,9 +532,10 @@ class Daemon:
 
         if not self.magic_ok():
             raise DaemonError("EMRI MAGIC mismatch — wrong device?")
-        if not self.is_mfsm_mode():
-            # BMC mode needs a different (high-level) command; v0 is mFSM only.
-            raise DaemonError("device is in BMC mode — v0 daemon is mFSM-only")
+        # Mode gate: the flow below drives OCC_CMD / MON_NOTIFY itself, which is
+        # the host's job only in mFSM mode (spec sec 8) — on a BMC the firmware
+        # daemon owns both words.
+        require_mfsm(self.mode(), "the host-driven OCC deploy")
 
         t0 = time.perf_counter()
         needs_blank = False
@@ -402,7 +546,9 @@ class Daemon:
             # FABulous red line: WRITE to a dirty region -> blank then retry
             needs_blank = True
             self._blank(region, frame_addr, len(words))
-            self._write_frames(region, frame_addr, words)
+            code = self._write_frames(region, frame_addr, words)
+        if code == OCC_DONE_DONE:
+            self._notify_deploy(region)
         return DeployResult(
             region=region,
             words_written=len(words),
@@ -456,28 +602,20 @@ def _parse_region(s: str) -> int:
         raise DaemonError(f"bad --region {s!r} (integer or 'auto')") from None
 
 
-def _cli_efp(args: Any) -> int:
-    """EFP transport path (emri-v0.md sec 3.2, BMC-mode daemon mailbox).
+def _cli_efp(args: Any, model: efp_client.EfpDaemonModel) -> int:
+    """BMC daemon session (emri-v0.md sec 3.2, the BMC-mode EFP mailbox).
 
     Builds the session with efp_client, executes it against the functional
     daemon model (sim scope), and optionally dumps the op list as a session
     JSON (``--emit-session``) for SV testbench replay (tb_ethctl_replay).
     """
     client = efp_client.EfpClient()
-    # Trusted key (raw 32-byte Ed25519): enforces the HOST-SIDE signature check
-    # in efp_client.load_image (E2-SEC1) and the sim model's VERIFY. Without it
-    # a signed image is refused unless --allow-unsigned is passed explicitly.
-    trusted_pk: bytes | None = None
-    if getattr(args, "pubkey", None):
-        from cryptography.hazmat.primitives import serialization
-
-        pub = serialization.load_pem_public_key(Path(args.pubkey[0]).read_bytes())
-        trusted_pk = pub.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+    # The model carries the trusted key (raw 32-byte Ed25519): it enforces the
+    # HOST-SIDE signature check in efp_client.load_image (E2-SEC1) and its own
+    # VERIFY. Without it a signed image is refused unless --allow-unsigned is
+    # passed explicitly.
+    trusted_pk = model.trusted_pk
     allow_unsigned = bool(getattr(args, "allow_unsigned", False))
-    model = efp_client.EfpDaemonModel(trusted_pk=trusted_pk)
 
     ops: list[efp_client.Op]
     image: efp_client.StagedImage | None = None
@@ -517,14 +655,14 @@ def _cli_efp(args: Any) -> int:
         reads = efp_client.execute_ops(ops, model)
     except efp_client.EfpError as e:
         # surface the device-side status/error alongside the host-side failure
-        st = model.read(efp_client.R_EFP_STATUS)
-        er = model.read(efp_client.R_EFP_ERR) & 0xFF
+        st = model.read(R_EFP_STATUS)
+        er = model.read(R_EFP_ERR) & 0xFF
         raise DaemonError(
             f"{e} (daemon state={efp_client.decode_state(st & 0xF)} "
             f"err={efp_client.decode_err(er)})"
         ) from e
-    status = model.read(efp_client.R_EFP_STATUS)
-    err = model.read(efp_client.R_EFP_ERR)
+    status = model.read(R_EFP_STATUS)
+    err = model.read(R_EFP_ERR)
     state = efp_client.decode_state(status & 0xF)
     if args.cmd == "ps":
         print(
@@ -553,6 +691,127 @@ def _cli_efp(args: Any) -> int:
     return 0
 
 
+def _transport_override(s: str) -> EmriMode | None:
+    """Map ``--transport`` to a pinned session mode (None = auto-probe)."""
+    return {"auto": None, "mfsm": EmriMode.MFSM, "efp": EmriMode.BMC}[s]
+
+
+def _trusted_pk(args: Any) -> bytes | None:
+    """Raw 32-byte Ed25519 public key from the first ``--pubkey`` PEM, if any."""
+    if not getattr(args, "pubkey", None):
+        return None
+    from cryptography.hazmat.primitives import serialization
+
+    pub = serialization.load_pem_public_key(Path(args.pubkey[0]).read_bytes())
+    return pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def _run_session(args: Any) -> int:
+    """Auto-detect the EMRI session mode and run the requested command.
+
+    E1-BMC4: the device (``--device``) is probed via ``CAPABILITIES.has_bmc``
+    and the session semantics follow the result -- mFSM = the host-driven OCC
+    flow (:class:`Daemon`), BMC = the EFP daemon mailbox (:func:`_cli_efp`).
+    An explicit ``--transport mfsm|efp`` pins the path instead and is checked
+    against the probe: a contradiction fails closed rather than driving the
+    wrong protocol (spec sec 3.2/8).
+    """
+    device = args.device
+    if device == "auto":
+        # Compat: an explicit --transport efp has always meant the BMC daemon
+        # path in sim, so it also selects the BMC device model.
+        device = "bmc" if args.transport == "efp" else "emri"
+    # In hardware there is ONE EMRI register map and only the probe differs
+    # (spec sec 1.1); the sim needs one device model per implementation.
+    model: PythonEmriModel | RecordTransport | efp_client.EfpDaemonModel
+    if device == "bmc":
+        model = efp_client.EfpDaemonModel(trusted_pk=_trusted_pk(args))
+    elif args.mode == "plan":
+        model = RecordTransport()
+    else:
+        model = PythonEmriModel()
+
+    detected = probe_mode(model)
+    override = _transport_override(args.transport)
+    if override is not None and override is not detected:
+        # Fail closed (spec sec 3.2/8): EFP commands at a daemonless mFSM are
+        # ignored, and the host-driven OCC flow at a BMC races the daemon and
+        # bypasses its lock policy.
+        if override is EmriMode.BMC:
+            require_bmc(detected, "the EFP session (--transport efp)")
+        else:
+            require_mfsm(detected, "the host-driven OCC session (--transport mfsm)")
+    session = override if override is not None else detected
+
+    if args.cmd == "inspect":
+        # Mode-agnostic: the identity/capability face is the same register map
+        # on both implementations, so the output is byte-identical for the
+        # fields both expose (spec sec 1.1/8 acceptance).
+        print(json.dumps(Daemon(model, mode_override=session).inspect(), indent=2))
+        return 0
+
+    if session is EmriMode.BMC:
+        if not isinstance(model, efp_client.EfpDaemonModel):
+            raise DaemonError(
+                "auto-detected a BMC but no daemon device model is selected "
+                "(--device bmc in sim)"
+            )
+        return _cli_efp(args, model)
+
+    # ---- mFSM mode: host-driven session, no device-side daemon ------------
+    if args.cmd in ("stop", "restart", "abort"):
+        require_bmc(session, f"'{args.cmd}' (device lifecycle)")
+    if args.emit_session:
+        raise DaemonError(
+            "--emit-session needs a BMC daemon (--transport efp): the session "
+            "JSON replays EFP commands, which an mFSM ignores (emri-v0.md "
+            "sec 3.2)"
+        )
+    if args.cmd == "run":
+        args.region = _parse_region(args.region)
+        if args.region == EFP_REGION_AUTO:
+            raise DaemonError(
+                "--region auto needs a BMC daemon allocator (--transport efp): "
+                "the mFSM host deploys to an explicit region"
+            )
+    daemon = Daemon(model, mode_override=session)
+    if args.cmd == "ps":
+        for row in daemon.ps():
+            print(
+                f"region{row['region']:2d} healthy={row['healthy']} "
+                f"{row['geometry']['cols']}x{row['geometry']['rows']} "
+                f"({row['geometry']['tiles']} tiles)"
+            )
+    elif args.cmd == "run":
+        keys = [Path(k).read_bytes() for k in args.pubkey] or None
+        res = daemon.deploy_image(
+            Path(args.eth),
+            region=args.region,
+            frame_addr=args.frame_addr,
+            trusted_pubkeys=keys,
+            allow_unsigned=args.allow_unsigned,
+        )
+        print(
+            f"deployed region{res.region}: {res.words_written} words, "
+            f"{res.elapsed_s * 1000:.1f} ms (mode={session.value})"
+        )
+        if args.mode == "plan" and args.plan_out:
+            # recompute frames_words for the plan
+            frames_bytes = _extract_frames(Path(args.eth), _target_of(Path(args.eth)))
+            words = [
+                struct.unpack_from("<I", frames_bytes, i)[0]
+                for i in range(0, len(frames_bytes), 4)
+            ]
+            if isinstance(model, RecordTransport):
+                plan = model.to_plan(_name_of(Path(args.eth)), words, args.region)
+                Path(args.plan_out).write_text(json.dumps(plan, indent=2))
+                print(f"wrote deploy plan -> {args.plan_out}")
+    return 0
+
+
 def _cli(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="ethctl", description="Ethereal host control")
     p.add_argument(
@@ -563,11 +822,20 @@ def _cli(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--plan-out", default=None, help="deploy-plan JSON path (mode=plan)")
     p.add_argument(
+        "--device",
+        choices=("auto", "emri", "bmc"),
+        default="auto",
+        help="sim device model: emri = EMRI regfile (record/Python model); "
+        "bmc = in-Python BMC daemon (EFP command block); auto follows "
+        "--transport (efp => bmc, else emri)",
+    )
+    p.add_argument(
         "--transport",
-        choices=("mfsm", "efp"),
-        default="mfsm",
-        help="mfsm: host-driven OCC flow (default, v0); efp: BMC-daemon EFP "
-        "command block (emri-v0.md sec 3.2, v0.2)",
+        choices=("auto", "mfsm", "efp"),
+        default="auto",
+        help="session semantics: auto (default) probes CAPABILITIES.has_bmc "
+        "and picks the mFSM host-driven OCC flow or the BMC EFP mailbox; "
+        "mfsm/efp pin the path explicitly (checked against the probe)",
     )
     p.add_argument(
         "--emit-session",
@@ -612,7 +880,9 @@ def _cli(argv: list[str] | None = None) -> int:
     # allow the transport flags AFTER the subcommand too
     # (`ethctl run img.eth --transport efp --emit-session s.json`)
     for spx in (sp_run, sp_ps, sp_stop, sp_restart, sp_abort):
-        spx.add_argument("--transport", choices=("mfsm", "efp"),
+        spx.add_argument("--device", choices=("auto", "emri", "bmc"),
+                         default=argparse.SUPPRESS)
+        spx.add_argument("--transport", choices=("auto", "mfsm", "efp"),
                          default=argparse.SUPPRESS)
         spx.add_argument("--emit-session", default=argparse.SUPPRESS)
 
@@ -651,82 +921,15 @@ def _cli(argv: list[str] | None = None) -> int:
         except (oci_registry.OciError, ethimg.EthimgError) as e:
             print(f"ethctl: error: {e}", file=sys.stderr)
             return 1
-    if args.transport == "efp":
-        try:
-            return _cli_efp(args)
-        except (
-            DaemonError,
-            efp_client.EfpError,
-            ethimg.EthimgError,
-            capcheck.CapabilityError,
-        ) as e:
-            # Capability refusal names the offending entry in `e` (E2-SEC1).
-            print(f"ethctl: error: {e}", file=sys.stderr)
-            return 1
-    if args.emit_session:
-        print("ethctl: error: --emit-session needs --transport efp", file=sys.stderr)
-        return 1
-    if args.cmd in ("stop", "restart", "abort"):
-        print(
-            f"ethctl: error: '{args.cmd}' needs --transport efp "
-            "(mFSM mode is host-driven; there is no device-side lifecycle)",
-            file=sys.stderr,
-        )
-        return 1
-    if args.cmd == "run":
-        try:
-            args.region = _parse_region(args.region)
-        except DaemonError as e:
-            print(f"ethctl: error: {e}", file=sys.stderr)
-            return 1
-        if args.region == EFP_REGION_AUTO:
-            print("ethctl: error: --region auto needs --transport efp "
-                  "(mFSM mode deploys to an explicit region)", file=sys.stderr)
-            return 1
-    # build transport
-    if args.mode == "plan":
-        transport: Transport = RecordTransport()
-    else:
-        transport = PythonEmriModel()
-    daemon = Daemon(transport)
-
     try:
-        if args.cmd == "inspect":
-            print(json.dumps(daemon.inspect(), indent=2))
-        elif args.cmd == "ps":
-            for r in daemon.ps():
-                print(
-                    f"region{r['region']:2d} healthy={r['healthy']} "
-                    f"{r['geometry']['cols']}x{r['geometry']['rows']} "
-                    f"({r['geometry']['tiles']} tiles)"
-                )
-        elif args.cmd == "run":
-            keys = [Path(k).read_bytes() for k in args.pubkey] or None
-            r = daemon.deploy_image(
-                Path(args.eth),
-                region=args.region,
-                frame_addr=args.frame_addr,
-                trusted_pubkeys=keys,
-                allow_unsigned=args.allow_unsigned,
-            )
-            print(
-                f"deployed region{r.region}: {r.words_written} words, "
-                f"{r.elapsed_s * 1000:.1f} ms"
-            )
-            if args.mode == "plan" and args.plan_out:
-                # recompute frames_words for the plan
-                frames_bytes = _extract_frames(
-                    Path(args.eth), _target_of(Path(args.eth))
-                )
-                words = [
-                    struct.unpack_from("<I", frames_bytes, i)[0]
-                    for i in range(0, len(frames_bytes), 4)
-                ]
-                plan = transport.to_plan(_name_of(Path(args.eth)), words, args.region)  # type: ignore[attr-defined]
-                Path(args.plan_out).write_text(json.dumps(plan, indent=2))
-                print(f"wrote deploy plan -> {args.plan_out}")
-        return 0
-    except (DaemonError, ethimg.EthimgError, capcheck.CapabilityError) as e:
+        return _run_session(args)
+    except (
+        DaemonError,
+        efp_client.EfpError,
+        ethimg.EthimgError,
+        capcheck.CapabilityError,
+    ) as e:
+        # A capability refusal names the offending entry in `e` (E2-SEC1).
         print(f"ethctl: error: {e}", file=sys.stderr)
         return 1
 

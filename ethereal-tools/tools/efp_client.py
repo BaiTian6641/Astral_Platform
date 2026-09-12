@@ -56,6 +56,7 @@ if _THIS_DIR not in sys.path:
 # pi-lens-ignore: E402
 import ethimg
 from emri_constants import (
+    CAPB_HAS_BMC,
     EFP_CMD_ABORT,
     EFP_CMD_NOP,
     EFP_CMD_RESTART,
@@ -85,23 +86,28 @@ from emri_constants import (
     EFP_S_RUNNING,
     EFP_S_STOPPED,
     EFP_S_VERIFY,
+    EMRI_MAGIC,
     IMG_DIGEST_WORDS,
     IMG_SIG_WORDS,
     R_CAP_DECL_IO,
     R_CAP_DECL_SVC,
+    R_CAPABILITIES,
     R_EFP_CMD,
     R_EFP_ERR,
     R_EFP_IMG_COLS,
     R_EFP_IMG_WORDS,
     R_EFP_REGION,
     R_EFP_STATUS,
+    R_HEALTH_STATUS,
     R_IMG_DIGEST,
     R_IMG_SIG,
+    R_MAGIC,
     R_NUM_REGIONS,
     R_OCC_FRAME_ADDR,
     R_OCC_STATUS,
     R_OCC_WDATA,
     R_OCC_WORD_COUNT,
+    R_PLATFORM_ID,
     R_REGION_INFO,
     R_REGION_SEL,
     R_SPI_CRC,
@@ -756,7 +762,7 @@ class EfpClient:
         s.ps(self.num_regions)
         return s.ops
 
-    def run_packed(self, eth_path_or_frames: Path | str | list,
+    def run_packed(self, eth_path_or_frames: Path | str | list[Any],
                    region: int = EFP_REGION_AUTO, *,
                    column_words: int | None = None,
                    trusted_pk: bytes | None = None,
@@ -876,10 +882,22 @@ class _Region:
 
 @dataclass
 class EfpDaemonModel:
-    """In-Python model of the EMRI EFP block + BMC daemon FSM + stub OCC."""
+    """In-Python model of the EMRI EFP block + BMC daemon FSM + stub OCC.
+
+    This is the **BMC** side of the EMRI ABI: the daemon FSM lives here, so the
+    identity/capability face reports ``CAPABILITIES.has_bmc=1`` (spec sec 1.1)
+    -- the field ethctl auto-detects on (E1-BMC4). ``has_bmc=False`` models a
+    device that answers the EFP block but is really an mFSM (no daemon), which
+    the host must refuse (spec sec 3.2).
+    """
 
     trusted_pk: bytes | None = None  # raw 32-byte Ed25519 public key
     num_regions: int = 2
+    has_bmc: bool = True  # CAPABILITIES.has_bmc (spec sec 1.1/2)
+    platform_id: int = 0x0000_0000
+    region_infos: dict[int, int] = field(
+        default_factory=lambda: {0: 0x0202_0010, 1: 0x0202_0010}
+    )
     _regs: dict[int, int] = field(default_factory=dict)
     _state: int = EFP_S_IDLE
     _busy: int = 0
@@ -904,6 +922,19 @@ class EfpDaemonModel:
 
     # ---- register face ----
     def read(self, addr: int) -> int:
+        # Identity/capability face: the SAME register map as the mFSM model
+        # (emri-v0.md sec 1.1) -- only CAPABILITIES.has_bmc differs, which is
+        # exactly what ethctl's session auto-detection probes (E1-BMC4).
+        if addr == R_MAGIC:
+            return EMRI_MAGIC
+        if addr == R_CAPABILITIES:
+            return (1 << CAPB_HAS_BMC) if self.has_bmc else 0
+        if addr == R_PLATFORM_ID:
+            return self.platform_id
+        if addr == R_HEALTH_STATUS:
+            return sum(1 << (8 * i) for i in range(self.num_regions))
+        if addr == R_REGION_INFO:
+            return self.region_infos.get(self._regs.get(R_REGION_SEL, 0) & 0xFF, 0)
         if addr == R_EFP_STATUS:
             return self._state | (self._busy << 4) | (self._done << 5)
         if addr == R_EFP_ERR:
@@ -913,6 +944,15 @@ class EfpDaemonModel:
         if addr == R_NUM_REGIONS:
             return self.num_regions
         return self._regs.get(addr, 0)
+
+    # ---- raw EMRI transport surface (ethctl's Transport protocol) ---------
+    def push(self, data: int) -> None:
+        """OCC_WDATA push (EFP-SPI op OCC_PUSH) -- same as writing 0x09."""
+        self.write(R_OCC_WDATA, data)
+
+    def read_status(self) -> int:
+        """OCC_STATUS convenience read (spec sec 4), as on the raw transport."""
+        return self.read(R_OCC_STATUS)
 
     def write(self, addr: int, data: int) -> None:
         if addr == R_EFP_CMD:

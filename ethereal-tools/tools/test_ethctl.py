@@ -26,6 +26,7 @@ if _SECURITY_DIR not in sys.path:
 import efp_client
 import ethimg
 from emri_constants import (
+    CAPB_HAS_BMC,
     EFP_CMD_RUN,
     EFP_CMD_RUN_PACKED,
     EFP_ERR_BAD_CMD,
@@ -54,6 +55,7 @@ from emri_constants import (
     OCC_WRITE,
     R_CAP_DECL_IO,
     R_CAP_DECL_SVC,
+    R_CAPABILITIES,
     R_EFP_CMD,
     R_EFP_ERR,
     R_EFP_IMG_COLS,
@@ -62,6 +64,7 @@ from emri_constants import (
     R_EFP_STATUS,
     R_IMG_DIGEST,
     R_IMG_SIG,
+    R_MON_NOTIFY,
     R_OCC_CMD,
     R_OCC_FRAME_ADDR,
     R_OCC_STATUS,
@@ -70,8 +73,13 @@ from emri_constants import (
 from ethctl import (
     Daemon,
     DaemonError,
+    EmriMode,
     PythonEmriModel,
     RecordTransport,
+    probe_mode,
+    require_bmc,
+    require_mfsm,
+    resolve_mode,
 )
 
 # pi-lens-ignore: E402
@@ -98,7 +106,7 @@ def _pkg_localparams() -> dict[str, str]:
     return out
 
 
-def test_emri_constants_match_pkg_sv():
+def test_emri_constants_match_pkg_sv() -> None:
     """Drift between emri_constants.py and emri_pkg.sv is a silent ABI break."""
     import emri_constants as ec
 
@@ -241,7 +249,7 @@ def daemon_model() -> tuple[Daemon, PythonEmriModel]:
     return Daemon(model), model
 
 
-def test_inspect(daemon_model):
+def test_inspect(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, _ = daemon_model
     info = daemon.inspect()
     assert info["magic_ok"] is True
@@ -250,7 +258,7 @@ def test_inspect(daemon_model):
     assert len(info["regions"]) == 2
 
 
-def test_ps(daemon_model):
+def test_ps(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, _ = daemon_model
     rows = daemon.ps()
     assert len(rows) == 2
@@ -258,7 +266,7 @@ def test_ps(daemon_model):
     assert rows[0]["region"] == 0
 
 
-def test_deploy_writes_all_words(daemon_model):
+def test_deploy_writes_all_words(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, model = daemon_model
     frames = b"".join(struct.pack("<I", 0x1000 + i) for i in range(8))
     r = daemon.deploy(frames, region=1, frame_addr=0x2000)
@@ -270,7 +278,7 @@ def test_deploy_writes_all_words(daemon_model):
     assert model._occ.store[7] == 0x1007
 
 
-def test_deploy_blank_first_default(daemon_model):
+def test_deploy_blank_first_default(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, model = daemon_model
     frames = struct.pack("<I", 0xABCDEF01)
     daemon.deploy(frames, region=0, frame_addr=0x100)
@@ -278,13 +286,13 @@ def test_deploy_blank_first_default(daemon_model):
     assert model._occ.status == OCC_S_DONE
 
 
-def test_deploy_rejects_non_word_aligned(daemon_model):
+def test_deploy_rejects_non_word_aligned(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, _ = daemon_model
     with pytest.raises(DaemonError):
         daemon.deploy(b"\x01\x02\x03", region=0)  # 3 bytes
 
 
-def test_deploy_rejects_empty(daemon_model):
+def test_deploy_rejects_empty(daemon_model: tuple[Daemon, PythonEmriModel]) -> None:
     daemon, _ = daemon_model
     with pytest.raises(DaemonError):
         daemon.deploy(b"", region=0)
@@ -293,7 +301,7 @@ def test_deploy_rejects_empty(daemon_model):
 # --------------------------------------------------------------------------- #
 # Record transport -> deploy plan (the SV TB input)
 # --------------------------------------------------------------------------- #
-def test_record_transport_produces_plan(tmp_path):
+def test_record_transport_produces_plan(tmp_path: Path) -> None:
     model = PythonEmriModel()
     daemon = Daemon(model)  # drive the model to produce side effects
     frames = b"".join(struct.pack("<I", i) for i in range(4))
@@ -316,7 +324,7 @@ def test_record_transport_produces_plan(tmp_path):
     json.loads(json.dumps(plan))
 
 
-def test_plan_has_blank_then_write_order(tmp_path):
+def test_plan_has_blank_then_write_order(tmp_path: Path) -> None:
     """The deploy plan MUST blank before write (FABulous red line)."""
     rec = RecordTransport()
     daemon = Daemon(rec)
@@ -334,7 +342,7 @@ def test_plan_has_blank_then_write_order(tmp_path):
 # --------------------------------------------------------------------------- #
 # end-to-end: ethimg pack -> ethctl deploy_image -> model
 # --------------------------------------------------------------------------- #
-def test_deploy_image_end_to_end(tmp_path):
+def test_deploy_image_end_to_end(tmp_path: Path) -> None:
     # build a tiny .eth
     src = tmp_path / "img"
     (src / "targets").mkdir(parents=True)
@@ -357,7 +365,7 @@ def test_deploy_image_end_to_end(tmp_path):
 # --------------------------------------------------------------------------- #
 # CLI smoke
 # --------------------------------------------------------------------------- #
-def test_cli_inspect_plan_mode(capsys):
+def test_cli_inspect_plan_mode(capsys: pytest.CaptureFixture[str]) -> None:
     from ethctl import _cli
 
     rc = _cli(["inspect"])
@@ -394,7 +402,7 @@ KAT_SIG_WORDS = [
 ]
 
 
-def _fixed_keypair():
+def _fixed_keypair() -> tuple[bytes, bytes]:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from gen_daemon_vectors import KEY_SEED
@@ -408,7 +416,7 @@ def _fixed_keypair():
     return pem, sk.public_key().public_bytes_raw()
 
 
-def _signed_eth(tmp_path: Path, name: str = "efp-img"):
+def _signed_eth(tmp_path: Path, name: str = "efp-img") -> tuple[Path, bytes, list[int]]:
     """Pack+sign image A (TFF, 12 words, v0 cfg-addr) with the daemon test key."""
     from gen_daemon_vectors import IMG_A_WORDS
 
@@ -438,7 +446,7 @@ def _daemon_pub_pem(tmp_path: Path) -> Path:
     return path
 
 
-def _signed_eth_with_caps(tmp_path: Path, caps_yaml: str, name: str):
+def _signed_eth_with_caps(tmp_path: Path, caps_yaml: str, name: str) -> tuple[Path, bytes]:
     """Pack+sign image A with an explicit capabilities.yaml body."""
     from gen_daemon_vectors import IMG_A_WORDS
 
@@ -454,12 +462,18 @@ def _signed_eth_with_caps(tmp_path: Path, caps_yaml: str, name: str):
     return out, pk_raw
 
 
+def _read_member(tf: tarfile.TarFile, name: str) -> bytes:
+    """Read a tar member's bytes (``extractfile`` is Optional in the stubs)."""
+    f = tf.extractfile(name)
+    return f.read() if f is not None else b""
+
+
 def _tamper_manifest_signature(eth_path: Path) -> None:
     """Flip the first hex nibble of the manifest signature (digest unchanged:
     ethimg's manifest_digest excludes the signature field)."""
     with tarfile.open(eth_path, "r") as tf:
         members = {
-            n: (tf.extractfile(n).read() if tf.extractfile(n) else b"")
+            n: _read_member(tf, n)
             for n in tf.getnames()
         }
     man = yaml.safe_load(members["manifest.yaml"])
@@ -484,7 +498,7 @@ def _set_eth_capabilities(eth_path: Path, caps_yaml: str) -> None:
 
     with tarfile.open(eth_path, "r") as tf:
         members = {
-            n: (tf.extractfile(n).read() if tf.extractfile(n) else b"")
+            n: _read_member(tf, n)
             for n in tf.getnames()
         }
     members["capabilities.yaml"] = caps_yaml.encode("utf-8")
@@ -502,7 +516,7 @@ def _set_eth_capabilities(eth_path: Path, caps_yaml: str) -> None:
             tf.addfile(info, io.BytesIO(data))
 
 
-def test_efp_digest_sig_byte_packing_kat():
+def test_efp_digest_sig_byte_packing_kat() -> None:
     """Word i = bytes[4i+3:4i] (LE in-word) — pinned to the E1-RUN2 vectors."""
     import hashlib
 
@@ -518,7 +532,7 @@ def test_efp_digest_sig_byte_packing_kat():
     assert efp_client.words_from_bytes(sig) == KAT_SIG_WORDS
 
 
-def test_efp_err_decode_all_codes():
+def test_efp_err_decode_all_codes() -> None:
     """EFP_ERR codes decode: v0.2 0-8, v0.4 9-10, v0.6 11-12."""
     expected = {
         EFP_ERR_NONE: "none",
@@ -541,7 +555,7 @@ def test_efp_err_decode_all_codes():
     assert efp_client.decode_err(13).startswith("unknown")
 
 
-def test_efp_state_decode_all():
+def test_efp_state_decode_all() -> None:
     for code, name in [
         (EFP_S_IDLE, "IDLE"), (EFP_S_LOAD, "LOAD"), (EFP_S_RUNNING, "RUNNING"),
         (EFP_S_ERROR, "ERROR"), (EFP_S_STOPPED, "STOPPED"),
@@ -550,7 +564,7 @@ def test_efp_state_decode_all():
     assert efp_client.decode_state(15).startswith("unknown")
 
 
-def test_efp_run_session_op_order(tmp_path):
+def test_efp_run_session_op_order(tmp_path: Path) -> None:
     """The run session must mirror spec sec 3.2 steps 1-6 exactly."""
     eth, pk, img_words = _signed_eth(tmp_path)
     client = efp_client.EfpClient()
@@ -596,7 +610,7 @@ def test_efp_run_session_op_order(tmp_path):
     assert len(ops) == 35
 
 
-def test_efp_run_happy_path_model(tmp_path):
+def test_efp_run_happy_path_model(tmp_path: Path) -> None:
     eth, pk, img_words = _signed_eth(tmp_path)
     client = efp_client.EfpClient()
     ops, _ = client.run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
@@ -617,7 +631,7 @@ _PACKED_COLUMNS = [
 ]
 
 
-def _signed_packed_eth(tmp_path: Path, columns, name: str = "efp-packed"):
+def _signed_packed_eth(tmp_path: Path, columns: list[list[int]], name: str = "efp-packed") -> tuple[Path, bytes]:
     """Pack+sign a PACKED image (per-column DATA words concatenated, CRC16
     tails excluded — the .eth packed-frames convention, spec sec 3.3)."""
     priv_pem, pk_raw = _fixed_keypair()
@@ -631,7 +645,7 @@ def _signed_packed_eth(tmp_path: Path, columns, name: str = "efp-packed"):
     return out, pk_raw
 
 
-def test_efp_run_packed_session_op_order(tmp_path):
+def test_efp_run_packed_session_op_order(tmp_path: Path) -> None:
     """The run_packed session must mirror spec sec 3.3: stage (+IMG_COLS),
     doorbell run_packed, per-column handshake + stream, terminal checks."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
@@ -678,7 +692,7 @@ def test_efp_run_packed_session_op_order(tmp_path):
     assert doc["nops"] == len(ops)
 
 
-def test_efp_run_packed_happy_path_model(tmp_path):
+def test_efp_run_packed_happy_path_model(tmp_path: Path) -> None:
     """run_packed drives the model daemon to RUNNING over 2 columns."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     client = efp_client.EfpClient()
@@ -693,7 +707,7 @@ def test_efp_run_packed_happy_path_model(tmp_path):
     assert model._streamed == sum(len(c) for c in _PACKED_COLUMNS)
 
 
-def test_efp_run_packed_bad_sig_rejected(tmp_path):
+def test_efp_run_packed_bad_sig_rejected(tmp_path: Path) -> None:
     """Tampered signature -> EFP_ERR=bad_sig, state ERROR (same as run)."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     img = efp_client.load_image(eth, trusted_pk=pk)
@@ -708,7 +722,7 @@ def test_efp_run_packed_bad_sig_rejected(tmp_path):
     assert model.region_state(0) == 0  # fabric untouched
 
 
-def test_efp_run_packed_geometry_validation(tmp_path):
+def test_efp_run_packed_geometry_validation(tmp_path: Path) -> None:
     """Client-side geometry checks (v0 homogeneous, region->column mapping)."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     client = efp_client.EfpClient()
@@ -731,7 +745,7 @@ def test_efp_run_packed_geometry_validation(tmp_path):
         client.run_packed([0] * 6, EFP_REGION_AUTO, column_words=4)
 
 
-def test_efp_busy_before_cmd_rejected(tmp_path):
+def test_efp_busy_before_cmd_rejected(tmp_path: Path) -> None:
     """A doorbell write while busy is ignored + flagged bad_cmd (spec 3.2)."""
     eth, pk, img_words = _signed_eth(tmp_path)
     img = efp_client.load_image(eth, trusted_pk=pk)
@@ -755,7 +769,7 @@ def test_efp_busy_before_cmd_rejected(tmp_path):
     assert model.read(R_EFP_ERR) & 0xFF == EFP_ERR_BAD_CMD
 
 
-def test_efp_bad_sig_rejected(tmp_path):
+def test_efp_bad_sig_rejected(tmp_path: Path) -> None:
     """Tampered signature -> EFP_ERR=bad_sig, state ERROR, region untouched."""
     eth, pk, _ = _signed_eth(tmp_path)
     img = efp_client.load_image(eth, trusted_pk=pk)
@@ -771,7 +785,7 @@ def test_efp_bad_sig_rejected(tmp_path):
     assert model.region_state(0) == 0  # still FREE: fabric untouched
 
 
-def test_efp_stop_restart_semantics(tmp_path):
+def test_efp_stop_restart_semantics(tmp_path: Path) -> None:
     eth, pk, _ = _signed_eth(tmp_path)
     client = efp_client.EfpClient()
     model = efp_client.EfpDaemonModel(trusted_pk=pk)
@@ -802,7 +816,7 @@ def test_efp_stop_restart_semantics(tmp_path):
     assert model.region_state(0) == 0
 
 
-def test_efp_ps_pure_read():
+def test_efp_ps_pure_read() -> None:
     ops = efp_client.EfpClient().ps()
     assert not any(o.addr == R_EFP_CMD for o in ops)  # ps never rings the bell
     assert ops[0].op == "read" and ops[0].addr == R_EFP_STATUS
@@ -812,7 +826,7 @@ def test_efp_ps_pure_read():
     assert reads[0] == EFP_S_IDLE  # fresh daemon: IDLE, not busy, not done
 
 
-def test_efp_session_json_self_describing(tmp_path):
+def test_efp_session_json_self_describing(tmp_path: Path) -> None:
     eth, pk, img_words = _signed_eth(tmp_path)
     ops, img = efp_client.EfpClient().run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
     text = efp_client.session_to_json(ops, name="run", image=img, region=0xFF)
@@ -834,7 +848,7 @@ def test_efp_session_json_self_describing(tmp_path):
             assert o["count"] == len(o["words"]) == len(img_words)
 
 
-def test_efp_build_demo_sessions(tmp_path):
+def test_efp_build_demo_sessions(tmp_path: Path) -> None:
     """The Makefile regen step: pack+sign .eth + ethctl-emitted session JSONs."""
     info = efp_client.build_demo_sessions(tmp_path / "gen")
     run = json.loads(Path(info["run"]).read_text())
@@ -842,7 +856,7 @@ def test_efp_build_demo_sessions(tmp_path):
     assert run["schema"] == stop["schema"] == "ethereal.efp-session.v0"
     streams = [o for o in run["ops"] if o["op"] == "stream"]
     assert len(streams) == 1 and streams[0]["count"] == 12
-    assert ethimg.read_manifest(info["eth"]).manifest_digest == info["digest"]
+    assert ethimg.read_manifest(Path(info["eth"])).manifest_digest == info["digest"]
     assert any(o.get("data") == "0x00000001" for o in run["ops"]
                if o["op"] == "write" and o["addr"] == "0x13")  # EFP_CMD=run
     assert any(o.get("data") == "0x00000002" for o in stop["ops"]
@@ -852,7 +866,7 @@ def test_efp_build_demo_sessions(tmp_path):
 # --------------------------------------------------------------------------- #
 # EFP CLI integration
 # --------------------------------------------------------------------------- #
-def test_cli_efp_run_emit_session(tmp_path, capsys):
+def test_cli_efp_run_emit_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from ethctl import _cli
 
     eth, _, _ = _signed_eth(tmp_path)
@@ -867,7 +881,7 @@ def test_cli_efp_run_emit_session(tmp_path, capsys):
     assert doc["schema"] == "ethereal.efp-session.v0"
 
 
-def test_cli_efp_stop_ps(tmp_path, capsys):
+def test_cli_efp_stop_ps(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from ethctl import _cli
 
     eth, _, _ = _signed_eth(tmp_path)
@@ -881,7 +895,7 @@ def test_cli_efp_stop_ps(tmp_path, capsys):
     assert "STOPPED" in capsys.readouterr().out
 
 
-def test_cli_efp_restart_without_staged_image(tmp_path, capsys):
+def test_cli_efp_restart_without_staged_image(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """restart on a device with no staged image -> bad_cmd (spec sec 3.2).
 
     (The sim model is per-process; a real BMC retains the staged metadata
@@ -903,7 +917,7 @@ def test_cli_efp_restart_without_staged_image(tmp_path, capsys):
                if o["op"] == "write" and o["addr"] == "0x13")
 
 
-def test_cli_efp_unsigned_run_rejected(tmp_path):
+def test_cli_efp_unsigned_run_rejected(tmp_path: Path) -> None:
     from ethctl import _cli
 
     src = tmp_path / "img"
@@ -915,7 +929,7 @@ def test_cli_efp_unsigned_run_rejected(tmp_path):
     assert rc == 1
 
 
-def test_cli_stop_needs_efp_transport(capsys):
+def test_cli_stop_needs_efp_transport(capsys: pytest.CaptureFixture[str]) -> None:
     from ethctl import _cli
 
     rc = _cli(["stop", "--region", "0"])
@@ -926,7 +940,7 @@ def test_cli_stop_needs_efp_transport(capsys):
 # --------------------------------------------------------------------------- #
 # E2-SEC1: host-side signature enforcement + capability pre-flight
 # --------------------------------------------------------------------------- #
-def test_efp_signed_image_matrices(tmp_path):
+def test_efp_signed_image_matrices(tmp_path: Path) -> None:
     """Signed images: trusted key ok, missing/wrong key refused, opt-out ok."""
     eth, pk, _ = _signed_eth(tmp_path)
     assert efp_client.load_image(eth, trusted_pk=pk).signed is True
@@ -939,7 +953,7 @@ def test_efp_signed_image_matrices(tmp_path):
     assert opted.signed is True and opted.sig64 != bytes(64)
 
 
-def test_efp_unsigned_image_rejected_by_default(tmp_path):
+def test_efp_unsigned_image_rejected_by_default(tmp_path: Path) -> None:
     src = tmp_path / "img"
     (src / "targets").mkdir(parents=True)
     (src / "targets" / "efab-1.0.frames").write_bytes(struct.pack("<I", 1))
@@ -951,14 +965,14 @@ def test_efp_unsigned_image_rejected_by_default(tmp_path):
     assert img.signed is False and img.sig64 == bytes(64)
 
 
-def test_efp_tampered_signature_rejected(tmp_path):
+def test_efp_tampered_signature_rejected(tmp_path: Path) -> None:
     eth, pk, _ = _signed_eth(tmp_path)
     _tamper_manifest_signature(eth)
     with pytest.raises(ethimg.SignatureError, match="did not verify"):
         efp_client.load_image(eth, trusted_pk=pk)
 
 
-def test_efp_capabilities_staged_and_ordered(tmp_path):
+def test_efp_capabilities_staged_and_ordered(tmp_path: Path) -> None:
     eth, pk = _signed_eth_with_caps(
         tmp_path,
         "io:\n  - {group: 1, dir: out}\n  - {group: 7, dir: inout}\n"
@@ -981,7 +995,7 @@ def test_efp_capabilities_staged_and_ordered(tmp_path):
     assert ops.index(cap_writes[1]) < doorbell
 
 
-def test_efp_over_declared_io_group_denied(tmp_path):
+def test_efp_over_declared_io_group_denied(tmp_path: Path) -> None:
     eth, pk = _signed_eth_with_caps(
         tmp_path, "io:\n  - {group: 200, dir: out}\nservices: []\n",
         name="efp-caps-big",
@@ -992,7 +1006,7 @@ def test_efp_over_declared_io_group_denied(tmp_path):
     assert "200" in str(ei.value)
 
 
-def test_efp_unknown_service_denied(tmp_path):
+def test_efp_unknown_service_denied(tmp_path: Path) -> None:
     eth, pk = _signed_eth_with_caps(
         tmp_path, "io: []\nservices:\n  - {name: can0, access: r}\n",
         name="efp-caps-svc",
@@ -1001,7 +1015,7 @@ def test_efp_unknown_service_denied(tmp_path):
         efp_client.load_image(eth, trusted_pk=pk)
 
 
-def test_efp_malformed_capabilities_rejected(tmp_path):
+def test_efp_malformed_capabilities_rejected(tmp_path: Path) -> None:
     """A malformed member fails stage-1 schema even before the trust gate."""
     bad_dir, pk = _signed_eth_with_caps(
         tmp_path, "io:\n  - {group: 0, dir: in}\nservices: []\n",
@@ -1021,7 +1035,7 @@ def test_efp_malformed_capabilities_rejected(tmp_path):
         efp_client.load_image(dup, trusted_pk=pk2)
 
 
-def test_cli_efp_capability_denied_is_actionable(tmp_path, capsys):
+def test_cli_efp_capability_denied_is_actionable(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     from ethctl import _cli
 
     eth, _ = _signed_eth_with_caps(
@@ -1040,7 +1054,7 @@ def test_cli_efp_capability_denied_is_actionable(tmp_path, capsys):
 # --------------------------------------------------------------------------- #
 # OCC_FRAME_ADDR v0.6 (E1-DMO2b): per-column addressing must not alias
 # --------------------------------------------------------------------------- #
-def test_occ_frame_addr_v06_column_addressing():
+def test_occ_frame_addr_v06_column_addressing() -> None:
     assert efp_client.region_frame_base(0) == 0x0000
     assert efp_client.region_frame_base(3) == 0x3000
     assert efp_client.column_frame_base(0, 0) == 0x0000
@@ -1048,7 +1062,7 @@ def test_occ_frame_addr_v06_column_addressing():
     assert efp_client.column_frame_base(1, 2) == 0x1200
 
 
-def test_occ_frame_addr_column_windows_do_not_overlap():
+def test_occ_frame_addr_column_windows_do_not_overlap() -> None:
     """A 68-word frame at col 0 and col 1 land in disjoint ranges (v0.6)."""
     c0 = efp_client.column_frame_range(0, 0, 68)
     c1 = efp_client.column_frame_range(0, 1, 68)
@@ -1060,7 +1074,7 @@ def test_occ_frame_addr_column_windows_do_not_overlap():
         efp_client.column_frame_range(0, 0, 257)
 
 
-def test_efp_run_packed_two_columns_address_each_column(tmp_path):
+def test_efp_run_packed_two_columns_address_each_column(tmp_path: Path) -> None:
     """The daemon mirror arms OCC_FRAME_ADDR = region_base | (col << 8)."""
     eth, pk = _signed_packed_eth(tmp_path, _PACKED_COLUMNS)
     ops, _ = efp_client.EfpClient().run_packed(
@@ -1078,7 +1092,7 @@ def test_efp_run_packed_two_columns_address_each_column(tmp_path):
 # --------------------------------------------------------------------------- #
 # EFP-SPI framing (spec sec 7 request frames + sec 7.1 CRC16 tail op)
 # --------------------------------------------------------------------------- #
-def test_spi_frame_encoding_kat():
+def test_spi_frame_encoding_kat() -> None:
     """Exact wire bytes: OP | ADDR (BE16) | DATA (BE32), 7 bytes."""
     import emri_constants as ec
 
@@ -1096,7 +1110,7 @@ def test_spi_frame_encoding_kat():
     assert frames[3] == bytes([0x03, 0x00, 0x09, 0x11, 0x22, 0x33, 0x44])
 
 
-def test_spi_crc16_known_vector():
+def test_spi_crc16_known_vector() -> None:
     """CRC-16/CCITT-FALSE check vector + frame_map algorithm identity."""
     import frame_map
 
@@ -1108,7 +1122,7 @@ def test_spi_crc16_known_vector():
         efp_client.crc16_bytes(b"12345678")
 
 
-def test_spi_crc_tail_op_placement():
+def test_spi_crc_tail_op_placement() -> None:
     """run_packed: WR SPI_CRC(crc16 of ALL stream words) immediately precedes
     the EFP_CMD doorbell frame (spec sec 7.1 step 3 ordering)."""
     import emri_constants as ec
@@ -1136,7 +1150,7 @@ def test_spi_crc_tail_op_placement():
     ]
 
 
-def test_spi_no_crc_frame_without_run():
+def test_spi_no_crc_frame_without_run() -> None:
     """stop/ps sessions carry no SPI_CRC latch (no stream follows)."""
     s = efp_client.EfpSession()
     s.stop(0)
@@ -1145,7 +1159,7 @@ def test_spi_no_crc_frame_without_run():
     assert any(f == bytes([0x01, 0x00, 0x13, 0, 0, 0, 2]) for f in frames)  # stop
 
 
-def test_spi_status_and_err_decode():
+def test_spi_status_and_err_decode() -> None:
     import emri_constants as ec
 
     assert efp_client.decode_spi_status(ec.SPI_STAT_OK) == "OK"
@@ -1155,3 +1169,199 @@ def test_spi_status_and_err_decode():
     assert efp_client.decode_spi_status(ec.SPI_STAT_CRC_ERR) == "CRC_ERR"
     assert efp_client.decode_spi_status(ec.SPI_STAT_NOT_READY) == "NOT_READY"
     assert efp_client.decode_err(ec.EFP_ERR_CRC_TRANSPORT) == "crc_transport"
+
+
+# --------------------------------------------------------------------------- #
+# E1-BMC4: session-mode auto-detection (BMC vs mFSM) + mode-dependent semantics
+#
+# emri-v0.md: both implementations share one register map and one transport;
+# the ONLY probe field that differs is CAPABILITIES.has_bmc (sec 1.1). What
+# differs is where the session intelligence lives (sec 8) — so the tests below
+# flip that single bit and assert ethctl's flow follows it, plus the refusal
+# paths for asking the wrong side for a command it cannot serve.
+# --------------------------------------------------------------------------- #
+class _CapsTransport:
+    """EMRI transport whose CAPABILITIES word is settable — the probe seam.
+
+    Everything else is the ordinary :class:`PythonEmriModel`, so a test can
+    flip the detected mode without changing any other register: exactly the
+    spec sec 1.1 property that makes auto-detection a single read.
+    """
+
+    def __init__(self, caps: int) -> None:
+        self.caps = caps
+        self.inner = PythonEmriModel()
+        self.writes: list[tuple[int, int]] = []
+
+    def read(self, addr: int) -> int:
+        if addr == R_CAPABILITIES:
+            return self.caps
+        return self.inner.read(addr)
+
+    def write(self, addr: int, data: int) -> None:
+        self.writes.append((addr, data))
+        self.inner.write(addr, data)
+
+    def push(self, data: int) -> None:
+        self.inner.push(data)
+
+    def read_status(self) -> int:
+        return self.inner.read_status()
+
+
+def test_mode_probe_is_capabilities_has_bmc() -> None:
+    """Auto-detection reads CAPABILITIES.has_bmc (bit0) and no other bit."""
+    assert probe_mode(_CapsTransport(0x00)) is EmriMode.MFSM
+    assert probe_mode(_CapsTransport(1 << CAPB_HAS_BMC)) is EmriMode.BMC
+    # has_dma/has_i2c_mon/has_trng/has_jtag_dbg are capabilities, not the mode
+    assert probe_mode(_CapsTransport(0b1_1110)) is EmriMode.MFSM
+
+
+def test_mode_override_pins_semantics() -> None:
+    """The documented --transport override wins; auto follows the probe."""
+    bmc = _CapsTransport(1 << CAPB_HAS_BMC)
+    assert resolve_mode(bmc, None) is EmriMode.BMC
+    assert resolve_mode(bmc, EmriMode.MFSM) is EmriMode.MFSM
+    assert Daemon(bmc, mode_override=EmriMode.MFSM).mode() is EmriMode.MFSM
+    assert Daemon(_CapsTransport(0)).mode() is EmriMode.MFSM
+
+
+def test_require_bmc_and_require_mfsm_guards() -> None:
+    """The two mode guards fire only on the mode that cannot serve the call."""
+    require_bmc(EmriMode.BMC, "x")  # no-op on a BMC
+    with pytest.raises(DaemonError, match="--transport efp"):
+        require_bmc(EmriMode.MFSM, "'stop'")
+    require_mfsm(EmriMode.MFSM, "x")  # no-op on an mFSM
+    with pytest.raises(DaemonError, match="mFSM-only"):
+        require_mfsm(EmriMode.BMC, "the host-driven OCC deploy")
+
+
+def test_deploy_auto_refuses_bmc_device() -> None:
+    """An auto-detected BMC is refused before any OCC write (spec sec 8)."""
+    dev = _CapsTransport(1 << CAPB_HAS_BMC)
+    daemon = Daemon(dev)
+    assert daemon.mode() is EmriMode.BMC
+    assert daemon.is_mfsm_mode() is False
+    with pytest.raises(DaemonError, match="mFSM-only"):
+        daemon.deploy(struct.pack("<I", 0xDEADBEEF), region=0)
+    assert dev.writes == []  # fail-closed: no OCC_CMD / WDATA behind the daemon
+
+
+def test_mfsm_deploy_notifies_anomaly_monitor() -> None:
+    """mFSM: the HOST posts MON_NOTIFY bit r on a completed deploy (sec 3.8)."""
+    rec = RecordTransport()
+    res = Daemon(rec).deploy(struct.pack("<I", 0xCAFEF00D), region=1)
+    assert res.words_written == 1
+    notes = [t.data for t in rec.log if t.op == "wr" and t.addr == R_MON_NOTIFY]
+    assert notes == [1 << 1]
+    # ... and it is the host that arms the OCC in mFSM mode (sec 8)
+    assert len([t for t in rec.log if t.addr == R_OCC_CMD]) == 2  # BLANK + WRITE
+
+
+def test_bmc_session_leaves_occ_and_monitor_to_the_daemon(tmp_path: Path) -> None:
+    """BMC: the host neither arms OCC_CMD nor notifies — the daemon does."""
+    eth, pk, _ = _signed_eth(tmp_path)
+    ops, _img = efp_client.EfpClient().run_image(eth, EFP_REGION_AUTO, trusted_pk=pk)
+    wrote = {op.addr for op in ops if op.op == "write"}
+    assert R_OCC_CMD not in wrote
+    assert R_MON_NOTIFY not in wrote
+    # the host's only OCC involvement is the LOAD word stream (sec 3.2 step 5)
+    assert any(op.op == "stream" and op.addr == R_OCC_WDATA for op in ops)
+
+
+def test_inspect_is_identical_across_modes() -> None:
+    """spec sec 8 acceptance: inspect matches on the fields both modes expose."""
+    mfsm = Daemon(PythonEmriModel()).inspect()
+    bmc = Daemon(efp_client.EfpDaemonModel()).inspect()
+    assert mfsm["mode"] == "mfsm" and bmc["mode"] == "bmc"
+    assert mfsm["has_bmc"] is False and bmc["has_bmc"] is True
+    drop = ("mode", "has_bmc")
+    shared = {k: v for k, v in mfsm.items() if k not in drop}
+    assert shared == {k: v for k, v in bmc.items() if k not in drop}
+    assert shared["magic_ok"] is True
+    assert shared["regions"] == [0x0202_0010, 0x0202_0010]
+
+
+def test_cli_inspect_reports_detected_mode(capsys: pytest.CaptureFixture[str]) -> None:
+    from ethctl import _cli
+
+    assert _cli(["inspect"]) == 0
+    out = capsys.readouterr().out
+    assert '"mode": "mfsm"' in out and '"has_bmc": false' in out
+    assert _cli(["--device", "bmc", "inspect"]) == 0
+    out = capsys.readouterr().out
+    assert '"mode": "bmc"' in out and '"has_bmc": true' in out
+
+
+def test_cli_auto_detects_bmc_device_and_runs_efp_session(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--device bmc + auto (default): the probe picks the EFP mailbox."""
+    from ethctl import _cli
+
+    eth, _pk, img_words = _signed_eth(tmp_path)
+    pub = _daemon_pub_pem(tmp_path)
+    rc = _cli(["--device", "bmc", "run", str(eth), "--region", "auto",
+               "--pubkey", str(pub)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RUNNING" in out and "err=none" in out
+    assert f"({len(img_words)} words" in out
+
+
+def test_cli_auto_keeps_mfsm_device_host_driven(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--device emri + auto (default): the host drives the OCC itself."""
+    from ethctl import _cli
+
+    eth, _pk, _words = _signed_eth(tmp_path)
+    pub = _daemon_pub_pem(tmp_path)
+    out_path = tmp_path / "plan.json"
+    rc = _cli(["--plan-out", str(out_path), "run", str(eth), "--region", "0",
+               "--pubkey", str(pub)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "(mode=mfsm)" in out
+    txn = json.loads(out_path.read_text())["txn_log"]
+    assert [t["data"] for t in txn if t["addr"] == R_MON_NOTIFY] == [1]
+    assert any(t["addr"] == R_OCC_CMD for t in txn)
+
+
+def test_cli_bmc_only_commands_refused_on_mfsm(capsys: pytest.CaptureFixture[str]) -> None:
+    """Auto-detected mFSM: daemon lifecycle commands are refused with the fix."""
+    from ethctl import _cli
+
+    for argv in (["stop", "--region", "0"], ["restart", "no-such.eth"], ["abort"]):
+        assert _cli(argv) == 1, argv
+        err = capsys.readouterr().err
+        assert "--transport efp" in err
+        assert "CAPABILITIES.has_bmc=0" in err and "mFSM" in err
+
+
+def test_cli_daemon_only_flags_refused_on_mfsm(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--region auto / --emit-session are daemon features (spec sec 3.2)."""
+    from ethctl import _cli
+
+    eth, _pk, _words = _signed_eth(tmp_path)
+    sess = tmp_path / "s.json"
+    assert _cli(["run", str(eth), "--region", "auto"]) == 1
+    assert "--transport efp" in capsys.readouterr().err
+    assert _cli(["run", str(eth), "--region", "0", "--emit-session", str(sess)]) == 1
+    assert "--transport efp" in capsys.readouterr().err
+    assert not sess.exists()
+
+
+def test_cli_forced_path_contradicting_the_device_fails_closed(capsys: pytest.CaptureFixture[str]) -> None:
+    """A pinned --transport that contradicts the probe must not silently run."""
+    from ethctl import _cli
+
+    assert _cli(["--device", "emri", "--transport", "efp", "ps"]) == 1
+    err = capsys.readouterr().err
+    assert "CAPABILITIES.has_bmc=0" in err and "--transport efp" in err
+    assert _cli(["--device", "bmc", "--transport", "mfsm", "ps"]) == 1
+    assert "mFSM-only" in capsys.readouterr().err
+
+
+def test_cli_legacy_transport_efp_still_selects_the_bmc_device(capsys: pytest.CaptureFixture[str]) -> None:
+    """Compat: `--transport efp` alone runs the BMC session exactly as before."""
+    from ethctl import _cli
+
+    assert _cli(["--transport", "efp", "ps"]) == 0
+    assert "daemon: state=IDLE" in capsys.readouterr().out
