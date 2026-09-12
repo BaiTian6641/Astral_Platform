@@ -3,7 +3,7 @@
 # =============================================================================
 # Reproducible simulation + open-source EDA environment for Phase 0+:
 #   * Verilator  v5.028      RTL lint (--lint-only -Wall, project rule G1) + sim
-#   * Yosys      yosys-0.59  synthesis + techlib mapping (ethereal mapper, E0-MAP1)
+#   * Yosys      v0.59       synthesis + techlib mapping (ethereal mapper, E0-MAP1)
 #   * VPR / VTR  v8.0.0      pack / place / route (MAP route A, E0-MAP2)
 #   * cocotb + cocotb-test   Python-driven testbenches / BFMs (ethereal-fabric/tb)
 #   * Python 3.12 + ruff + mypy --strict   ethereal-tools toolchain (G1)
@@ -28,6 +28,19 @@
 # the authoring environment; the maintainer runs `make docker-build` and
 # pastes results. If VPR v8.0.0 fails on this base, see §"Fallback" notes
 # below each RUN.
+# CI EVIDENCE (2026-09-12, GitHub run 34696652313 — the first real run of
+# .github/workflows/lint-and-test.yml): step 4 "Build sim Docker image" failed
+# after 53 s, i.e. inside the FIRST apt layer, long before any source build.
+# Cause: the pinned `python3.12-distutils` is not published by the deadsnakes
+# jammy PPA (Python 3.12 dropped distutils; the PPA ships *-distutils only up to
+# 3.11), so apt aborts with "Unable to locate package". Two further defects would
+# have failed the same step later: `yosys-0.59` is not an upstream tag (0.59 is
+# tagged `v0.59`), and the workflow's 30-min job timeout is shorter than the
+# 45-90 min cold build documented above. All three are fixed here / in the
+# workflow. The toolchain pins themselves (Verilator v5.028, Yosys v0.59,
+# VPR/VTR v8.0.0, cocotb 1.9.x, Python 3.12) are unchanged, and every tag/URL
+# kept was re-checked reachable on 2026-09-12. Full write-up:
+# docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -40,11 +53,16 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # ---- 1. System build prerequisites ------------------------------------------------
 # deadsnakes PPA provides python3.12 on Ubuntu 22.04 (which ships 3.10).
+# `gawk` + `pkg-config` are Yosys build deps (upstream README's apt line); without
+# them yosys still builds but falls back to guessed ffi/tcl flags. `libtbb-dev` is
+# what VPR's cmake looks for (find_package(TBB)) so VPR_EXECUTION_ENGINE=auto can
+# pick the parallel router instead of the serial fallback.
+# The python3.12 group deliberately has NO `python3.12-distutils` — see CI EVIDENCE.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl wget git make cmake ninja-build \
         software-properties-common gnupg \
-        autoconf flex bison ccache \
-        libfl-dev libgoogle-perftools-dev libjemalloc-dev \
+        autoconf flex bison ccache gawk pkg-config \
+        libfl-dev libgoogle-perftools-dev libjemalloc-dev libtbb-dev \
         zlib1g-dev liblz4-dev libreadline-dev \
         graphviz help2man perl \
         libffi-dev libftdi1-dev libusb-1.0-0-dev \
@@ -52,7 +70,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-venv python3.12-distutils \
+        python3.12 python3.12-dev python3.12-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Make python3.12 the default `python3`, then bootstrap pip for it.
@@ -73,10 +91,13 @@ RUN git clone --depth 1 --branch ${VERILATOR_TAG} https://github.com/verilator/v
     && rm -rf /tmp/verilator \
     && verilator --version
 
-# ---- 3. Yosys yosys-0.59 ----------------------------------------------------------
+# ---- 3. Yosys v0.59 ----------------------------------------------------------
 # Full clone (not --depth 1) because we must checkout the tag then re-sync the
 # ABC / abc plugins submodules to that tag's pinned commits.
-ARG YOSYS_TAG=yosys-0.59
+# Upstream tag naming changed over time: `yosys-<ver>` up to yosys-0.44, bare
+# `0.45`-`0.47`, then `v<ver>` from v0.48 on. Release 0.59 is tagged `v0.59`;
+# `yosys-0.59` does not exist and fails the clone (see CI EVIDENCE above).
+ARG YOSYS_TAG=v0.59
 RUN git clone https://github.com/YosysHQ/yosys.git /tmp/yosys \
     && cd /tmp/yosys \
     && git checkout ${YOSYS_TAG} \
@@ -91,6 +112,8 @@ RUN git clone https://github.com/YosysHQ/yosys.git /tmp/yosys \
 # Heaviest + most compiler-sensitive build. Isolated in its own RUN layer so it
 # is cached and can be rebuilt independently. `make` at the cmake build root
 # builds every target; vpr lands at build/vpr/vpr — copy it onto PATH.
+# libtbb-dev (layer 1) is picked up by find_package(TBB), so the VTR/VPR
+# "auto" execution engine selects the parallel router rather than the serial one.
 # Fallback if v8.0.0 fails on this GCC: try Ubuntu 24.04 + GCC 13 with a newer
 # VTR release candidate, or pin a known-good commit; document in the E0-INF3
 # report before changing the tag.

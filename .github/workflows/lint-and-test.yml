@@ -18,6 +18,16 @@
 # Actions runners. The Makefile targets (`make lint`, `make test`) and the sim Docker
 # image are defined by E0-INF3 per the shared contract; locally this environment has
 # neither docker nor the toolchain, so YAML parse-validation is the only check here.
+# HISTORY (2026-09-12): the first real run of this workflow (run 34696652313, on
+# 69ba9c3) failed at step 4 "Build sim Docker image" after 53 s — i.e. inside the
+# image's first apt layer, before any source build. Root cause was in
+# docker/Dockerfile (`python3.12-distutils` is not published for jammy by the
+# deadsnakes PPA; `yosys-0.59` is not an upstream tag either) — both fixed there.
+# This workflow itself needed two fixes: the 30-min job timeout cannot fit the
+# 45-90 min cold source build documented in the Dockerfile (and a hosted runner
+# has 4 vCPUs, not a laptop's), and a fresh runner has no layer cache, so every
+# push would pay that cost again. See
+# docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md.
 
 name: Lint and Test
 
@@ -47,7 +57,7 @@ jobs:
   sim:
     name: Verilator lint + cocotb regression (in sim Docker)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,11 +81,40 @@ jobs:
 
       # NOTE: From here on every step HARD-FAILS (no continue-on-error). The `if:`
       # guard just skips them when the Dockerfile is absent during early bootstrap.
-      - name: Build sim Docker image
+      - name: Free disk space
         if: steps.prereq.outputs.skip != 'true'
         run: |
           set -euo pipefail
-          docker build -f docker/Dockerfile -t ethereal-sim docker/
+          # Verilator + Yosys + VTR are three source builds: sources, build trees,
+          # the layer cache and the loaded image need more room than a hosted
+          # runner has left once the preinstalled SDKs are counted. Drop the ones
+          # CI does not use (plain shell, no third-party action — same
+          # supply-chain rule as dco.yml).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Docker Buildx
+        if: steps.prereq.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build sim Docker image
+        if: steps.prereq.outputs.skip != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          # Exactly the documented Makefile-contract invocation:
+          #   docker build -f docker/Dockerfile -t ethereal-sim docker/
+          # (build-push-action passes `file` straight through as --file, resolved
+          # against the workspace root, and `context` as the position arg.)
+          context: docker/
+          file: docker/Dockerfile
+          tags: ethereal-sim:latest
+          # `load` puts the image in the local daemon so the two `docker run`
+          # steps below (make lint / make test) work unchanged.
+          load: true
+          # GHA layer cache: without it every push recompiles all three tools
+          # from scratch on a fresh runner (the 45-90 min cold build above).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Verilator lint (make lint)
         if: steps.prereq.outputs.skip != 'true'

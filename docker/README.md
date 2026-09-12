@@ -40,7 +40,7 @@ run inside the Docker image.)
 | Tool | Version | Tag / source | Why this pin |
 |---|---|---|---|
 | **Verilator** | **5.028** | `v5.028` (github.com/verilator/verilator) | Maintainer-suggested stable; widely deployed; contemporaneous with Ubuntu 22.04 / GCC 11. Drives rule G1 (`--lint-only -Wall`) + cycle sim. |
-| **Yosys** | **0.59** | `yosys-0.59` (github.com/YosysHQ/yosys) | Stable in the 0.5x series with solid SystemVerilog support; ISC-licensed; used by the fabric techlib mapper (`E0-MAP1`). |
+| **Yosys** | **0.59** | `v0.59` (github.com/YosysHQ/yosys) | Stable in the 0.5x series with solid SystemVerilog support; ISC-licensed; used by the fabric techlib mapper (`E0-MAP1`). Tag naming moved over time (`yosys-<ver>` ≤ yosys-0.44, bare `0.45`-`0.47`, `v<ver>` from v0.48 on) — release 0.59 is tagged `v0.59`, and a wrong tag name fails the clone outright. |
 | **VPR / VTR** | **8.0.0** | `v8.0.0` (github.com/verilog-to-routing/vtr-verilog-to-routing) | MIT-licensed; the canonical academic P&R for the MAP route A toolchain (`E0-MAP2`). Released ~2022, matches the GCC-11 base. |
 | **cocotb** | **1.9.x** | `pip` | Stable series with reliable Verilator `--timing` support for `Clock` / `RisingEdge` triggers. |
 | **cocotb-test** | latest | `pip` | Lets CI run cocotb through pytest (`E0-INF2`). |
@@ -54,6 +54,16 @@ run inside the Docker image.)
 > VPR, and Docker itself is absent). The maintainer must run `make docker-build`
 > once and paste results; if any tag fails, see the per-RUN fallback notes in
 > [`Dockerfile`](Dockerfile) and update the report.
+>
+> **UPDATE (2026-09-12, first real CI run `34696652313`)**: the `docker build`
+> step failed after 53 s — inside the image's **first apt layer**, before any
+> source build. Two pinned names did not exist: `python3.12-distutils` (not
+> published for jammy by the deadsnakes PPA — Python 3.12 dropped distutils) and
+> the Yosys tag `yosys-0.59` (correct tag: `v0.59`). Both are fixed in
+> [`Dockerfile`](Dockerfile); every tag/URL kept was re-verified reachable.
+> The image is **still not built locally** (this environment has no Docker), so
+> "does it compile" is answered by CI. Full write-up:
+> [`docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md`](../docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md).
 
 ---
 
@@ -65,6 +75,9 @@ mount path stay consistent:
 ```bash
 make docker-build      # docker build -f docker/Dockerfile -t ethereal-sim docker/   (~45-90 min cold; cached after)
 make docker-shell      # interactive bash, repo bind-mounted at /work
+# NOTE: CI does not shell out to `make docker-build`; it runs the same build via
+# docker/build-push-action with a GHA layer cache, so only the first push pays the
+# cold build (.github/workflows/lint-and-test.yml, `sim` job).
 # then, inside the container:
 make help              # list targets
 make lint              # verilator --lint-only -Wall over all ethereal-fabric/ + ethereal-shell/ RTL

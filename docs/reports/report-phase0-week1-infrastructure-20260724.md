@@ -14,7 +14,7 @@
 | **E0-INF1** | 8 仓库骨架（许可证/DCO/CONTRIBUTING） | ✅ | 7 个新顶层仓 + `docs/` 补全；48 个文件；LICENSE 逐仓核实（见 §2） |
 | **S04-P0#1** | Mailbox RTL 导出与移植注记 | ✅⚠️ | 14 RTL + 1 spec 迁入 `ethereal-shell/`，全文件 CERN-OHL-S-2.0 + 出处头；注记含授权说明。⚠️ `verilator --lint-only -Wall` 未跑（本地无 verilator/docker，Docker-gated） |
 | **E0-INF3** | 仿真环境 Dockerfile + Makefile | ✅⚠️ | `docker/Dockerfile`（pin: Verilator v5.028 / Yosys 0.59 / VPR v8.0.0 / cocotb 1.9 / Py3.12）+ 根 `Makefile` + 冒烟测试。⚠️ `docker build` 未在本地验证（无 docker，Docker-gated） |
-| **E0-INF2** | CI 骨架（lint+cocotb+docs+DCO） | ✅ | `.github/workflows/{lint-and-test,docs,dco}.yml`；YAML 解析通过；含"无 Dockerfile 则跳过并保持绿"的守卫 |
+| **E0-INF2** | CI 骨架（lint+cocotb+docs+DCO） | ✅⚠️ | `.github/workflows/{lint-and-test,docs,dco}.yml`；YAML 解析通过；含"无 Dockerfile 则跳过并保持绿"的守卫。⚠️ **2026-09-12 首次真实运行（run 34696652313）失败**：`sim` job 的 `Build sim Docker image` 因 Dockerfile 第 1 层 pin 了不存在的 `python3.12-distutils`（＋ Yosys tag 写错、job timeout 过短）而中止 —— 定位与修复见 `docs/reports/report-E0-INF2-ci-docker-build-fix-20260912.md`；"CI 变绿"仍待维护者下一次 push |
 
 > ⚠️ 含义：**已交付文件、结构正确、可在本地验证项已过**；**Docker-gated 项（真实 `docker build` / `verilator --lint-only -Wall` / cocotb 运行）需维护者在装好 Docker 的机器上 `make docker-build && make lint && make test` 后回填结果**（本地环境无 `docker/verilator/yosys/vpr/gh`）。
 
