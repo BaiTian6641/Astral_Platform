@@ -644,7 +644,7 @@ tasks:
     est_days: 45
     deliverable: ethereal-shell/rtl/dma/eth_dma_2d.sv
     acceptance: 2D block move + blit/fill TB 通过（VDMA 风格寄存器模型）
-    status: in_progress   # 2026-09-13 启动: 依赖 E2-DMA1（eth_dma_mc，绿）已完成；本轮为可纯本机验证的下一项（ND-strided + blit/fill/ROP + VDMA 风格寄存器模型 + 自检 TB 与负控；Makefile 由主控接线）
+    status: done   # 2026-09-13 收官: `eth_dma_2d_addr.sv`（ND-strided 行走器，N<=3，65 位窗口+AXI 空间护栏，A_IDLE/A_RUN/A_DONE/A_FAULT，abort 停靠）+ `eth_dma_2d.sv`（VDMA 风格 4 KiB CSR 窗口：控制/状态/MODE/ROP/COLOUR/CFG/VERSION + 几何 + 窗口护栏 + 源/目的 base/line_stride/plane_stride + 计数器；MOVE/FILL/BLIT 与 16 种 ROP；帧参数在 START 影子化=双缓冲；无乘法器增量行走；64 位进位**拒绝而非截断**）。验收：TB **checks=159 errors=0 / TEST PASSED**（T0 寄存器模型含 EN=0 时 START 被忽略且零总线活动、T1 MOVE、T2 BLIT 全 16 ROP、T3 FILL 三平面、T4 4 KiB 跨界行、T5 CFG/RANGE/DECERR、T6 ABORT、T7 校验灵敏度、T8 AXI 协议+窗口监视器）；**变异负控**（TB 不变）：窗口护栏禁用→10 错（监视器抓到突发越窗）、ROP 被忽略→26、几何校验禁用→18、原始→0；形式化 `eth_dma_2d_addr.sby` prove（basecase + **无界时序归纳**）+3/3 cover；lint 0 警告无豁免；`eth_dma_pkg.sv` **纯增量（75 行插入 0 删除）** ⇒ 1D 侧逐位不变。规范冻结建议见报告 §5（本任务不改 spec）
 
   - id: E2-AXI2
     title: eth_axi_xbar v0.1 burst 扩展（AxLEN/AxSIZE/AxBURST/WLAST/RLAST 贯通）

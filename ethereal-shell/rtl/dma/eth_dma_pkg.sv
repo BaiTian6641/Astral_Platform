@@ -117,6 +117,8 @@ package eth_dma_pkg;
     localparam logic [3:0] DMA_ERR_SLVERR = 4'd2;  // AXI SLVERR / protocol
     localparam logic [3:0] DMA_ERR_DESC   = 4'd3;  // malformed descriptor
     localparam logic [3:0] DMA_ERR_ABORT  = 4'd4;  // aborted by software
+    localparam logic [3:0] DMA_ERR_CFG    = 4'd5;  // illegal geometry/stride (eth_dma_2d)
+    localparam logic [3:0] DMA_ERR_RANGE  = 4'd6;  // line outside the declared window
 
     // ------------------------------------------------------------------
     // CSR map
@@ -165,6 +167,79 @@ package eth_dma_pkg;
 
     // CH_CFG bit positions
     localparam int CH_CFG_IRQEN_BIT = 0;
+
+    // ------------------------------------------------------------------
+    // eth_dma_2d CSR map (E2-DMA2) — same {block[11:6], offset[5:0]} scheme as
+    // the multi-channel DMA, but the 2D engine has ONE register file: block 0
+    // control/status, 1 source, 2 destination, 3 geometry+window, 4 counters,
+    // blocks 5..63 reserved (read 0, writes ignored).  The layout is the ABI
+    // for `eth_dma_2d` and is restated in that module's header.
+    // ------------------------------------------------------------------
+    localparam logic [CSR_BLK_W-1:0] CSR2D_BLK_CTRL = 6'd0;
+    localparam logic [CSR_BLK_W-1:0] CSR2D_BLK_SRC  = 6'd1;
+    localparam logic [CSR_BLK_W-1:0] CSR2D_BLK_DST  = 6'd2;
+    localparam logic [CSR_BLK_W-1:0] CSR2D_BLK_DIM  = 6'd3;
+    localparam logic [CSR_BLK_W-1:0] CSR2D_BLK_STAT = 6'd4;
+
+    // block 0 — control / status / pixel operation
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_CTRL    = 6'h00;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_STATUS  = 6'h04;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_MODE    = 6'h08;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_ROP     = 6'h0C;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_COLOUR  = 6'h10;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_CFG     = 6'h14;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_VERSION = 6'h18;
+
+    // blocks 1 (source) and 2 (destination) — identical offsets
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_BASE_LO   = 6'h00;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_BASE_HI   = 6'h04;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_LSTRIDE   = 6'h08;  // line stride (bytes)
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_PSTRIDE   = 6'h0C;  // plane stride (bytes)
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_CUR_LO    = 6'h10;  // RO: current line address
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_CUR_HI    = 6'h14;
+
+    // block 3 — geometry and window guard
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_HSIZE   = 6'h00;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_VSIZE   = 6'h04;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_PLANES  = 6'h08;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_WIN_LO_LO = 6'h0C;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_WIN_LO_HI = 6'h10;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_WIN_HI_LO = 6'h14;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_WIN_HI_HI = 6'h18;
+
+    // block 4 — counters / fault address
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_XFER      = 6'h00;  // bytes written since START
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_LINES     = 6'h04;  // lines completed
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_ERR_LO    = 6'h08;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_ERR_HI    = 6'h0C;
+    localparam logic [CSR_OFF_W-1:0] CSR2D_OFF_FRAMES    = 6'h10;  // frames completed
+
+    // DMA_CTRL bit positions (block 0 +0x00)
+    localparam int DMA2D_CTRL_EN_BIT      = 0;   // RW  run/stop (VDMA "RS")
+    localparam int DMA2D_CTRL_START_BIT   = 1;   // W1P start one frame
+    localparam int DMA2D_CTRL_ABORT_BIT   = 2;   // W1P abort at the burst boundary
+    localparam int DMA2D_CTRL_IRQCLR_BIT  = 3;   // W1P clear DONE/ERROR/ERRCODE/IRQ
+
+    // DMA_STATUS bit positions (block 0 +0x04) — mirrors CH_STATUS
+    localparam int DMA2D_ST_BUSY_BIT    = 0;
+    localparam int DMA2D_ST_DONE_BIT    = 1;
+    localparam int DMA2D_ST_ERROR_BIT   = 2;
+    localparam int DMA2D_ST_ERRCODE_LSB = 4;    // [6:4]
+    localparam int DMA2D_ST_LINES_LSB   = 8;    // [15:8] lines done (low byte)
+    localparam int DMA2D_ST_IRQ_BIT     = 16;
+
+    // DMA_MODE[1:0] (block 0 +0x08)
+    localparam logic [1:0] DMA2D_MODE_MOVE  = 2'd0;  // src -> dst
+    localparam logic [1:0] DMA2D_MODE_FILL  = 2'd1;  // colour -> dst
+    localparam logic [1:0] DMA2D_MODE_BLIT  = 2'd2;  // rop(src, dst) -> dst
+    localparam logic [1:0] DMA2D_MODE_RSVD  = 2'd3;  // illegal -> DMA_ERR_CFG
+
+    // DMA_CFG bit positions (block 0 +0x14)
+    localparam int DMA2D_CFG_IRQEN_BIT    = 0;  // frame-done interrupt enable
+    localparam int DMA2D_CFG_ERRIRQEN_BIT = 1;  // error interrupt enable
+
+    // DMA_VERSION (block 0 +0x18): {major[31:16], minor[15:0]}
+    localparam logic [31:0] DMA2D_VERSION = 32'h0001_0000;
 
     // ------------------------------------------------------------------
     // Response code -> channel error code

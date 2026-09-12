@@ -1,0 +1,61 @@
+# eth_dma_2d_addr ND-strided walk formal proof (SymbiYosys).
+#
+# Proves the address walker of the 2D graphics DMA `eth_dma_2d` (E2-DMA2,
+# S15 §3 "ND-strided 地址引擎") on its own, because the walker is where the
+# ADDRESS-PER-ACCESS SAFETY of the whole device is decided:
+#   W1  a line offered for transfer (safe_o) lies entirely inside the declared
+#       window [WIN_LO, WIN_HI) AND inside the AXI address space (no carry out
+#       of 2**AXI_AW), so every beat of that line -- line_addr + k*beat,
+#       k < h_bytes/beat -- is inside the window.  `eth_dma_2d` issues beats
+#       only for a line with safe_o, which is what makes the whole device
+#       unable to touch memory outside its programmed framebuffer region;
+#   W2  the walk never leaves the declared rectangle (y < VSIZE, z < PLANES in
+#       every running cycle);
+#   W3  addresses move only by the declared strides -- +LINE_STRIDE per line,
+#       plane origin +PLANE_STRIDE per plane -- and a step whose addition would
+#       carry out of 64 bits is refused (fault), never truncated, so the walk
+#       can neither wrap nor silently reach an undeclared address;
+#   W4  A_DONE is reachable only from the last line of the last plane, and no
+#       accepted step is swallowed (each advances y, or z, or completes);
+#   W5  DONE and FAULT are terminal until the next start (the walk cannot
+#       restart itself);
+#   W6  an armed walk is not restarted while running: `start_i` is ignored in
+#       A_RUN and a running walk moves only on `step_i`;
+#   W7  `abort_i` parks the walk from any state, which is how the engine
+#       guarantees no walk survives into the next frame.
+#
+# Properties are one-step relations over (state, inputs, next state) or frozen
+# output checks, so the proof holds by k-induction at UNBOUNDED depth -- no
+# harness length bound and no property-only counting state.  The environment
+# assumptions are the caller contract of `eth_dma_2d`: a legal rectangle
+# (non-zero HSIZE/VSIZE/PLANES, non-zero line stride, non-empty window inside
+# the AXI address space) whose geometry and window are held stable for the whole
+# frame.  That stability is a hardware guarantee, not a promise: the engine
+# copies every frame parameter into shadow registers at START and asserts that
+# they are frozen while a frame runs (eth_dma_2d.sby, property S1).
+#
+# The cover task witnesses the running/complete/faulted states, so the safety
+# proof is non-vacuous (a walk that can never fault would prove nothing about
+# the guard).
+#
+# Run:  sby -f eth_dma_2d_addr.sby     (picked up by `make formal`)
+[tasks]
+prove
+cover
+
+[options]
+prove: mode prove
+prove: depth 24
+cover: mode cover
+cover: depth 24
+
+[engines]
+prove: smtbmc
+cover: smtbmc
+
+[script]
+read -formal eth_dma_2d_addr.sv
+prep -top eth_dma_2d_addr
+
+[files]
+ethereal-shell/rtl/dma/eth_dma_2d_addr.sv
