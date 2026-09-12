@@ -224,7 +224,7 @@ tasks:
     est_days: 1
     deliverable: rtl/ebi/ebi_tiny.sv
     acceptance: BFM 随机读写一致性测试通过
-    status: todo
+    status: done   # 2026-09-13 由 E2-BMC1 收口: 计划原本即注明「EBI-Tiny 降为小器件降级 profile，随 mFSM（E2-BMC1）落地」。交付 `ethereal-shell/rtl/ebi/ebi_tiny.sv`（+ `ebi_pkg.sv` 的 ADR-006 profile 与窗口图）；验收「BFM 随机读写一致性测试通过」已达成：TB TEST PASSED（13,944 checks / 10,000 ops，各窗口提交数==写入数，6 个额外种子，Verilator 下同数），金模型 45 pytest，verilator -Wall 0 警告无豁免；Makefile 已接线（RTL_CLEAN/deps/test-sv）
 
   - id: E0-SHL2
     title: Shell v0 仿真集成（EBI+OCC+fabric+宿主 BFM）
